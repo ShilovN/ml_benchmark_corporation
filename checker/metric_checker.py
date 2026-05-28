@@ -54,6 +54,49 @@ def load_values(path: Path, column: str | None = None) -> list[Value]:
     return values
 
 
+def load_keyed_values(path: Path, id_column: str, value_column: str) -> dict[str, Value]:
+    """Load values keyed by an id column from a CSV or TSV file."""
+    if not path.exists():
+        raise ValueError(f"File does not exist: {path}")
+
+    suffix = path.suffix.lower()
+    if suffix not in {".csv", ".tsv"}:
+        raise ValueError("id_column validation is supported only for CSV and TSV files")
+
+    delimiter = "\t" if suffix == ".tsv" else ","
+    with path.open("r", encoding="utf-8", newline="") as file:
+        reader = csv.DictReader(file, delimiter=delimiter)
+        if not reader.fieldnames:
+            raise ValueError(f"{path} must contain a header row")
+
+        missing_columns = [
+            column
+            for column in (id_column, value_column)
+            if column not in reader.fieldnames
+        ]
+        if missing_columns:
+            raise ValueError(
+                f"{path} is missing required columns: {', '.join(missing_columns)}. "
+                f"Available columns: {', '.join(reader.fieldnames)}"
+            )
+
+        values: dict[str, Value] = {}
+        for row_number, row in enumerate(reader, start=2):
+            raw_id = row.get(id_column)
+            if raw_id is None or not raw_id.strip():
+                raise ValueError(f"{path} has an empty id at row {row_number}")
+
+            item_id = raw_id.strip()
+            if item_id in values:
+                raise ValueError(f"{path} has a duplicate id: {item_id}")
+
+            values[item_id] = _parse_value(row[value_column])
+
+    if not values:
+        raise ValueError(f"No values found in {path}")
+    return values
+
+
 def _load_json(path: Path, column: str | None) -> list[Value]:
     with path.open("r", encoding="utf-8") as file:
         data = json.load(file)
@@ -265,7 +308,29 @@ def compute_metric(
     column: str | None = None,
     true_column: str | None = None,
     pred_column: str | None = None,
+    id_column: str | None = None,
 ) -> float:
+    result = compute_metric_details(
+        true_path,
+        pred_path,
+        metric_name,
+        column=column,
+        true_column=true_column,
+        pred_column=pred_column,
+        id_column=id_column,
+    )
+    return float(result["value"])
+
+
+def compute_metric_details(
+    true_path: Path,
+    pred_path: Path,
+    metric_name: str,
+    column: str | None = None,
+    true_column: str | None = None,
+    pred_column: str | None = None,
+    id_column: str | None = None,
+) -> dict[str, Union[float, int, str]]:
     registry = metric_registry()
     normalized_metric = normalize_metric_name(metric_name)
     if normalized_metric not in registry:
@@ -274,10 +339,40 @@ def compute_metric(
             f"{', '.join(sorted(registry))}"
         )
 
-    y_true = load_values(true_path, true_column or column)
-    y_pred = load_values(pred_path, pred_column or column)
+    if id_column:
+        true_value_column = true_column or column
+        pred_value_column = pred_column or column
+        if not true_value_column or not pred_value_column:
+            raise ValueError("--id-column requires --column or both --true-column and --pred-column")
+
+        keyed_true = load_keyed_values(true_path, id_column, true_value_column)
+        keyed_pred = load_keyed_values(pred_path, id_column, pred_value_column)
+        true_ids = set(keyed_true)
+        pred_ids = set(keyed_pred)
+        missing_ids = sorted(true_ids - pred_ids)
+        extra_ids = sorted(pred_ids - true_ids)
+        if missing_ids or extra_ids:
+            details = []
+            if missing_ids:
+                details.append(f"missing ids: {', '.join(missing_ids[:10])}")
+            if extra_ids:
+                details.append(f"extra ids: {', '.join(extra_ids[:10])}")
+            raise ValueError("Submission ids do not match answers: " + "; ".join(details))
+
+        ordered_ids = sorted(keyed_true)
+        y_true = [keyed_true[item_id] for item_id in ordered_ids]
+        y_pred = [keyed_pred[item_id] for item_id in ordered_ids]
+    else:
+        y_true = load_values(true_path, true_column or column)
+        y_pred = load_values(pred_path, pred_column or column)
+
     ensure_same_length(y_true, y_pred)
-    return registry[normalized_metric](y_true, y_pred)
+    score = registry[normalized_metric](y_true, y_pred)
+    return {
+        "metric": normalized_metric,
+        "value": score,
+        "rows_checked": len(y_true),
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -293,6 +388,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--true-column", help="Column name for the true-values file")
     parser.add_argument("--pred-column", help="Column name for the predicted-values file")
+    parser.add_argument("--id-column", help="Id column used to align CSV/TSV rows")
     parser.add_argument(
         "--digits",
         type=int,
@@ -312,6 +408,7 @@ def main() -> int:
             column=args.column,
             true_column=args.true_column,
             pred_column=args.pred_column,
+            id_column=args.id_column,
         )
     except (KeyError, ValueError, OSError, csv.Error, json.JSONDecodeError) as exc:
         print(f"Error: {exc}")

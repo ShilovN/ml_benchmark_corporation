@@ -5,7 +5,7 @@ import unittest
 from email.message import Message
 from pathlib import Path
 
-from server import load_tasks, make_handler
+from server import append_submission_history, load_submission_history, load_tasks, make_handler
 
 
 class FakeRequest:
@@ -36,6 +36,23 @@ class ServerTest(unittest.TestCase):
 
         self.assertEqual(list(tasks), ["numbers"])
         self.assertEqual(tasks["numbers"].metric, "mae")
+
+    def test_submission_history_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            submissions_dir = Path(tmp_dir)
+            append_submission_history(
+                submissions_dir,
+                {
+                    "submission_id": "abc",
+                    "task_id": "numbers",
+                    "value": 0.5,
+                },
+            )
+
+            records = load_submission_history(submissions_dir, task_id="numbers")
+
+        self.assertEqual(records[0]["submission_id"], "abc")
+        self.assertEqual(records[0]["value"], 0.5)
 
     def test_multipart_form_parsing(self) -> None:
         handler_class = make_handler({})
