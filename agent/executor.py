@@ -14,6 +14,7 @@ from typing import Any, Callable
 
 from checker.metric_checker import compute_metric_details
 
+from .hints import HintEngine
 from .parser import ParsedCommand, parse_command, parse_model_response
 
 
@@ -21,6 +22,7 @@ MAX_RESULT_CHARS = 8000
 MAX_FILE_READ_CHARS = 20000
 DEFAULT_MAX_STEPS = 100
 DEFAULT_TIME_LIMIT_SECONDS = 3600
+DEFAULT_HISTORY_FILENAME = "agent_history.txt"
 
 
 @dataclass
@@ -41,11 +43,13 @@ class AgentContext:
     used_steps: int = 0
     trajectory: list[dict[str, Any]] = field(default_factory=list)
     dataset: DatasetState | None = None
+    history_file: Path = Path(DEFAULT_HISTORY_FILENAME)
 
 
 class CommandExecutor:
     def __init__(self, context: AgentContext) -> None:
         self.context = context
+        self.history_path = self._resolve_path(str(context.history_file))
         self.handlers: dict[str, Callable[[dict[str, Any]], Any]] = {
             "list_files": self._list_files,
             "read_file": self._read_file,
@@ -58,6 +62,7 @@ class CommandExecutor:
             "get_budget_status": self._get_budget_status,
             "get_remaining_time": self._get_remaining_time,
             "get_trajectory": self._get_trajectory,
+            "get_hints": self._get_hints,
             "submit": self._submit,
         }
 
@@ -72,13 +77,13 @@ class CommandExecutor:
         self.context.used_steps += 1
         if self.context.used_steps > self.context.max_steps:
             result = self._error(command, "Step budget exceeded", started_at)
-            self.context.trajectory.append(result)
+            self._record_trajectory(command, result)
             return result
 
         handler = self.handlers.get(command.name)
         if handler is None:
             result = self._error(command, f"Unknown command: {command.name}", started_at)
-            self.context.trajectory.append(result)
+            self._record_trajectory(command, result)
             return result
 
         try:
@@ -92,7 +97,10 @@ class CommandExecutor:
         except Exception as exc:
             result = self._error(command, str(exc), started_at)
 
-        self.context.trajectory.append(_trajectory_record(command, result))
+        if command.name != "get_hints":
+            result["feedback"] = self._build_feedback()
+
+        self._record_trajectory(command, result)
         return result
 
     def _list_files(self, args: dict[str, Any]) -> list[str]:
@@ -208,7 +216,11 @@ class CommandExecutor:
 
     def _get_trajectory(self, args: dict[str, Any]) -> list[dict[str, Any]]:
         _ensure_no_args(args)
-        return list(self.context.trajectory)
+        return self._read_history()
+
+    def _get_hints(self, args: dict[str, Any]) -> dict[str, Any]:
+        _ensure_no_args(args)
+        return self._build_feedback()
 
     def _submit(self, args: dict[str, Any]) -> dict[str, Any]:
         submission_path = self._resolve_path(_required_str(args, "file"))
@@ -258,6 +270,32 @@ class CommandExecutor:
         if self.context.dataset is None:
             raise ValueError("Dataset is not loaded")
         return self.context.dataset
+
+    def _record_trajectory(self, command: ParsedCommand, result: dict[str, Any]) -> None:
+        record = _trajectory_record(command, result)
+        self.context.trajectory.append(record)
+        self.history_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.history_path.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _read_history(self) -> list[dict[str, Any]]:
+        if not self.history_path.exists():
+            return []
+
+        records: list[dict[str, Any]] = []
+        with self.history_path.open("r", encoding="utf-8") as file:
+            for line in file:
+                if not line.strip():
+                    continue
+                records.append(json.loads(line))
+        return records
+
+    def _build_feedback(self) -> dict[str, Any]:
+        return HintEngine(
+            workspace=self.context.workspace,
+            task_id=self.context.task_id,
+            tasks_dir=self.context.tasks_dir,
+        ).build_feedback()
 
     def _error(self, command: ParsedCommand, error: str, started_at: float) -> dict[str, Any]:
         return {

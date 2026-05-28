@@ -55,6 +55,7 @@ Environment:
 
 - `get_budget_status()`
 - `get_remaining_time()`
+- `get_hints()`
 
 Logging:
 
@@ -71,6 +72,7 @@ From the repository root:
 ```bash
 python3 -m agent.cli 'list_files("checker")'
 python3 -m agent.cli 'load_dataset("checker/tasks/salary_prediction/train.csv")'
+python3 -m agent.cli 'get_hints()'
 python3 -m agent.cli 'submit("checker/tasks/salary_prediction/answers.csv")'
 python3 -m agent.cli --model-response 'Сейчас прочитаю README: read_file("checker/README.md")'
 ```
@@ -86,6 +88,28 @@ python3 -m agent.cli --task-id sample_with_id 'submit("checker/tasks/sample_with
 The executor rejects paths outside the workspace, unknown commands, invalid
 argument types, missing datasets, invalid submission files, and exhausted step
 budgets.
+
+Every executed command is appended to `agent_history.txt` in the workspace as one
+JSON object per line. `get_trajectory()` returns the parsed contents of that
+file, so the LLM can inspect the persistent command history.
+
+## Feedback hints
+
+Every command result includes a `feedback` field with abstract suggestions for
+improving the current ML solution. The hidden checklist covers:
+
+- EDA: target, duplicates, missing values, outliers;
+- feature engineering: target leakage and duplicated numeric signal;
+- training: task type, saved model, validation signal, and submission file.
+
+The LLM can request the same feedback explicitly:
+
+```bash
+python3 -m agent.cli 'get_hints()'
+```
+
+Hints intentionally stay high-level, for example: "Подумай над пропусками и
+стратегией их обработки."
 
 `edit_file(path, diff)` expects `diff` to be a JSON string or object:
 

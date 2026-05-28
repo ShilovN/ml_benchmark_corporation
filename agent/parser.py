@@ -32,6 +32,7 @@ NO_ARG_COMMANDS = {
     "get_budget_status",
     "get_remaining_time",
     "get_trajectory",
+    "get_hints",
 }
 
 COMMAND_NAMES = set(POSITIONAL_ARGS) | NO_ARG_COMMANDS
