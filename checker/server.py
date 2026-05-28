@@ -9,16 +9,20 @@ import csv
 import json
 import shutil
 import tempfile
+import time
+import uuid
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from metric_checker import compute_metric, metric_registry, normalize_metric_name
+from metric_checker import compute_metric_details, metric_registry, normalize_metric_name
 
 
 DEFAULT_TASKS_DIR = Path(__file__).resolve().parent / "tasks"
+DEFAULT_SUBMISSIONS_DIR = Path(__file__).resolve().parent / "submissions"
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 
 
@@ -32,6 +36,7 @@ class TaskConfig:
         column: str | None = None,
         true_column: str | None = None,
         pred_column: str | None = None,
+        id_column: str | None = None,
     ) -> None:
         self.task_id = task_id
         self.name = name
@@ -40,6 +45,7 @@ class TaskConfig:
         self.column = column
         self.true_column = true_column
         self.pred_column = pred_column
+        self.id_column = id_column
 
     @classmethod
     def from_json(cls, path: Path) -> "TaskConfig":
@@ -63,6 +69,7 @@ class TaskConfig:
             column=data.get("column"),
             true_column=data.get("true_column"),
             pred_column=data.get("pred_column"),
+            id_column=data.get("id_column"),
         )
 
     def public_dict(self) -> dict[str, Any]:
@@ -71,6 +78,7 @@ class TaskConfig:
             "name": self.name,
             "metric": self.metric,
             "column": self.column,
+            "id_column": self.id_column,
             "pred_column": self.pred_column,
         }
 
@@ -88,18 +96,35 @@ def load_tasks(tasks_dir: Path) -> dict[str, TaskConfig]:
     return tasks
 
 
-def make_handler(tasks: dict[str, TaskConfig]) -> type[BaseHTTPRequestHandler]:
+def make_handler(
+    tasks: dict[str, TaskConfig],
+    submissions_dir: Path = DEFAULT_SUBMISSIONS_DIR,
+) -> type[BaseHTTPRequestHandler]:
     class CheckerRequestHandler(BaseHTTPRequestHandler):
         server_version = "MetricCheckerHTTP/0.1"
 
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
+            if parsed.path == "/":
+                self._send_html(render_index_page(tasks))
+                return
+
             if parsed.path == "/health":
-                self._send_json({"status": "ok"})
+                self._send_json({"status": "ok", "tasks_count": len(tasks)})
                 return
 
             if parsed.path == "/tasks":
-                self._send_json({"tasks": [task.public_dict() for task in tasks.values()]})
+                self._send_json({"status": "ok", "tasks": [task.public_dict() for task in tasks.values()]})
+                return
+
+            if parsed.path == "/submissions":
+                task_id = _first_query_value(parsed.query, "task_id")
+                self._send_json(
+                    {
+                        "status": "ok",
+                        "submissions": load_submission_history(submissions_dir, task_id=task_id),
+                    }
+                )
                 return
 
             self._send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
@@ -113,9 +138,9 @@ def make_handler(tasks: dict[str, TaskConfig]) -> type[BaseHTTPRequestHandler]:
             try:
                 self._handle_check(parsed.query)
             except RequestError as exc:
-                self._send_json({"error": str(exc)}, status=exc.status)
+                self._send_json({"status": "error", "error": str(exc)}, status=exc.status)
             except (KeyError, ValueError, OSError, csv.Error, json.JSONDecodeError) as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                self._send_json({"status": "error", "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
 
         def _handle_check(self, query: str) -> None:
             form = self._read_multipart_form()
@@ -130,26 +155,52 @@ def make_handler(tasks: dict[str, TaskConfig]) -> type[BaseHTTPRequestHandler]:
                 raise RequestError("Missing uploaded file field named 'file'", HTTPStatus.BAD_REQUEST)
 
             task = tasks[task_id]
-            suffix = Path(getattr(submission, "filename", "") or "submission.txt").suffix
-            with tempfile.TemporaryDirectory(prefix="checker_submission_") as tmp_dir:
-                submission_path = Path(tmp_dir) / f"submission{suffix}"
-                with submission_path.open("wb") as output:
-                    shutil.copyfileobj(submission.file, output)
+            original_filename = Path(getattr(submission, "filename", "") or "submission.txt").name
+            suffix = Path(original_filename).suffix or ".txt"
+            submission_id = uuid.uuid4().hex
+            task_submission_dir = submissions_dir / task.task_id
+            task_submission_dir.mkdir(parents=True, exist_ok=True)
+            saved_submission_path = task_submission_dir / f"{submission_id}{suffix}"
 
-                score = compute_metric(
+            started_at = time.perf_counter()
+            with saved_submission_path.open("wb") as output:
+                shutil.copyfileobj(submission.file, output)
+
+            try:
+                result = compute_metric_details(
                     task.answer_file,
-                    submission_path,
+                    saved_submission_path,
                     task.metric,
                     column=task.column,
                     true_column=task.true_column,
                     pred_column=task.pred_column,
+                    id_column=task.id_column,
                 )
+            except Exception:
+                saved_submission_path.unlink(missing_ok=True)
+                raise
 
+            elapsed_ms = round((time.perf_counter() - started_at) * 1000, 3)
+            record = {
+                "submission_id": submission_id,
+                "task_id": task.task_id,
+                "filename": original_filename,
+                "metric": result["metric"],
+                "value": result["value"],
+                "rows_checked": result["rows_checked"],
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "elapsed_ms": elapsed_ms,
+            }
+            append_submission_history(submissions_dir, record)
             self._send_json(
                 {
+                    "status": "ok",
+                    "submission_id": submission_id,
                     "task_id": task.task_id,
-                    "metric": task.metric,
-                    "value": score,
+                    "metric": result["metric"],
+                    "value": result["value"],
+                    "rows_checked": result["rows_checked"],
+                    "elapsed_ms": elapsed_ms,
                 }
             )
 
@@ -182,10 +233,147 @@ def make_handler(tasks: dict[str, TaskConfig]) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             self.wfile.write(body)
 
+        def _send_html(self, html: str, status: HTTPStatus = HTTPStatus.OK) -> None:
+            body = html.encode("utf-8")
+            self.send_response(status.value)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def log_message(self, format: str, *args: Any) -> None:
             print(f"{self.address_string()} - {format % args}")
 
     return CheckerRequestHandler
+
+
+def append_submission_history(submissions_dir: Path, record: dict[str, Any]) -> None:
+    submissions_dir.mkdir(parents=True, exist_ok=True)
+    history_path = submissions_dir / "history.jsonl"
+    with history_path.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def load_submission_history(
+    submissions_dir: Path,
+    task_id: str | None = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    history_path = submissions_dir / "history.jsonl"
+    if not history_path.exists():
+        return []
+
+    records: list[dict[str, Any]] = []
+    with history_path.open("r", encoding="utf-8") as file:
+        for line in file:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if task_id and record.get("task_id") != task_id:
+                continue
+            records.append(record)
+
+    return list(reversed(records[-limit:]))
+
+
+def render_index_page(tasks: dict[str, TaskConfig]) -> str:
+    options = "\n".join(
+        f'<option value="{task.task_id}">{task.name} ({task.metric})</option>'
+        for task in tasks.values()
+    )
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Solution Checker</title>
+  <style>
+    body {{
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f6f7f9;
+      color: #1d2430;
+    }}
+    main {{
+      max-width: 760px;
+      margin: 48px auto;
+      padding: 0 20px;
+    }}
+    h1 {{
+      font-size: 32px;
+      margin: 0 0 20px;
+    }}
+    form, section {{
+      background: #ffffff;
+      border: 1px solid #dfe3e8;
+      border-radius: 8px;
+      padding: 20px;
+      margin-bottom: 16px;
+    }}
+    label {{
+      display: block;
+      font-weight: 600;
+      margin: 0 0 8px;
+    }}
+    select, input, button {{
+      box-sizing: border-box;
+      width: 100%;
+      min-height: 40px;
+      margin-bottom: 16px;
+      font: inherit;
+    }}
+    button {{
+      border: 0;
+      border-radius: 6px;
+      background: #1864ab;
+      color: white;
+      font-weight: 700;
+      cursor: pointer;
+    }}
+    pre {{
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: #111827;
+      color: #f9fafb;
+      border-radius: 6px;
+      padding: 14px;
+      min-height: 48px;
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Solution Checker</h1>
+    <form id="check-form">
+      <label for="task_id">Task</label>
+      <select id="task_id" name="task_id" required>
+        {options}
+      </select>
+      <label for="file">Submission file</label>
+      <input id="file" name="file" type="file" required>
+      <button type="submit">Check solution</button>
+    </form>
+    <section>
+      <label>Result</label>
+      <pre id="result">Waiting for submission...</pre>
+    </section>
+  </main>
+  <script>
+    const form = document.getElementById('check-form');
+    const result = document.getElementById('result');
+    form.addEventListener('submit', async (event) => {{
+      event.preventDefault();
+      result.textContent = 'Checking...';
+      const response = await fetch('/check', {{
+        method: 'POST',
+        body: new FormData(form)
+      }});
+      const payload = await response.json();
+      result.textContent = JSON.stringify(payload, null, 2);
+    }});
+  </script>
+</body>
+</html>"""
 
 
 class RequestError(Exception):
@@ -221,6 +409,12 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_TASKS_DIR,
         help="Directory with task configs",
     )
+    parser.add_argument(
+        "--submissions-dir",
+        type=Path,
+        default=DEFAULT_SUBMISSIONS_DIR,
+        help="Directory for uploaded submissions and history",
+    )
     return parser.parse_args()
 
 
@@ -236,7 +430,7 @@ def main() -> int:
         print(f"No tasks found in {args.tasks_dir}")
         return 1
 
-    handler = make_handler(tasks)
+    handler = make_handler(tasks, args.submissions_dir)
     server = ThreadingHTTPServer((args.host, args.port), handler)
     print(f"Checker server is running on http://{args.host}:{args.port}")
     print(f"Loaded tasks: {', '.join(sorted(tasks))}")
