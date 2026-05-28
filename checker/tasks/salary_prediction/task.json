@@ -1,0 +1,12 @@
+{
+  "id": "salary_prediction",
+  "name": "Salary prediction",
+  "metric": "mae",
+  "answer_file": "answers.csv",
+  "id_column": "id",
+  "column": "salary",
+  "public_files": [
+    "train.csv",
+    "test.csv"
+  ]
+}

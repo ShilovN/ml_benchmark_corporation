@@ -7,6 +7,7 @@ import argparse
 import cgi
 import csv
 import json
+import mimetypes
 import shutil
 import tempfile
 import time
@@ -37,6 +38,7 @@ class TaskConfig:
         true_column: str | None = None,
         pred_column: str | None = None,
         id_column: str | None = None,
+        public_files: list[str] | None = None,
     ) -> None:
         self.task_id = task_id
         self.name = name
@@ -46,6 +48,7 @@ class TaskConfig:
         self.true_column = true_column
         self.pred_column = pred_column
         self.id_column = id_column
+        self.public_files = public_files or []
 
     @classmethod
     def from_json(cls, path: Path) -> "TaskConfig":
@@ -70,6 +73,7 @@ class TaskConfig:
             true_column=data.get("true_column"),
             pred_column=data.get("pred_column"),
             id_column=data.get("id_column"),
+            public_files=list(data.get("public_files") or []),
         )
 
     def public_dict(self) -> dict[str, Any]:
@@ -80,7 +84,20 @@ class TaskConfig:
             "column": self.column,
             "id_column": self.id_column,
             "pred_column": self.pred_column,
+            "public_files": self.public_files,
         }
+
+    def public_file_path(self, filename: str) -> Path:
+        if filename not in self.public_files:
+            raise RequestError(f"File is not public for task '{self.task_id}': {filename}", HTTPStatus.NOT_FOUND)
+
+        candidate = (self.answer_file.parent / filename).resolve()
+        task_dir = self.answer_file.parent.resolve()
+        if task_dir not in candidate.parents and candidate != task_dir:
+            raise RequestError("Invalid file path", HTTPStatus.BAD_REQUEST)
+        if not candidate.exists() or not candidate.is_file():
+            raise RequestError(f"Public file not found: {filename}", HTTPStatus.NOT_FOUND)
+        return candidate
 
 
 def load_tasks(tasks_dir: Path) -> dict[str, TaskConfig]:
@@ -117,6 +134,10 @@ def make_handler(
                 self._send_json({"status": "ok", "tasks": [task.public_dict() for task in tasks.values()]})
                 return
 
+            if parsed.path.startswith("/tasks/") and "/files/" in parsed.path:
+                self._handle_public_file(parsed.path)
+                return
+
             if parsed.path == "/submissions":
                 task_id = _first_query_value(parsed.query, "task_id")
                 self._send_json(
@@ -128,6 +149,36 @@ def make_handler(
                 return
 
             self._send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
+
+        def _handle_public_file(self, path: str) -> None:
+            parts = path.strip("/").split("/")
+            if len(parts) != 4 or parts[0] != "tasks" or parts[2] != "files":
+                self._send_json({"status": "error", "error": "Not found"}, status=HTTPStatus.NOT_FOUND)
+                return
+
+            task_id = parts[1]
+            filename = parts[3]
+            if task_id not in tasks:
+                self._send_json({"status": "error", "error": f"Unknown task_id: {task_id}"}, status=HTTPStatus.NOT_FOUND)
+                return
+
+            try:
+                file_path = tasks[task_id].public_file_path(filename)
+            except RequestError as exc:
+                self._send_json({"status": "error", "error": str(exc)}, status=exc.status)
+                return
+
+            content_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+            self.send_response(HTTPStatus.OK.value)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(file_path.stat().st_size))
+            self.send_header("Content-Disposition", f'attachment; filename="{file_path.name}"')
+            self.end_headers()
+            with file_path.open("rb") as file:
+                try:
+                    shutil.copyfileobj(file, self.wfile)
+                except BrokenPipeError:
+                    pass
 
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
@@ -281,6 +332,17 @@ def render_index_page(tasks: dict[str, TaskConfig]) -> str:
         f'<option value="{task.task_id}">{task.name} ({task.metric})</option>'
         for task in tasks.values()
     )
+    task_links = "\n".join(
+        "<li>"
+        f"<strong>{task.name}</strong>: "
+        + ", ".join(
+            f'<a href="/tasks/{task.task_id}/files/{filename}">{filename}</a>'
+            for filename in task.public_files
+        )
+        + "</li>"
+        for task in tasks.values()
+        if task.public_files
+    )
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -339,6 +401,12 @@ def render_index_page(tasks: dict[str, TaskConfig]) -> str:
       padding: 14px;
       min-height: 48px;
     }}
+    li {{
+      margin-bottom: 8px;
+    }}
+    a {{
+      color: #1864ab;
+    }}
   </style>
 </head>
 <body>
@@ -356,6 +424,12 @@ def render_index_page(tasks: dict[str, TaskConfig]) -> str:
     <section>
       <label>Result</label>
       <pre id="result">Waiting for submission...</pre>
+    </section>
+    <section>
+      <label>Task files</label>
+      <ul>
+        {task_links or "<li>No public files configured.</li>"}
+      </ul>
     </section>
   </main>
   <script>
