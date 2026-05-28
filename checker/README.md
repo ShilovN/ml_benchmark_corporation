@@ -48,6 +48,7 @@ Endpoints:
 - `GET /` - browser upload form;
 - `GET /health` - server health check;
 - `GET /tasks` - list public task metadata;
+- `GET /tasks/<task_id>/files/<filename>` - download a public task file;
 - `GET /submissions` - list latest submission results;
 - `POST /check` - upload a solution file and get the metric value.
 
@@ -100,5 +101,35 @@ CSV task config with id validation:
 }
 ```
 
+Salary prediction task:
+
+```bash
+curl http://127.0.0.1:8000/tasks/salary_prediction/files/train.csv -o train.csv
+curl http://127.0.0.1:8000/tasks/salary_prediction/files/test.csv -o test.csv
+curl -X POST http://127.0.0.1:8000/check \
+  -F task_id=salary_prediction \
+  -F file=@submission.csv
+```
+
+Expected submission format:
+
+```csv
+id,salary
+5000,32513
+5001,31157
+```
+
 Uploaded submissions are stored in `checker/submissions/<task_id>/`. Submission
 metadata is appended to `checker/submissions/history.jsonl`.
+
+## Agent command layer
+
+The repository also contains `agent/`, a command parser and executor for LLM
+actions such as `read_file(path)`, `load_dataset(path)`, `run_python(code)`, and
+`submit(file)`.
+
+Example:
+
+```bash
+python3 -m agent.cli 'submit("checker/tasks/salary_prediction/answers.csv")'
+```

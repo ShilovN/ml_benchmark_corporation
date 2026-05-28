@@ -27,15 +27,18 @@ class ServerTest(unittest.TestCase):
                         "name": "Numbers",
                         "metric": "mae",
                         "answer_file": "answers.txt",
+                        "public_files": ["train.csv"],
                     }
                 ),
                 encoding="utf-8",
             )
+            (task_dir / "train.csv").write_text("id,value\n1,2\n", encoding="utf-8")
 
             tasks = load_tasks(Path(tmp_dir))
 
         self.assertEqual(list(tasks), ["numbers"])
         self.assertEqual(tasks["numbers"].metric, "mae")
+        self.assertEqual(tasks["numbers"].public_files, ["train.csv"])
 
     def test_submission_history_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
