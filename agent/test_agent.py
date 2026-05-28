@@ -20,6 +20,12 @@ class ParserTest(unittest.TestCase):
         self.assertEqual(command.name, "show_sample_rows")
         self.assertEqual(command.args, {"n": 2})
 
+    def test_parse_get_hints(self) -> None:
+        command = parse_command("get_hints()")
+
+        self.assertEqual(command.name, "get_hints")
+        self.assertEqual(command.args, {})
+
     def test_extract_command_from_fenced_block(self) -> None:
         text = """Сначала посмотрю файлы.
 
@@ -66,10 +72,74 @@ class ExecutorTest(unittest.TestCase):
             write_result = executor.execute_text('write_file("a.txt", "hello")')
             read_result = executor.execute_text('read_file("a.txt")')
             trajectory_result = executor.execute_text("get_trajectory()")
+            history_path = workspace / "agent_history.txt"
+            history_lines = history_path.read_text(encoding="utf-8").splitlines()
 
         self.assertEqual(write_result["status"], "ok")
+        self.assertIn("feedback", write_result)
         self.assertEqual(read_result["result"]["content"], "hello")
         self.assertEqual(len(trajectory_result["result"]), 2)
+        self.assertEqual(len(history_lines), 3)
+        self.assertEqual(json.loads(history_lines[0])["command"], "write_file")
+
+    def test_get_hints_returns_abstract_feedback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            task_dir = workspace / "checker" / "tasks" / "toy"
+            task_dir.mkdir(parents=True)
+            (task_dir / "task.json").write_text(
+                json.dumps(
+                    {
+                        "id": "toy",
+                        "metric": "mae",
+                        "answer_file": "answers.csv",
+                        "id_column": "id",
+                        "column": "salary",
+                        "public_files": ["train.csv", "test.csv"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (task_dir / "train.csv").write_text(
+                "id,feature,salary\n1,10,100\n1,10,100\n2,,10000\n",
+                encoding="utf-8",
+            )
+            (task_dir / "test.csv").write_text("id,feature\n3,\n", encoding="utf-8")
+            executor = CommandExecutor(
+                AgentContext(workspace=workspace, task_id="toy", tasks_dir=Path("checker/tasks"))
+            )
+
+            result = executor.execute_text("get_hints()")
+
+        messages = [hint["message"] for hint in result["result"]["hints"]]
+        self.assertTrue(any("пропус" in message for message in messages))
+        self.assertTrue(any("повтор" in message for message in messages))
+        self.assertTrue(any("модель" in message for message in messages))
+        self.assertTrue(any("отправ" in message for message in messages))
+
+    def test_get_trajectory_reads_history_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            history_path = workspace / "agent_history.txt"
+            history_path.write_text(
+                json.dumps(
+                    {
+                        "timestamp": "2026-05-28T00:00:00+00:00",
+                        "command": "read_file",
+                        "args": {"path": "a.txt"},
+                        "status": "ok",
+                        "result_preview": "preview",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            executor = CommandExecutor(AgentContext(workspace=workspace))
+
+            result = executor.execute_text("get_trajectory()")
+
+        self.assertEqual(result["result"][0]["command"], "read_file")
+        self.assertEqual(result["result"][0]["result_preview"], "preview")
 
     def test_execute_model_response(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
