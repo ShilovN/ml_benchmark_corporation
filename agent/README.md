@@ -95,7 +95,8 @@ file, so the LLM can inspect the persistent command history.
 
 ## Feedback hints
 
-Every command result includes a `feedback` field with abstract suggestions for
+The full benchmark loop adds feedback once after all commands from the latest
+model response have executed. The feedback contains abstract suggestions for
 improving the current ML solution. The hidden checklist covers:
 
 - EDA: target, duplicates, missing values, outliers;
