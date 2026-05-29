@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import shutil
 import subprocess
@@ -61,6 +62,8 @@ SKIP_FILENAMES = {
 DEFAULT_CONTEXT_CHARS_PER_FILE = 2500
 DEFAULT_CONTEXT_TOTAL_CHARS = 30000
 DEFAULT_DOCKER_IMAGE = "ml-benchmark-runner:latest"
+MAX_FOLLOWUP_PROMPT_CHARS = 60000
+MIN_COMPACT_STRING_CHARS = 1000
 
 
 @dataclass
@@ -588,7 +591,6 @@ def build_followup_prompt(
     budget_status = build_budget_status(stats, args)
     payload = {
         "command_results": command_results,
-        "feedback": feedback,
         "benchmark_status": {
             "elapsed_seconds": stats.elapsed_seconds,
             "requests": stats.requests,
@@ -602,13 +604,71 @@ def build_followup_prompt(
             "remaining_seconds": max(0.0, args.time_limit_seconds - stats.elapsed_seconds),
         },
     }
-    return (
+    if feedback is not None:
+        payload["feedback"] = feedback
+    prefix = (
         f"{format_budget_line(stats, args)} "
-        "Результаты выполнения твоих команд и подсказки hidden checklist ниже. "
-        "Продолжай решать задачу только агентскими командами. "
-        "Когда submission.csv готов, вызови submit(\"submission.csv\").\n\n"
-        + json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+        "Дальше верни только команды.\n\n"
     )
+    return prefix + compact_json_for_prompt(payload, MAX_FOLLOWUP_PROMPT_CHARS - len(prefix))
+
+
+def compact_json_for_prompt(payload: dict[str, Any], max_chars: int) -> str:
+    text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
+    if len(text) <= max_chars:
+        return text
+
+    compacted = copy.deepcopy(payload)
+    low = MIN_COMPACT_STRING_CHARS
+    high = longest_string_length(compacted)
+    best_text: str | None = None
+    while low <= high:
+        limit = (low + high) // 2
+        candidate = truncate_long_strings(compacted, limit)
+        candidate_text = json.dumps(candidate, ensure_ascii=False, separators=(",", ":"), default=str)
+        if len(candidate_text) <= max_chars:
+            best_text = candidate_text
+            low = limit + 1
+        else:
+            high = limit - 1
+
+    if best_text is not None:
+        return best_text
+
+    compacted = truncate_long_strings(compacted, MIN_COMPACT_STRING_CHARS)
+    return json.dumps(compacted, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def longest_string_length(value: Any) -> int:
+    if isinstance(value, str):
+        return len(value)
+    if isinstance(value, dict):
+        return max((longest_string_length(item) for item in value.values()), default=0)
+    if isinstance(value, list):
+        return max((longest_string_length(item) for item in value), default=0)
+    return 0
+
+
+def truncate_long_strings(value: Any, limit: int) -> Any:
+    if isinstance(value, str):
+        return truncate_middle(value, limit)
+    if isinstance(value, dict):
+        return {key: truncate_long_strings(item, limit) for key, item in value.items()}
+    if isinstance(value, list):
+        return [truncate_long_strings(item, limit) for item in value]
+    return value
+
+
+def truncate_middle(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    if limit < 80:
+        return value[:limit]
+    marker = f"...[truncated {len(value) - limit} chars]..."
+    keep = max(0, limit - len(marker))
+    head = keep // 2
+    tail = keep - head
+    return value[:head] + marker + value[-tail:]
 
 
 def build_budget_status(stats: BenchmarkStats, args: argparse.Namespace) -> dict[str, Any]:
@@ -634,7 +694,10 @@ def format_budget_line(stats: BenchmarkStats, args: argparse.Namespace) -> str:
         token_text = "лимит токенов не задан"
     else:
         token_text = f"осталось {percent}% токенов"
-    return f"Бюджет: {token_text}; осталось итераций: {status['remaining_iterations']}."
+    line = f"Бюджет: {token_text}; осталось итераций: {status['remaining_iterations']}."
+    if percent is not None and percent < 30:
+        line += " Экономь токены: скоро сделай submit, иначе проиграешь."
+    return line
 
 
 def print_debug_state(
