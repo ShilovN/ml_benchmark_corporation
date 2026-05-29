@@ -6,7 +6,13 @@ from pathlib import Path
 
 from agent.executor import AgentContext, CommandExecutor
 from agent.parser import extract_command_text, parse_command, parse_model_response
-from main import BenchmarkStats, build_followup_prompt, compact_json_for_prompt
+from main import (
+    BenchmarkStats,
+    build_followup_prompt,
+    compact_history_for_model,
+    compact_json_for_prompt,
+    response_max_tokens,
+)
 
 
 class ParserTest(unittest.TestCase):
@@ -124,10 +130,10 @@ class ExecutorTest(unittest.TestCase):
 
         self.assertIn("осталось 29.9% токенов", prompt)
         self.assertIn("Экономь токены", prompt)
-        self.assertIn("сделай submit", prompt)
+        self.assertIn("делать submit", prompt)
         self.assertIn("иначе проиграешь", prompt)
 
-    def test_followup_prompt_does_not_warn_at_exactly_30_percent(self) -> None:
+    def test_followup_prompt_uses_soft_warning_at_exactly_30_percent(self) -> None:
         args = argparse.Namespace(token_limit=1000, max_steps=10, time_limit_seconds=3600)
         stats = BenchmarkStats()
         stats.total_tokens = 700
@@ -135,7 +141,46 @@ class ExecutorTest(unittest.TestCase):
         prompt = build_followup_prompt([], stats, args)
 
         self.assertIn("осталось 30.0% токенов", prompt)
-        self.assertNotIn("Экономь токены", prompt)
+        self.assertIn("прекращай исследование", prompt)
+        self.assertNotIn("иначе проиграешь", prompt)
+
+    def test_followup_prompt_pushes_submit_when_token_budget_is_critical(self) -> None:
+        args = argparse.Namespace(token_limit=1000, max_steps=10, time_limit_seconds=3600)
+        stats = BenchmarkStats()
+        stats.total_tokens = 851
+
+        prompt = build_followup_prompt([], stats, args)
+
+        self.assertIn("осталось 14.9% токенов", prompt)
+        self.assertIn("КРИТИЧНО", prompt)
+        self.assertIn("вызывай submit", prompt)
+
+    def test_response_max_tokens_shrinks_when_budget_is_low(self) -> None:
+        args = argparse.Namespace(token_limit=1000, max_steps=10, max_tokens=4096)
+        stats = BenchmarkStats()
+
+        stats.total_tokens = 200
+        self.assertEqual(response_max_tokens(stats, args), 4096)
+        stats.total_tokens = 501
+        self.assertEqual(response_max_tokens(stats, args), 1024)
+        stats.total_tokens = 701
+        self.assertEqual(response_max_tokens(stats, args), 768)
+        stats.total_tokens = 851
+        self.assertEqual(response_max_tokens(stats, args), 512)
+
+    def test_compact_history_limits_old_messages_and_long_content(self) -> None:
+        history = [
+            {"role": "user", "content": f"message-{index}-" + ("x" * 4000)}
+            for index in range(12)
+        ]
+
+        compacted = compact_history_for_model(history)
+
+        self.assertEqual(len(compacted), 9)
+        self.assertIn("history compacted", compacted[0]["content"])
+        self.assertTrue(all(len(message["content"]) <= 2600 for message in compacted[1:]))
+        self.assertIn("message-4", compacted[1]["content"])
+        self.assertIn("[truncated", compacted[1]["content"])
 
     def test_compact_json_truncates_long_strings_from_middle_only_when_needed(self) -> None:
         payload = {"result": {"content": "a" * 3000 + "middle" + "z" * 3000}}
