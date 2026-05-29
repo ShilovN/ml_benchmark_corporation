@@ -6,7 +6,7 @@ from pathlib import Path
 
 from agent.executor import AgentContext, CommandExecutor
 from agent.parser import extract_command_text, parse_command, parse_model_response
-from main import BenchmarkStats, build_followup_prompt
+from main import BenchmarkStats, build_followup_prompt, compact_json_for_prompt
 
 
 class ParserTest(unittest.TestCase):
@@ -98,6 +98,56 @@ class ExecutorTest(unittest.TestCase):
         self.assertEqual(payload["feedback"], feedback)
         self.assertNotIn("feedback", payload["command_results"][0])
         self.assertNotIn("feedback", payload["command_results"][1])
+
+    def test_followup_prompt_contains_remaining_budget(self) -> None:
+        args = argparse.Namespace(token_limit=1000, max_steps=10, time_limit_seconds=3600)
+        stats = BenchmarkStats()
+        stats.total_tokens = 250
+        stats.executed_commands = 4
+
+        prompt = build_followup_prompt([], stats, args)
+        payload = json.loads(prompt.split("\n\n", 1)[1])
+
+        self.assertIn("осталось 75.0% токенов", prompt)
+        self.assertIn("осталось итераций: 6", prompt)
+        self.assertNotIn("\n  ", prompt)
+        self.assertEqual(payload["benchmark_status"]["remaining_tokens"], 750)
+        self.assertEqual(payload["benchmark_status"]["remaining_token_percent"], 75.0)
+        self.assertEqual(payload["benchmark_status"]["remaining_iterations"], 6)
+
+    def test_followup_prompt_warns_when_token_budget_is_low(self) -> None:
+        args = argparse.Namespace(token_limit=1000, max_steps=10, time_limit_seconds=3600)
+        stats = BenchmarkStats()
+        stats.total_tokens = 701
+
+        prompt = build_followup_prompt([], stats, args)
+
+        self.assertIn("осталось 29.9% токенов", prompt)
+        self.assertIn("Экономь токены", prompt)
+        self.assertIn("сделай submit", prompt)
+        self.assertIn("иначе проиграешь", prompt)
+
+    def test_followup_prompt_does_not_warn_at_exactly_30_percent(self) -> None:
+        args = argparse.Namespace(token_limit=1000, max_steps=10, time_limit_seconds=3600)
+        stats = BenchmarkStats()
+        stats.total_tokens = 700
+
+        prompt = build_followup_prompt([], stats, args)
+
+        self.assertIn("осталось 30.0% токенов", prompt)
+        self.assertNotIn("Экономь токены", prompt)
+
+    def test_compact_json_truncates_long_strings_from_middle_only_when_needed(self) -> None:
+        payload = {"result": {"content": "a" * 3000 + "middle" + "z" * 3000}}
+
+        full = compact_json_for_prompt(payload, 10000)
+        compact = compact_json_for_prompt(payload, 1800)
+
+        self.assertIn("middle", full)
+        self.assertLess(len(compact), len(full))
+        self.assertIn("[truncated", compact)
+        self.assertIn("aaa", compact)
+        self.assertIn("zzz", compact)
 
     def test_get_hints_returns_abstract_feedback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
