@@ -15,6 +15,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
+from sklearn.metrics import accuracy_score
+from sklearn.model_selection import train_test_split
+
 from agent.executor import AgentContext, CommandExecutor
 from agent.llm_client import (
     DEFAULT_MAX_TOKENS,
@@ -60,6 +64,270 @@ SKIP_FILENAMES = {
 DEFAULT_CONTEXT_CHARS_PER_FILE = 2500
 DEFAULT_CONTEXT_TOTAL_CHARS = 30000
 DEFAULT_DOCKER_IMAGE = "ml-benchmark-runner:latest"
+
+
+class AutoGym:
+    def __init__(self, dataset_path: str | Path, target_column: str):
+        df = pd.read_csv(dataset_path)
+        target = target_column
+        self.mode = "flexible"
+        self.logs = []
+        self.current_stage = "EDA"
+        self.max_attempts = 5
+        self.attempts_made = 0
+        self.final_evaluated = False
+
+        trainval, test = train_test_split(df, test_size=0.2, random_state=42)
+        train, val = train_test_split(trainval, test_size=0.2, random_state=42)
+
+        self.train_data = train
+        self.val_x = val.drop(columns=[target])
+        self.val_y = val[target]
+        self.private_x = test.drop(columns=[target])
+        self.private_y = test[target]
+        self.candidates = {}
+
+        self.logs.append(
+            {
+                "action": "init_env",
+                "train_size": len(self.train_data),
+                "val_size": len(self.val_x),
+                "test_size": len(self.private_x),
+            }
+        )
+
+    def _trigger_fallback(self):
+        if self.candidates:
+            return max(self.candidates, key=lambda k: self.candidates[k]["val_score"])
+        return None
+
+    def run_replay_and_evaluate(self, chosen_id=None):
+        if self.final_evaluated:
+            return {
+                "status": "rejected",
+                "message": "Private final evaluation уже была выполнена. Повторный запуск запрещен.",
+            }
+
+        if chosen_id is None or chosen_id not in self.candidates:
+            chosen_id = self._trigger_fallback()
+
+        if chosen_id is None:
+            return {
+                "status": "rejected",
+                "message": "Нет валидированных кандидатов для final evaluation.",
+            }
+
+        best_candidate = self.candidates[chosen_id]
+        agent_code_used = best_candidate["agent_code"]
+        expected_val_score = best_candidate["val_score"]
+
+        self.logs.append({"action": "replay_started", "candidate_id": chosen_id})
+
+        try:
+            replay_vars = {"train_df": self.train_data}
+            exec(agent_code_used, {}, replay_vars)
+
+            reproduced_model = replay_vars.get("model")
+            if reproduced_model is None:
+                raise KeyError("В коде агента после повторного запуска не найден объект 'model'")
+
+            replay_predictions = reproduced_model.predict(self.val_x)
+            replay_val_score = accuracy_score(self.val_y, replay_predictions)
+
+            if abs(replay_val_score - expected_val_score) > 1e-5:
+                self.logs.append(
+                    {
+                        "action": "replay_warning",
+                        "candidate_id": chosen_id,
+                        "message": "Скор изменился при повторном запуске",
+                    }
+                )
+            else:
+                self.logs.append({"action": "replay_success", "candidate_id": chosen_id})
+
+        except Exception:
+            import traceback
+
+            error_msg = traceback.format_exc()
+            self.logs.append({"action": "replay_failed", "candidate_id": chosen_id, "error": error_msg})
+            return {
+                "status": "rejected",
+                "message": "Финальное решение отклонено: код не воспроизводится (падает при перезапуске).",
+                "error": error_msg,
+            }
+
+        final_predictions = reproduced_model.predict(self.private_x)
+        final_private_score = accuracy_score(self.private_y, final_predictions)
+        self.final_evaluated = True
+
+        self.logs.append(
+            {
+                "action": "final_evaluation_success",
+                "candidate_id": chosen_id,
+                "private_score": final_private_score,
+            }
+        )
+
+        return {
+            "status": "success",
+            "chosen_candidate_id": chosen_id,
+            "validation_score": replay_val_score,
+            "final_private_score": final_private_score,
+        }
+
+    def set_mode(self, mode: str):
+        allowed_modes = ["single-shot", "repeated", "fixed-transitions", "flexible"]
+        if mode not in allowed_modes:
+            raise ValueError(f"Неизвестный режим. Выберите из: {allowed_modes}")
+
+        self.mode = mode
+        self.attempts_made = 0
+        self.current_stage = "EDA"
+        self.logs.append({"action": "set_mode", "mode": mode})
+
+    def _execute_code(self, agent_code: str) -> dict:
+        try:
+            local_vars = {"train_df": self.train_data}
+            exec(agent_code, {}, local_vars)
+
+            model = local_vars.get("model")
+            if model is None:
+                error_msg = "Объект 'model' не найден в вашем коде."
+                self.logs.append({"action": "execute_failed", "error": error_msg})
+                return {"success": False, "error": error_msg}
+
+            preds = model.predict(self.val_x)
+            val_score = accuracy_score(self.val_y, preds)
+
+            attempt_id = f"attempt_{len(self.candidates) + 1}"
+            self.candidates[attempt_id] = {
+                "agent_code": agent_code,
+                "val_score": val_score,
+            }
+
+            self.logs.append(
+                {
+                    "action": "execute_success",
+                    "candidate_id": attempt_id,
+                    "val_score": val_score,
+                }
+            )
+            return {"success": True, "val_score": val_score, "candidate_id": attempt_id, "error": None}
+
+        except Exception:
+            import traceback
+
+            err_trace = traceback.format_exc()
+            self.logs.append({"action": "execute_runtime_error", "error": err_trace})
+            return {"success": False, "error": err_trace}
+
+    def _execute_stage_code(self, agent_code: str) -> dict:
+        try:
+            local_vars = {"train_df": self.train_data}
+            exec(agent_code, {}, local_vars)
+            self.logs.append({"action": "stage_execute_success"})
+            return {"success": True, "error": None}
+
+        except Exception:
+            import traceback
+
+            err_trace = traceback.format_exc()
+            self.logs.append({"action": "stage_execute_runtime_error", "error": err_trace})
+            return {"success": False, "error": err_trace}
+
+    def step(self, agent_code: str, stage_action: str = None) -> dict:
+        if stage_action:
+            stage_action = stage_action.upper()
+
+        self.attempts_made += 1
+
+        if self.mode == "single-shot":
+            if self.attempts_made > 1:
+                self.logs.append({"action": "rule_violation", "error": "Превышение попыток в single-shot"})
+                return {"status": "Rejected", "error": "В режиме Single-shot разрешена только 1 попытка."}
+
+            self._execute_code(agent_code)
+            return {"status": "Accepted"}
+
+        if self.mode == "repeated":
+            if self.attempts_made > self.max_attempts:
+                self.logs.append({"action": "rule_violation", "error": "Превышение лимита попыток в repeated"})
+                return {"status": "Rejected", "error": f"Превышен лимит попыток ({self.max_attempts})."}
+
+            res = self._execute_code(agent_code)
+            if not res["success"]:
+                return {
+                    "status": "Execution Error",
+                    "validation_score": None,
+                    "message": "В коде произошла ошибка. Логи компилятора скрыты настройками режима.",
+                }
+
+            return {
+                "status": "Success",
+                "validation_score": res["val_score"],
+            }
+
+        if self.mode == "fixed-transitions":
+            pipeline = ["EDA", "FEATURES", "TRAIN"]
+
+            if stage_action not in pipeline:
+                self.logs.append({"action": "rule_violation", "error": f"Неизвестный шаг пайплайна: {stage_action}"})
+                return {"status": "Rejected", "error": f"Неизвестный шаг. Возможные шаги: {pipeline}"}
+
+            if stage_action != self.current_stage:
+                self.logs.append(
+                    {
+                        "action": "rule_violation",
+                        "error": f"Нарушен порядок шагов. Ожидался: {self.current_stage}, вызван: {stage_action}",
+                    }
+                )
+                return {
+                    "status": "Pipeline Violation",
+                    "error": (
+                        f"Нарушена последовательность! Сейчас вы должны выполнять этап: {self.current_stage}. "
+                        f"Вызов этапа {stage_action} заблокирован."
+                    ),
+                }
+
+            if stage_action == "TRAIN":
+                res = self._execute_code(agent_code)
+            else:
+                res = self._execute_stage_code(agent_code)
+
+            if not res["success"]:
+                return {"status": "Runtime Error", "traceback": res["error"]}
+
+            current_idx = pipeline.index(self.current_stage)
+            if current_idx < len(pipeline) - 1:
+                self.current_stage = pipeline[current_idx + 1]
+
+            response = {
+                "status": "Success",
+                "message": f"Этап {stage_action} пройден успешно. Следующий обязательный этап: {self.current_stage}",
+            }
+
+            if "val_score" in res:
+                response["validation_score"] = res["val_score"]
+                response["candidate_id"] = res["candidate_id"]
+
+            return response
+
+        if self.mode == "flexible":
+            res = self._execute_code(agent_code)
+            if not res["success"]:
+                return {
+                    "status": "Runtime Error",
+                    "traceback": res["error"],
+                    "hint": "Проверьте совместимость типов данных или размерность матриц.",
+                }
+
+            return {
+                "status": "Success",
+                "validation_score": res["val_score"],
+                "candidate_id": res["candidate_id"],
+            }
+
+        return {"status": "Rejected", "error": f"Неизвестный режим: {self.mode}"}
 
 
 @dataclass
