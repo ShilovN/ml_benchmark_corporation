@@ -44,6 +44,7 @@ class AgentContext:
     trajectory: list[dict[str, Any]] = field(default_factory=list)
     dataset: DatasetState | None = None
     history_file: Path = Path(DEFAULT_HISTORY_FILENAME)
+    docker_container: str | None = None
 
 
 class CommandExecutor:
@@ -96,9 +97,6 @@ class CommandExecutor:
             }
         except Exception as exc:
             result = self._error(command, str(exc), started_at)
-
-        if command.name != "get_hints":
-            result["feedback"] = self._build_feedback()
 
         self._record_trajectory(command, result)
         return result
@@ -179,9 +177,9 @@ class CommandExecutor:
         code_or_file = _required_str(args, "code_or_file")
         candidate = self._maybe_workspace_path(code_or_file)
         if candidate and candidate.exists() and candidate.is_file():
-            command = ["python3", str(candidate)]
+            command = self._python_file_command(candidate)
         else:
-            command = ["python3", "-c", code_or_file]
+            command = self._python_code_command(code_or_file)
 
         completed = subprocess.run(
             command,
@@ -196,6 +194,34 @@ class CommandExecutor:
             "stdout": _truncate(completed.stdout),
             "stderr": _truncate(completed.stderr),
         }
+
+    def _python_file_command(self, path: Path) -> list[str]:
+        if self.context.docker_container:
+            relative_path = path.resolve().relative_to(self.context.workspace.resolve())
+            return [
+                "docker",
+                "exec",
+                "-w",
+                "/workspace",
+                self.context.docker_container,
+                "python3",
+                str(Path("/workspace") / relative_path),
+            ]
+        return ["python3", str(path)]
+
+    def _python_code_command(self, code: str) -> list[str]:
+        if self.context.docker_container:
+            return [
+                "docker",
+                "exec",
+                "-w",
+                "/workspace",
+                self.context.docker_container,
+                "python3",
+                "-c",
+                code,
+            ]
+        return ["python3", "-c", code]
 
     def _get_budget_status(self, args: dict[str, Any]) -> dict[str, int]:
         _ensure_no_args(args)
@@ -220,7 +246,7 @@ class CommandExecutor:
 
     def _get_hints(self, args: dict[str, Any]) -> dict[str, Any]:
         _ensure_no_args(args)
-        return self._build_feedback()
+        return self.build_feedback()
 
     def _submit(self, args: dict[str, Any]) -> dict[str, Any]:
         submission_path = self._resolve_path(_required_str(args, "file"))
@@ -237,7 +263,7 @@ class CommandExecutor:
         )
 
     def _load_task_config(self, task_id: str) -> dict[str, Any]:
-        tasks_dir = self._resolve_path(str(self.context.tasks_dir))
+        tasks_dir = self.context.tasks_dir.resolve()
         task_dir = tasks_dir / task_id
         config_path = task_dir / "task.json"
         if not config_path.exists():
@@ -290,7 +316,7 @@ class CommandExecutor:
                 records.append(json.loads(line))
         return records
 
-    def _build_feedback(self) -> dict[str, Any]:
+    def build_feedback(self) -> dict[str, Any]:
         return HintEngine(
             workspace=self.context.workspace,
             task_id=self.context.task_id,

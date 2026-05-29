@@ -1,3 +1,4 @@
+import argparse
 import json
 import tempfile
 import unittest
@@ -5,6 +6,7 @@ from pathlib import Path
 
 from agent.executor import AgentContext, CommandExecutor
 from agent.parser import extract_command_text, parse_command, parse_model_response
+from main import BenchmarkStats, build_followup_prompt
 
 
 class ParserTest(unittest.TestCase):
@@ -76,11 +78,26 @@ class ExecutorTest(unittest.TestCase):
             history_lines = history_path.read_text(encoding="utf-8").splitlines()
 
         self.assertEqual(write_result["status"], "ok")
-        self.assertIn("feedback", write_result)
+        self.assertNotIn("feedback", write_result)
         self.assertEqual(read_result["result"]["content"], "hello")
         self.assertEqual(len(trajectory_result["result"]), 2)
         self.assertEqual(len(history_lines), 3)
         self.assertEqual(json.loads(history_lines[0])["command"], "write_file")
+
+    def test_followup_prompt_contains_one_batch_feedback(self) -> None:
+        args = argparse.Namespace(token_limit=None, max_steps=100, time_limit_seconds=3600)
+        command_results = [
+            {"status": "ok", "command": "write_file", "result": {"path": "a.txt"}},
+            {"status": "ok", "command": "read_file", "result": {"content": "hello"}},
+        ]
+        feedback = {"hints": [{"stage": "EDA", "message": "hint"}]}
+
+        prompt = build_followup_prompt(command_results, BenchmarkStats(), args, feedback)
+        payload = json.loads(prompt.split("\n\n", 1)[1])
+
+        self.assertEqual(payload["feedback"], feedback)
+        self.assertNotIn("feedback", payload["command_results"][0])
+        self.assertNotIn("feedback", payload["command_results"][1])
 
     def test_get_hints_returns_abstract_feedback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

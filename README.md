@@ -140,6 +140,32 @@ python3 -m agent.cli 'get_hints()'
 python3 -m agent.cli 'submit("checker/tasks/salary_prediction/answers.csv")'
 ```
 
+## Docker ML Environment
+
+Build the benchmark image once:
+
+```bash
+docker build -f Dockerfile.benchmark -t ml-benchmark-runner:latest .
+```
+
+By default, `main.py` creates a per-run container from this prebuilt image and
+mounts a fresh workspace containing the public task files. Dependencies are not
+installed during each benchmark run. The image includes OpenMP runtime plus the
+ML stack from `requirements-ml.txt`: pandas, NumPy, SciPy, scikit-learn,
+plotting libraries, gradient boosting libraries, and Optuna.
+
+Use a different prebuilt image:
+
+```bash
+python3 main.py --docker-image my-benchmark-image:latest
+```
+
+Run without Docker:
+
+```bash
+python3 main.py --no-docker
+```
+
 ## Trajectory
 
 Every executed command is stored in:
@@ -178,7 +204,9 @@ Example hint:
 }
 ```
 
-Each command result includes a `feedback` field, and the LLM can explicitly call:
+During the benchmark loop, feedback is added once after the full batch of
+commands from the latest model response has executed. The LLM can explicitly
+request the same hints with:
 
 ```text
 get_hints()
