@@ -99,6 +99,21 @@ class ExecutorTest(unittest.TestCase):
         self.assertNotIn("feedback", payload["command_results"][0])
         self.assertNotIn("feedback", payload["command_results"][1])
 
+    def test_followup_prompt_contains_remaining_budget(self) -> None:
+        args = argparse.Namespace(token_limit=1000, max_steps=10, time_limit_seconds=3600)
+        stats = BenchmarkStats()
+        stats.total_tokens = 250
+        stats.executed_commands = 4
+
+        prompt = build_followup_prompt([], stats, args)
+        payload = json.loads(prompt.split("\n\n", 1)[1])
+
+        self.assertIn("осталось 75.0% токенов", prompt)
+        self.assertIn("осталось итераций: 6", prompt)
+        self.assertEqual(payload["benchmark_status"]["remaining_tokens"], 750)
+        self.assertEqual(payload["benchmark_status"]["remaining_token_percent"], 75.0)
+        self.assertEqual(payload["benchmark_status"]["remaining_iterations"], 6)
+
     def test_get_hints_returns_abstract_feedback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             workspace = Path(tmp_dir)

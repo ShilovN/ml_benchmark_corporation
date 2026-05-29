@@ -24,6 +24,7 @@ from agent.llm_client import (
     SYSTEM_MESSAGE,
     URL,
     Message,
+    auth_headers,
     chat_completion,
 )
 from agent.parser import (
@@ -192,6 +193,8 @@ def main() -> int:
         task_id=args.task_id,
         per_file_limit=args.context_chars_per_file,
         total_limit=args.context_total_chars,
+        stats=stats,
+        args=args,
     )
 
     print("Benchmark started")
@@ -223,6 +226,7 @@ def main() -> int:
                 stats.stop_reason = "step_limit"
                 break
 
+            print_debug_state("before_model_request", stats, args, history, user_message)
             try:
                 response = chat_completion(
                     user_message,
@@ -243,6 +247,15 @@ def main() -> int:
             stats.requests += 1
             update_token_stats(stats, response.get("usage", {}))
             assistant_text = extract_assistant_text(response)
+            print_debug_state(
+                "after_model_response",
+                stats,
+                args,
+                history,
+                user_message,
+                assistant_text=assistant_text,
+                usage=response.get("usage", {}),
+            )
             history.append({"role": "user", "content": user_message})
             history.append({"role": "assistant", "content": assistant_text})
 
@@ -250,7 +263,7 @@ def main() -> int:
                 commands = extract_commands(assistant_text)
             except ValueError as exc:
                 stats.parse_errors += 1
-                user_message = build_parse_error_prompt(assistant_text, exc)
+                user_message = build_parse_error_prompt(assistant_text, exc, stats, args)
                 continue
 
             command_results: list[dict[str, Any]] = []
@@ -377,13 +390,15 @@ def create_run_workspace(source_workspace: Path, run_root: Path, task_id: str) -
 def resolve_llm_url(args: argparse.Namespace) -> str:
     if args.base_url:
         return build_chat_completions_url(args.base_url)
-    return args.url
+    return build_chat_completions_url(args.url)
 
 
 def build_chat_completions_url(base_url: str) -> str:
     stripped = base_url.rstrip("/")
     if stripped.endswith("/chat/completions"):
         return stripped
+    if stripped.endswith("/openai"):
+        return f"{stripped}/chat/completions"
     if stripped.endswith("/v1") or stripped.endswith("/compatible-mode/v1"):
         return f"{stripped}/chat/completions"
     return f"{stripped}/compatible-mode/v1/chat/completions"
@@ -391,7 +406,7 @@ def build_chat_completions_url(base_url: str) -> str:
 
 def preflight_llm(chat_url: str, timeout: int) -> None:
     models_url = build_models_url(chat_url)
-    request = urllib.request.Request(models_url, method="GET")
+    request = urllib.request.Request(models_url, headers=auth_headers(), method="GET")
     try:
         with urllib.request.urlopen(request, timeout=min(timeout, 10)) as response:
             payload = response.read().decode("utf-8", errors="replace")
@@ -436,13 +451,17 @@ def build_initial_prompt(
     task_id: str,
     per_file_limit: int,
     total_limit: int,
+    stats: BenchmarkStats,
+    args: argparse.Namespace,
 ) -> str:
     file_previews = collect_file_previews(
         workspace,
         per_file_limit=per_file_limit,
         total_limit=total_limit,
     )
+    budget_line = format_budget_line(stats, args)
     return (
+        f"{budget_line}\n\n"
         "Ты решаешь ML benchmark task. Работай только через доступные агентские команды. "
         "В одном ответе можно вернуть одну или несколько команд, но каждая команда должна быть "
         "отдельной строкой или отдельным fenced-блоком. Вызови submit(file) ровно один раз, "
@@ -544,8 +563,14 @@ def command_candidates(response_text: str) -> list[str]:
     return unique
 
 
-def build_parse_error_prompt(assistant_text: str, exc: Exception) -> str:
+def build_parse_error_prompt(
+    assistant_text: str,
+    exc: Exception,
+    stats: BenchmarkStats,
+    args: argparse.Namespace,
+) -> str:
     return (
+        f"{format_budget_line(stats, args)}\n\n"
         "Твой прошлый ответ не удалось распарсить как агентскую команду.\n"
         f"Ошибка парсинга: {exc}\n\n"
         "Верни только валидные команды, по одной на строку. "
@@ -560,6 +585,7 @@ def build_followup_prompt(
     args: argparse.Namespace,
     feedback: dict[str, Any] | None = None,
 ) -> str:
+    budget_status = build_budget_status(stats, args)
     payload = {
         "command_results": command_results,
         "feedback": feedback,
@@ -568,17 +594,119 @@ def build_followup_prompt(
             "requests": stats.requests,
             "total_tokens": stats.total_tokens,
             "token_limit": args.token_limit,
+            "remaining_tokens": budget_status["remaining_tokens"],
+            "remaining_token_percent": budget_status["remaining_token_percent"],
             "used_steps": stats.executed_commands,
             "max_steps": args.max_steps,
+            "remaining_iterations": budget_status["remaining_iterations"],
             "remaining_seconds": max(0.0, args.time_limit_seconds - stats.elapsed_seconds),
         },
     }
     return (
+        f"{format_budget_line(stats, args)} "
         "Результаты выполнения твоих команд и подсказки hidden checklist ниже. "
         "Продолжай решать задачу только агентскими командами. "
         "Когда submission.csv готов, вызови submit(\"submission.csv\").\n\n"
         + json.dumps(payload, ensure_ascii=False, indent=2, default=str)
     )
+
+
+def build_budget_status(stats: BenchmarkStats, args: argparse.Namespace) -> dict[str, Any]:
+    token_limit = getattr(args, "token_limit", None)
+    max_steps = getattr(args, "max_steps", 0)
+    remaining_iterations = max(0, max_steps - stats.executed_commands)
+    remaining_tokens: int | None = None
+    remaining_token_percent: float | None = None
+    if token_limit:
+        remaining_tokens = max(0, token_limit - stats.total_tokens)
+        remaining_token_percent = round((remaining_tokens / token_limit) * 100, 2)
+    return {
+        "remaining_tokens": remaining_tokens,
+        "remaining_token_percent": remaining_token_percent,
+        "remaining_iterations": remaining_iterations,
+    }
+
+
+def format_budget_line(stats: BenchmarkStats, args: argparse.Namespace) -> str:
+    status = build_budget_status(stats, args)
+    percent = status["remaining_token_percent"]
+    if percent is None:
+        token_text = "лимит токенов не задан"
+    else:
+        token_text = f"осталось {percent}% токенов"
+    return f"Бюджет: {token_text}; осталось итераций: {status['remaining_iterations']}."
+
+
+def print_debug_state(
+    event: str,
+    stats: BenchmarkStats,
+    args: argparse.Namespace,
+    history: list[Message],
+    user_message: str,
+    *,
+    assistant_text: str | None = None,
+    usage: Any | None = None,
+) -> None:
+    budget_status = build_budget_status(stats, args)
+    token_limit = getattr(args, "token_limit", None)
+    max_steps = getattr(args, "max_steps", None)
+    title = event.replace("_", " ").title()
+    print(f"\n=== DEBUG: {title} ===")
+    print(f"Elapsed: {stats.elapsed_seconds}s | Requests: {stats.requests}")
+    print(
+        "Tokens: "
+        f"{stats.total_tokens}/{format_optional_int(token_limit)} total "
+        f"(prompt {stats.prompt_tokens}, completion {stats.completion_tokens}) | "
+        f"remaining {format_optional_int(budget_status['remaining_tokens'])} "
+        f"({format_optional_percent(budget_status['remaining_token_percent'])})"
+    )
+    print(
+        "Iterations: "
+        f"{stats.executed_commands}/{format_optional_int(max_steps)} used | "
+        f"remaining {budget_status['remaining_iterations']}"
+    )
+    if usage is not None:
+        print(f"Last usage: {format_usage(usage)}")
+    print(f"History: {len(history)} messages")
+    for index, message in enumerate(history[-6:], start=max(1, len(history) - 5)):
+        role = str(message.get("role", "unknown")).upper()
+        content = message.get("content", "")
+        print(f"  [{index:02d}] {role} ({len(content)} chars)")
+        print(indent_preview(preview_text(content, limit=700), prefix="       "))
+    print("Next user message:")
+    print(indent_preview(preview_text(user_message, limit=1000), prefix="  "))
+    if assistant_text is not None:
+        print("Assistant response:")
+        print(indent_preview(preview_text(assistant_text, limit=1000), prefix="  "))
+    print("=" * 32)
+
+
+def format_optional_int(value: Any) -> str:
+    return "unlimited" if value is None else str(value)
+
+
+def format_optional_percent(value: Any) -> str:
+    return "n/a" if value is None else f"{value}%"
+
+
+def format_usage(usage: Any) -> str:
+    if not isinstance(usage, dict):
+        return str(usage)
+    prompt = usage.get("prompt_tokens", 0)
+    completion = usage.get("completion_tokens", 0)
+    total = usage.get("total_tokens", 0)
+    return f"prompt {prompt}, completion {completion}, total {total}"
+
+
+def indent_preview(text: str, prefix: str) -> str:
+    return "\n".join(prefix + line for line in text.splitlines())
+
+
+def preview_text(text: str, limit: int = 1200) -> str:
+    compact = text.replace("\r\n", "\n")
+    if len(compact) <= limit:
+        return compact
+    return compact[:limit] + f"... <truncated {len(compact) - limit} chars>"
 
 
 def update_token_stats(stats: BenchmarkStats, usage: Any) -> None:
