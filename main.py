@@ -63,10 +63,12 @@ SKIP_DIRS = {
 SKIP_FILENAMES = {
     "agent_history.txt",
 }
-DEFAULT_CONTEXT_CHARS_PER_FILE = 2500
-DEFAULT_CONTEXT_TOTAL_CHARS = 30000
+DEFAULT_CONTEXT_CHARS_PER_FILE = 900
+DEFAULT_CONTEXT_TOTAL_CHARS = 10000
 DEFAULT_DOCKER_IMAGE = "ml-benchmark-runner:latest"
-MAX_FOLLOWUP_PROMPT_CHARS = 60000
+MAX_HISTORY_MESSAGES = 8
+MAX_HISTORY_MESSAGE_CHARS = 2500
+MAX_FOLLOWUP_PROMPT_CHARS = 30000
 MIN_COMPACT_STRING_CHARS = 1000
 
 
@@ -502,10 +504,10 @@ def main() -> int:
                 response = chat_completion(
                     user_message,
                     system_message=SYSTEM_MESSAGE,
-                    history=history,
+                    history=compact_history_for_model(history),
                     url=llm_url,
                     model=args.model,
-                    max_tokens=args.max_tokens,
+                    max_tokens=response_max_tokens(stats, args),
                     temperature=args.temperature,
                     timeout=args.request_timeout,
                 )
@@ -733,12 +735,11 @@ def build_initial_prompt(
     budget_line = format_budget_line(stats, args)
     return (
         f"{budget_line}\n\n"
-        "Ты решаешь ML benchmark task. Работай только через доступные агентские команды. "
-        "В одном ответе можно вернуть одну или несколько команд, но каждая команда должна быть "
-        "отдельной строкой или отдельным fenced-блоком. Вызови submit(file) ровно один раз, "
-        "когда файл submission готов.\n\n"
+        "ML benchmark. Отвечай только агентскими командами, по одной на строку. "
+        "Сначала проверь данные, затем быстро готовь submission.csv и вызови submit(\"submission.csv\"). "
+        "Не трать токены на объяснения.\n\n"
         f"task_id: {task_id}\n"
-        "Ниже частичное содержимое файлов workspace. Секретные answer/submission файлы не включены.\n\n"
+        "Компактный обзор workspace. Для деталей используй read_file/load_dataset/show_sample_rows.\n\n"
         f"{file_previews}"
     )
 
@@ -761,16 +762,28 @@ def collect_file_previews(workspace: Path, *, per_file_limit: int, total_limit: 
         if hidden_answer_file:
             continue
 
-        preview = content[:per_file_limit]
-        if len(content) > per_file_limit:
-            preview += "\n...[truncated]"
-        chunk = f"### {relative}\n```text\n{preview}\n```\n"
+        preview = compact_file_preview(relative, content, per_file_limit)
+        chunk = f"{relative} ({len(content)} chars)\n{preview}\n"
         if used_chars + len(chunk) > total_limit:
             chunks.append("...[initial context truncated]")
             break
         chunks.append(chunk)
         used_chars += len(chunk)
     return "\n".join(chunks) if chunks else "(no readable text files found)"
+
+
+def compact_file_preview(relative: Path, content: str, limit: int) -> str:
+    suffix = relative.suffix.lower()
+    if suffix in {".csv", ".tsv"}:
+        lines = content.splitlines()
+        delimiter = "\\t" if suffix == ".tsv" else ","
+        preview_lines = lines[:4]
+        preview = "\n".join(preview_lines)
+        if len(lines) > len(preview_lines):
+            preview += f"\n...[{len(lines) - len(preview_lines)} more rows; delimiter={delimiter}]"
+    else:
+        preview = content
+    return truncate_middle(preview, limit)
 
 
 def should_skip_path(workspace: Path, path: Path) -> bool:
@@ -842,11 +855,10 @@ def build_parse_error_prompt(
 ) -> str:
     return (
         f"{format_budget_line(stats, args)}\n\n"
-        "Твой прошлый ответ не удалось распарсить как агентскую команду.\n"
+        "Твой прошлый ответ не распарсился как команда.\n"
         f"Ошибка парсинга: {exc}\n\n"
-        "Верни только валидные команды, по одной на строку. "
-        "Не объясняй ход мыслей вне команд.\n\n"
-        f"Прошлый ответ:\n{assistant_text[:4000]}"
+        "Верни только валидные команды, по одной на строку. Без объяснений.\n\n"
+        f"Прошлый ответ:\n{truncate_middle(assistant_text, 1200)}"
     )
 
 
@@ -963,9 +975,59 @@ def format_budget_line(stats: BenchmarkStats, args: argparse.Namespace) -> str:
     else:
         token_text = f"осталось {percent}% токенов"
     line = f"Бюджет: {token_text}; осталось итераций: {status['remaining_iterations']}."
-    if percent is not None and percent < 30:
-        line += " Экономь токены: скоро сделай submit, иначе проиграешь."
+    directive = budget_directive(percent)
+    if directive:
+        line += f" {directive}"
     return line
+
+
+def budget_directive(percent: float | None) -> str:
+    if percent is None:
+        return ""
+    if percent < 15:
+        return "КРИТИЧНО: вызывай submit с лучшим текущим файлом сейчас, иначе проиграешь."
+    if percent < 30:
+        return "Экономь токены: следующий шаг должен готовить/проверять submission или делать submit, иначе проиграешь."
+    if percent < 50:
+        return "Экономь токены: прекращай исследование, делай простой baseline и двигайся к submit."
+    return ""
+
+
+def response_max_tokens(stats: BenchmarkStats, args: argparse.Namespace) -> int:
+    configured = getattr(args, "max_tokens", DEFAULT_MAX_TOKENS)
+    percent = build_budget_status(stats, args)["remaining_token_percent"]
+    if percent is None:
+        return configured
+    if percent < 15:
+        return min(configured, 512)
+    if percent < 30:
+        return min(configured, 768)
+    if percent < 50:
+        return min(configured, 1024)
+    return configured
+
+
+def compact_history_for_model(history: list[Message]) -> list[Message]:
+    if len(history) <= MAX_HISTORY_MESSAGES:
+        return [compact_history_message(message) for message in history]
+    compacted = [
+        {
+            "role": "user",
+            "content": (
+                f"[history compacted: hidden {len(history) - MAX_HISTORY_MESSAGES} old messages. "
+                "Use get_trajectory() if old command results are needed.]"
+            ),
+        }
+    ]
+    compacted.extend(compact_history_message(message) for message in history[-MAX_HISTORY_MESSAGES:])
+    return compacted
+
+
+def compact_history_message(message: Message) -> Message:
+    return {
+        "role": message.get("role", "user"),
+        "content": truncate_middle(message.get("content", ""), MAX_HISTORY_MESSAGE_CHARS),
+    }
 
 
 def print_debug_state(
@@ -991,6 +1053,7 @@ def print_debug_state(
         f"remaining {format_optional_int(budget_status['remaining_tokens'])} "
         f"({format_optional_percent(budget_status['remaining_token_percent'])})"
     )
+    print(f"Next max_tokens: {response_max_tokens(stats, args)}")
     print(
         "Iterations: "
         f"{stats.executed_commands}/{format_optional_int(max_steps)} used | "
