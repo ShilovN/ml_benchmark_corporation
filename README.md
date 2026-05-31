@@ -21,9 +21,49 @@ The intended loop is:
 5. The agent improves the solution and eventually calls `submit(file)`.
 6. `checker` validates the submission and returns the metric.
 
+## LLM Agent Web UI
+
+The main interface for the benchmark is the agent runner. It starts the LLM,
+shows the model responses, parsed commands, command outputs, feedback hints,
+budget counters, and the final submission result.
+
+Run:
+
+```bash
+python3 -m agent.web_server --host 127.0.0.1 --port 8010
+```
+
+Open:
+
+```text
+http://127.0.0.1:8010/
+```
+
+From the page you can:
+
+- choose a task;
+- set the OpenAI-compatible LLM URL;
+- choose one of the available models: `deepseek-v4-flash` or `gemma-4-26b`;
+- choose a run mode: `single-shot` or `multi-shot`;
+- start or stop a benchmark run;
+- watch the live trajectory of prompts, model responses, commands, results, and hints;
+- see the final `submit(file)` result.
+
+Each run gets an isolated workspace under `benchmark_runs/`. Public task files
+such as `train.csv`, `test.csv`, and public `task.json` are copied there. Hidden
+answer files stay in `checker/tasks/...` and are only used by `submit(file)`.
+
+In `single-shot` mode, the model gets one response. If it does not call
+`submit(file)`, the runner performs a forced final submit. In `multi-shot` mode,
+the model can iterate until it submits or hits the configured limits. If limits
+are reached before submit, the runner still performs a forced final submit:
+existing `submission.csv` is used when present, otherwise a simple baseline
+`submission.csv` is generated.
+
 ## Checker
 
-The checker computes metrics from answer files and submission files. It supports:
+The checker is the lower-level scoring and upload server. It computes metrics
+from answer files and submission files. It supports:
 
 - text, CSV, TSV, and JSON inputs;
 - row alignment by `id`;
@@ -32,7 +72,7 @@ The checker computes metrics from answer files and submission files. It supports
 - regression metrics: `mae`, `mse`, `rmse`, `r2`;
 - an HTTP server for uploads and task files.
 
-Run the server:
+Run the checker server:
 
 ```bash
 python3 checker/server.py --host 127.0.0.1 --port 8000
@@ -43,6 +83,15 @@ Open the browser UI:
 ```text
 http://127.0.0.1:8000/
 ```
+
+The UI provides:
+
+- task selection and metric metadata;
+- links for public task files such as `train.csv` and `test.csv`;
+- drag-and-drop or file-picker submission upload;
+- latest score summary;
+- raw JSON response for debugging;
+- per-task submission history.
 
 Useful endpoints:
 

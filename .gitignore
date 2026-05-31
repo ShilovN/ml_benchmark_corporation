@@ -1,4 +1,5 @@
 agent_history.txt
+benchmark_runs/
 benchmark_runs
 .idea
 __pycache__
