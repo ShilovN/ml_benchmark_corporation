@@ -614,13 +614,14 @@ def render_agent_page() -> str:
   <style>
     :root { --bg:#f5f7fa; --surface:#fff; --border:#d8e0ea; --text:#152033; --muted:#667085; --accent:#155eef; --ok:#067647; --bad:#b42318; }
     body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:var(--bg); color:var(--text); }
-    main { max-width:1240px; margin:0 auto; padding:28px 20px 44px; }
+    main { max-width:1240px; margin:0 auto; padding:28px 20px 44px; overflow-x:hidden; }
     header { display:flex; justify-content:space-between; gap:18px; align-items:flex-start; margin-bottom:20px; }
     h1 { margin:0 0 8px; font-size:30px; line-height:1.15; }
     h2 { margin:0 0 14px; font-size:18px; }
     p { margin:0; color:var(--muted); }
-    section { background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:18px; margin-bottom:16px; }
+    section { min-width:0; background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:18px; margin-bottom:16px; }
     .layout { display:grid; grid-template-columns:360px minmax(0,1fr); gap:18px; align-items:start; }
+    .layout > * { min-width:0; }
     label { display:block; margin:0 0 7px; font-weight:700; }
     input, select, button { box-sizing:border-box; width:100%; min-height:40px; font:inherit; }
     input, select { border:1px solid var(--border); border-radius:6px; padding:8px; background:white; }
@@ -633,11 +634,41 @@ def render_agent_page() -> str:
     .cards { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; }
     .card { border:1px solid var(--border); border-radius:8px; padding:12px; background:#f8fafc; }
     .card strong { display:block; font-size:22px; margin-top:4px; }
-    .events { display:grid; gap:10px; }
-    .event { border:1px solid var(--border); border-radius:8px; padding:12px; background:white; }
+    .events { display:grid; gap:10px; min-width:0; }
+    .event { min-width:0; max-width:100%; overflow:hidden; border:1px solid var(--border); border-radius:8px; padding:12px; background:white; }
+    .event.prompt { border-left:4px solid #155eef; }
+    .event.llm { border-left:4px solid #7c3aed; }
+    .event.command { border-left:4px solid #c2410c; }
+    .event.result { border-left:4px solid #067647; }
+    .event.error, .event.parse_error { border-left:4px solid var(--bad); }
     .event-head { display:flex; justify-content:space-between; gap:10px; color:var(--muted); font-size:13px; margin-bottom:8px; }
     .kind { font-weight:800; color:var(--accent); text-transform:uppercase; }
-    pre { margin:0; white-space:pre-wrap; word-break:break-word; max-height:280px; overflow:auto; background:#111827; color:#f9fafb; border-radius:6px; padding:12px; font-size:13px; }
+    .event-body { box-sizing:border-box; width:100%; min-width:0; white-space:pre-wrap; line-height:1.45; max-height:220px; overflow:auto; background:#f8fafc; border:1px solid var(--border); border-radius:6px; padding:12px; margin-top:10px; }
+    .event-body.structured { white-space:normal; }
+    .event.expanded .event-body { max-height:none; }
+    .block { min-width:0; overflow:hidden; border:1px solid var(--border); border-radius:6px; background:white; padding:10px; margin:8px 0; }
+    .block-title { font-weight:800; margin-bottom:6px; color:var(--text); }
+    .block pre { background:#f8fafc; color:var(--text); border:1px solid var(--border); max-height:180px; }
+    .code-block { box-sizing:border-box; width:100%; max-width:100%; background:#111827; color:#f9fafb; border-radius:6px; padding:12px; overflow:auto; max-height:340px; font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; font-size:13px; white-space:pre; }
+    .inline-code { display:inline-block; box-sizing:border-box; max-width:100%; overflow:hidden; text-overflow:ellipsis; vertical-align:bottom; font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; background:#eef3f8; border:1px solid var(--border); border-radius:4px; padding:1px 4px; }
+    .md-heading { font-weight:800; margin:10px 0 6px; }
+    .md-paragraph { margin:4px 0; }
+    .md-rule { border:0; border-top:1px solid var(--border); margin:10px 0; }
+    .command-name { font-size:16px; font-weight:900; color:var(--text); }
+    .command-call { max-width:100%; margin-top:8px; overflow:hidden; }
+    .arg-list { display:grid; gap:8px; margin-top:8px; }
+    .arg-row { min-width:0; overflow:hidden; border:1px solid var(--border); border-radius:6px; padding:10px; background:#fff; }
+    .arg-name { display:block; color:var(--muted); font-weight:800; margin-bottom:6px; }
+    .hint-list { margin:6px 0 0; padding-left:20px; }
+    .hint-list li { margin-bottom:6px; }
+    .kv { display:grid; grid-template-columns:180px minmax(0,1fr); gap:6px 12px; font-size:14px; }
+    .kv span { min-width:0; overflow-wrap:anywhere; }
+    .kv span:nth-child(odd) { color:var(--muted); font-weight:700; }
+    .event-actions { display:flex; gap:8px; margin-top:10px; flex-wrap:wrap; }
+    .small-button { width:auto; min-height:32px; padding:0 10px; font-size:13px; background:#eef3f8; color:var(--text); border:1px solid var(--border); }
+    details { margin-top:10px; }
+    summary { cursor:pointer; color:var(--muted); font-weight:700; }
+    pre { box-sizing:border-box; width:100%; max-width:100%; margin:0; white-space:pre-wrap; word-break:break-word; max-height:280px; overflow:auto; background:#111827; color:#f9fafb; border-radius:6px; padding:12px; font-size:13px; }
     .message { border-radius:8px; padding:12px; background:#eef3f8; color:var(--muted); margin-top:12px; }
     .error { color:var(--bad); background:#fef3f2; border:1px solid #fecdca; }
     @media (max-width:900px){ header,.layout{display:block}.row,.cards{grid-template-columns:1fr} }
@@ -716,6 +747,216 @@ const message = document.getElementById('message');
 const statusEl = document.getElementById('status');
 const eventsEl = document.getElementById('events');
 function esc(v){return String(v).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');}
+function cleanText(value){return String(value ?? '').trim();}
+function renderMarkdownish(text){
+  text = cleanText(text);
+  if(!text) return '<div class="md-paragraph">Empty message.</div>';
+  const parts = [];
+  const fence = /```(\w+)?\\n([\s\S]*?)```/g;
+  let last = 0;
+  for(const match of text.matchAll(fence)){
+    parts.push(renderPlainText(text.slice(last, match.index)));
+    parts.push(`<div class="code-block">${esc(match[2].trim())}</div>`);
+    last = match.index + match[0].length;
+  }
+  parts.push(renderPlainText(text.slice(last)));
+  return parts.join('');
+}
+function renderPlainText(text){
+  text = cleanText(text);
+  if(!text) return '';
+  return text
+    .split('\\n')
+    .map(line => {
+      const trimmed = line.trim();
+      if(!trimmed) return '';
+      if(trimmed === '***' || trimmed === '---') return '<hr class="md-rule">';
+      if(trimmed.startsWith('### ')) return `<div class="md-heading">${esc(trimmed.slice(4))}</div>`;
+      if(trimmed.startsWith('## ')) return `<div class="md-heading">${esc(trimmed.slice(3))}</div>`;
+      if(trimmed.startsWith('# ')) return `<div class="md-heading">${esc(trimmed.slice(2))}</div>`;
+      return `<div class="md-paragraph">${esc(trimmed)}</div>`;
+    })
+    .join('');
+}
+function isProbablyCode(value){
+  return typeof value === 'string' && (
+    value.includes('\\n') ||
+    value.includes('import ') ||
+    value.includes('def ') ||
+    value.includes('pd.read_csv') ||
+    value.includes('print(')
+  );
+}
+function renderValue(value){
+  if(isProbablyCode(value)) return `<div class="code-block">${esc(cleanText(value))}</div>`;
+  if(typeof value === 'string') return `<span class="inline-code">${esc(cleanText(value))}</span>`;
+  return `<pre>${esc(JSON.stringify(value, null, 2))}</pre>`;
+}
+function renderCommandCall(name, args){
+  const argValues = Object.entries(args || {}).map(([key, value]) => {
+    if(typeof value === 'string') {
+      const cleaned = cleanText(value);
+      if(isProbablyCode(cleaned)) return `${key}=<code block>`;
+      return JSON.stringify(cleaned);
+    }
+    return `${key}=${JSON.stringify(value)}`;
+  });
+  return `${name}(${argValues.join(', ')})`;
+}
+function tryParseFollowupPrompt(text){
+  const marker = '\\n\\n';
+  const index = text.indexOf(marker);
+  if(index === -1) return null;
+  const intro = text.slice(0, index).trim();
+  const rest = text.slice(index + marker.length).trim();
+  if(!rest.startsWith('{')) return null;
+  try {
+    return {intro, payload: JSON.parse(rest)};
+  } catch {
+    return null;
+  }
+}
+function commandResultSummary(result){
+  const payload = result.result || {};
+  if(result.command === 'run_python') {
+    return `
+      <div class="block">
+        <div class="block-title">run_python finished with code ${esc(payload.returncode ?? 'unknown')}</div>
+        ${payload.stdout ? `<div class="block-title">stdout</div><pre>${esc(payload.stdout)}</pre>` : ''}
+        ${payload.stderr ? `<div class="block-title">stderr</div><pre>${esc(payload.stderr)}</pre>` : ''}
+      </div>`;
+  }
+  if(result.command === 'submit') {
+    return `
+      <div class="block">
+        <div class="block-title">submit result</div>
+        <div class="kv">
+          <span>Status</span><span>${esc(result.status)}</span>
+          <span>Metric</span><span>${esc(payload.metric || '-')}</span>
+          <span>Value</span><span>${esc(payload.value ?? '-')}</span>
+          <span>Rows checked</span><span>${esc(payload.rows_checked ?? '-')}</span>
+        </div>
+      </div>`;
+  }
+  return `
+    <div class="block">
+      <div class="block-title">${esc(result.command || 'command')} result</div>
+      <pre>${esc(JSON.stringify(payload || result, null, 2))}</pre>
+    </div>`;
+}
+function renderCommandHtml(event){
+  const args = event.data?.args || {};
+  const entries = Object.entries(args);
+  return `
+    <div class="event-body structured">
+      <div class="command-name">${esc(cleanText(event.title))}</div>
+      <div class="command-call"><span class="inline-code">${esc(renderCommandCall(cleanText(event.title), args))}</span></div>
+      <div class="arg-list">
+        ${entries.length ? entries.map(([name, value]) => `
+          <div class="arg-row">
+            <span class="arg-name">${esc(name)}</span>
+            ${renderValue(value)}
+          </div>
+        `).join('') : '<div>No arguments.</div>'}
+      </div>
+    </div>`;
+}
+function renderFeedbackHtml(data){
+  const hints = data.hints || [];
+  return `
+    <div class="event-body structured">
+      <div class="block">
+        <div class="block-title">Feedback hints</div>
+        ${hints.length ? `<ul class="hint-list">${hints.map(h => `<li><strong>${esc(h.stage)}</strong>: ${esc(h.message)}</li>`).join('')}</ul>` : '<div>No hints.</div>'}
+      </div>
+    </div>`;
+}
+function renderSubmissionHtml(submission){
+  const payload = submission.result || {};
+  return `
+    <strong>${submission.status === 'ok' ? 'Submitted.' : 'Submission attempted.'}</strong>
+    <div class="kv" style="margin-top:10px">
+      <span>Status</span><span>${esc(submission.status || '-')}</span>
+      <span>Metric</span><span>${esc(payload.metric || '-')}</span>
+      <span>Value</span><span>${esc(payload.value ?? '-')}</span>
+      <span>Rows checked</span><span>${esc(payload.rows_checked ?? '-')}</span>
+    </div>
+    <details>
+      <summary>Secondary data</summary>
+      <pre>${esc(JSON.stringify(submission, null, 2))}</pre>
+    </details>`;
+}
+function renderPromptHtml(text){
+  const parsed = tryParseFollowupPrompt(text);
+  if(!parsed) return `<div class="event-body structured">${renderMarkdownish(text)}</div>`;
+  const payload = parsed.payload;
+  const results = payload.command_results || [];
+  const hints = payload.feedback?.hints || [];
+  const budget = payload.budget || {};
+  return `
+    <div class="event-body structured">
+      <div class="block">
+        <div class="block-title">Instruction to LLM</div>
+        <div>${esc(parsed.intro)}</div>
+      </div>
+      <div class="block">
+        <div class="block-title">Command results sent back</div>
+        ${results.length ? results.map(commandResultSummary).join('') : '<div>No command results.</div>'}
+      </div>
+      <div class="block">
+        <div class="block-title">Feedback hints</div>
+        ${hints.length ? `<ul class="hint-list">${hints.map(h => `<li><strong>${esc(h.stage)}</strong>: ${esc(h.message)}</li>`).join('')}</ul>` : '<div>No hints.</div>'}
+      </div>
+      <div class="block">
+        <div class="block-title">Budget</div>
+        <div class="kv">
+          <span>Steps</span><span>${esc(budget.used_steps ?? 0)} / ${esc(budget.max_steps ?? '-')}</span>
+          <span>Remaining steps</span><span>${esc(budget.remaining_steps ?? '-')}</span>
+          <span>Requests</span><span>${esc(budget.requests ?? '-')}</span>
+          <span>Tokens</span><span>${esc(budget.total_tokens ?? 0)} / ${esc(budget.token_limit ?? '-')}</span>
+        </div>
+      </div>
+    </div>`;
+}
+function eventMainText(event){
+  const data = event.data || {};
+  if(event.kind === 'prompt') return cleanText(data.content || '');
+  if(event.kind === 'llm') return cleanText(data.content || '');
+  if(event.kind === 'command') return renderCommandCall(cleanText(event.title), data.args || {});
+  if(event.kind === 'result') {
+    const status = data.status || 'unknown';
+    const result = data.result ? JSON.stringify(data.result, null, 2) : (data.error || '');
+    return `${event.title}\nstatus: ${status}\n${result}`;
+  }
+  if(event.kind === 'feedback') {
+    const hints = (data.hints || []).map(h => `- ${h.stage}: ${h.message}`).join(String.fromCharCode(10));
+    return hints || JSON.stringify(data, null, 2);
+  }
+  if(event.kind === 'error' || event.kind === 'parse_error') return data.error || JSON.stringify(data, null, 2);
+  return JSON.stringify(data, null, 2);
+}
+function eventBodyHtml(event){
+  const data = event.data || {};
+  if(event.kind === 'prompt') return renderPromptHtml(data.content || '');
+  if(event.kind === 'llm') return `<div class="event-body structured">${renderMarkdownish(data.content || '')}</div>`;
+  if(event.kind === 'command') return renderCommandHtml(event);
+  if(event.kind === 'result') return `<div class="event-body structured">${commandResultSummary(data)}</div>`;
+  if(event.kind === 'feedback') return renderFeedbackHtml(data);
+  return `<div class="event-body">${esc(eventMainText(event))}</div>`;
+}
+function eventLabel(kind){
+  const labels = {
+    prompt: 'Prompt to LLM',
+    llm: 'LLM answer',
+    command: 'Command',
+    result: 'Command result',
+    feedback: 'Hints',
+    system: 'System',
+    error: 'Error',
+    parse_error: 'Parse error'
+  };
+  return labels[kind] || kind;
+}
 async function loadTasks(){
   const res = await fetch('/api/tasks');
   const data = await res.json();
@@ -761,8 +1002,7 @@ function render(run){
   message.textContent = `Mode: ${run.mode}. Task: ${run.task_id}.`;
   if(run.submission_result){
     document.getElementById('submission').className = 'message';
-    const title = run.submission_result.status === 'ok' ? 'Submitted.' : 'Submission attempted.';
-    document.getElementById('submission').innerHTML = `<strong>${title}</strong><pre>${esc(JSON.stringify(run.submission_result, null, 2))}</pre>`;
+    document.getElementById('submission').innerHTML = renderSubmissionHtml(run.submission_result);
   } else if(run.error){
     document.getElementById('submission').className = 'message error';
     document.getElementById('submission').textContent = run.error;
@@ -778,12 +1018,29 @@ function render(run){
     document.getElementById('submission').className = 'message';
     document.getElementById('submission').textContent = 'No submission yet.';
   }
-  eventsEl.innerHTML = run.events.length ? run.events.slice().reverse().map(e => `
-    <div class="event">
-      <div class="event-head"><span class="kind">${esc(e.kind)}</span><span>${esc(new Date(e.time).toLocaleTimeString())}</span></div>
-      <strong>${esc(e.title)}</strong>
-      <pre>${esc(JSON.stringify(e.data, null, 2))}</pre>
-    </div>`).join('') : '<div class="message">No events yet.</div>';
+  eventsEl.innerHTML = run.events.length ? run.events.slice().reverse().map((e, index) => {
+    const details = JSON.stringify(e.data, null, 2);
+    return `
+      <div class="event ${esc(e.kind)}" data-event-index="${index}">
+        <div class="event-head"><span class="kind">${esc(eventLabel(e.kind))}</span><span>${esc(new Date(e.time).toLocaleTimeString())}</span></div>
+        <strong>${esc(e.title)}</strong>
+        ${eventBodyHtml(e)}
+        <div class="event-actions">
+          <button class="small-button" type="button" data-action="expand">Expand</button>
+        </div>
+        <details>
+          <summary>Secondary data</summary>
+          <pre>${esc(details)}</pre>
+        </details>
+      </div>`;
+  }).join('') : '<div class="message">No events yet.</div>';
+  eventsEl.querySelectorAll('[data-action="expand"]').forEach(button => {
+    button.addEventListener('click', () => {
+      const event = button.closest('.event');
+      event.classList.toggle('expanded');
+      button.textContent = event.classList.contains('expanded') ? 'Collapse' : 'Expand';
+    });
+  });
 }
 start.addEventListener('click', startRun);
 stop.addEventListener('click', stopRun);
