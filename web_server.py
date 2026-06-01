@@ -484,23 +484,103 @@ def build_initial_prompt(workspace: Path, task_id: str) -> str:
 
 
 def build_followup_prompt(results: list[dict[str, Any]], feedback: dict[str, Any], state: RunState) -> str:
-    payload = {
-        "command_results": results,
-        "feedback": feedback,
-        "budget": {
-            "used_steps": state.executor.context.used_steps,
-            "max_steps": state.config.max_steps,
-            "remaining_steps": max(0, state.config.max_steps - state.executor.context.used_steps),
-            "requests": state.requests,
-            "total_tokens": state.total_tokens,
-            "token_limit": state.config.token_limit,
-        },
-    }
-    return "Продолжай решение. Верни только следующую команду или команды.\n\n" + json.dumps(
-        payload,
-        ensure_ascii=False,
-        default=str,
-    )
+    used_steps = state.executor.context.used_steps
+    max_steps = state.config.max_steps
+    remaining_steps = max(0, max_steps - used_steps)
+    lines = [
+        "Продолжай решение. Верни только следующую команду или команды.",
+        "",
+        "Статус benchmark:",
+        (
+            f"requests={state.requests}; tokens={state.total_tokens}/{state.config.token_limit or 'без лимита'}; "
+            f"steps={used_steps}/{max_steps}; remaining_steps={remaining_steps}"
+        ),
+        "",
+        "Результаты команд:",
+    ]
+    if results:
+        for index, result in enumerate(results, start=1):
+            lines.extend(format_web_command_result(index, result))
+    else:
+        lines.append("- команд не было")
+    if feedback:
+        lines.extend(["", "Подсказки:"])
+        lines.extend(format_web_feedback(feedback))
+    return "\n".join(lines)
+
+
+def format_web_command_result(index: int, result: dict[str, Any]) -> list[str]:
+    command = str(result.get("command", "unknown"))
+    status = str(result.get("status", "unknown"))
+    if status != "ok":
+        return [f"{index}. {command}: error", f"   {short_web_text(str(result.get('error', 'unknown error')), 1200)}"]
+    lines = [f"{index}. {command}: ok"]
+    lines.extend(f"   {line}" for line in format_web_result_payload(command, result.get("result")))
+    return lines
+
+
+def format_web_result_payload(command: str, payload: Any) -> list[str]:
+    if command == "read_file" and isinstance(payload, dict):
+        lines = [f"path={payload.get('path', '?')}; truncated={payload.get('truncated', False)}"]
+        content = str(payload.get("content", ""))
+        if content:
+            lines.append("content:")
+            lines.extend(indent_web_block(short_web_text(content, 2500), "  "))
+        return lines
+    if command == "run_python" and isinstance(payload, dict):
+        lines = [f"returncode={payload.get('returncode', '?')}"]
+        stdout = str(payload.get("stdout", ""))
+        stderr = str(payload.get("stderr", ""))
+        if stdout:
+            lines.append("stdout:")
+            lines.extend(indent_web_block(short_web_text(stdout, 1800), "  "))
+        if stderr:
+            lines.append("stderr:")
+            lines.extend(indent_web_block(short_web_text(stderr, 1800), "  "))
+        return lines
+    if command == "list_files" and isinstance(payload, list):
+        shown = [str(item) for item in payload[:30]]
+        suffix = f" ... (+{len(payload) - len(shown)} more)" if len(payload) > len(shown) else ""
+        return [", ".join(shown) + suffix if shown else "(empty)"]
+    if isinstance(payload, (dict, list)):
+        return indent_web_block(short_web_json(payload, 2500), "")
+    return [short_web_text(str(payload), 2500)]
+
+
+def format_web_feedback(feedback: dict[str, Any]) -> list[str]:
+    hints = feedback.get("hints")
+    if not isinstance(hints, list) or not hints:
+        return [f"- {short_web_json(feedback, 1500)}"]
+    lines: list[str] = []
+    for hint in hints[:8]:
+        if isinstance(hint, dict):
+            lines.append(f"- {hint.get('stage', 'hint')}: {hint.get('message', '')}")
+        else:
+            lines.append(f"- {hint}")
+    if len(hints) > 8:
+        lines.append(f"- ... (+{len(hints) - 8} more hints)")
+    return lines
+
+
+def short_web_json(value: Any, limit: int) -> str:
+    return short_web_text(json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str), limit)
+
+
+def short_web_text(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    if limit < 80:
+        return value[:limit]
+    marker = f"...[truncated {len(value) - limit} chars]..."
+    keep = max(0, limit - len(marker))
+    head = keep // 2
+    tail = keep - head
+    return value[:head] + marker + value[-tail:]
+
+
+def indent_web_block(text: str, prefix: str) -> list[str]:
+    lines = text.splitlines()
+    return [prefix + line for line in lines] if lines else [prefix]
 
 
 def collect_file_previews(workspace: Path) -> str:

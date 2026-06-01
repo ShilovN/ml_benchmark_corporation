@@ -126,11 +126,14 @@ class ExecutorTest(unittest.TestCase):
         feedback = {"hints": [{"stage": "EDA", "message": "hint"}]}
 
         prompt = build_followup_prompt(command_results, BenchmarkStats(), args, feedback)
-        payload = json.loads(prompt.split("\n\n", 1)[1])
 
-        self.assertEqual(payload["feedback"], feedback)
-        self.assertNotIn("feedback", payload["command_results"][0])
-        self.assertNotIn("feedback", payload["command_results"][1])
+        self.assertIn("Результаты команд:", prompt)
+        self.assertIn("1. write_file: ok", prompt)
+        self.assertIn("2. read_file: ok", prompt)
+        self.assertIn("Подсказки:", prompt)
+        self.assertIn("- EDA: hint", prompt)
+        self.assertNotIn('"command_results"', prompt)
+        self.assertNotIn('"feedback"', prompt)
 
     def test_followup_prompt_contains_remaining_budget(self) -> None:
         args = argparse.Namespace(token_limit=1000, max_steps=10, time_limit_seconds=3600)
@@ -139,14 +142,15 @@ class ExecutorTest(unittest.TestCase):
         stats.executed_commands = 4
 
         prompt = build_followup_prompt([], stats, args)
-        payload = json.loads(prompt.split("\n\n", 1)[1])
 
         self.assertIn("осталось 75.0% токенов", prompt)
         self.assertIn("осталось итераций: 6", prompt)
-        self.assertNotIn("\n  ", prompt)
-        self.assertEqual(payload["benchmark_status"]["remaining_tokens"], 750)
-        self.assertEqual(payload["benchmark_status"]["remaining_token_percent"], 75.0)
-        self.assertEqual(payload["benchmark_status"]["remaining_iterations"], 6)
+        self.assertIn("Статус benchmark:", prompt)
+        self.assertIn("tokens=250/1000", prompt)
+        self.assertIn("steps=4/10", prompt)
+        self.assertIn("remaining_steps=6", prompt)
+        self.assertIn("- команд не было", prompt)
+        self.assertNotIn('"benchmark_status"', prompt)
 
     def test_followup_prompt_warns_when_token_budget_is_low(self) -> None:
         args = argparse.Namespace(token_limit=1000, max_steps=10, time_limit_seconds=3600)
