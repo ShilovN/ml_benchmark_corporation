@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html
 import json
 import shutil
 import sys
@@ -26,14 +27,17 @@ if __package__ in {None, ""}:
 
 from agent.executor import AgentContext, CommandExecutor
 from agent.llm_client import (
+    AVAILABLE_MODELS,
     DEFAULT_MAX_TOKENS,
     DEFAULT_TEMPERATURE,
     DEFAULT_TIMEOUT,
     MODEL,
+    MODEL_GROUPS,
     SYSTEM_MESSAGE,
-    URL,
     auth_headers,
     chat_completion,
+    open_url,
+    resolve_model_url,
 )
 from agent.parser import COMMAND_NAMES, FENCED_BLOCK_RE, ParsedCommand, parse_command, parse_model_response
 
@@ -49,7 +53,7 @@ MAX_FILE_PREVIEW_CHARS = 2500
 class RunConfig:
     task_id: str
     model: str = MODEL
-    llm_url: str = URL
+    llm_url: str | None = None
     mode: str = "multi-shot"
     max_steps: int = 40
     token_limit: int = 120000
@@ -176,7 +180,9 @@ class AgentRunManager:
                     user_message,
                     system_message=SYSTEM_MESSAGE,
                     history=history,
-                    url=build_chat_completions_url(state.config.llm_url),
+                    url=build_chat_completions_url(
+                        state.config.llm_url or resolve_model_url(state.config.model)
+                    ),
                     model=state.config.model,
                     max_tokens=state.config.max_tokens,
                     temperature=state.config.temperature,
@@ -297,7 +303,8 @@ def make_handler(manager: AgentRunManager) -> type[BaseHTTPRequestHandler]:
                 self._send_json({"status": "ok", "tasks": manager.list_tasks()})
                 return
             if parsed.path == "/api/models":
-                llm_url = _first_query_value(parsed.query, "url") or URL
+                model = _first_query_value(parsed.query, "model") or MODEL
+                llm_url = resolve_model_url(model)
                 try:
                     self._send_json({"status": "ok", "models": fetch_model_options(llm_url)})
                 except Exception as exc:
@@ -305,7 +312,7 @@ def make_handler(manager: AgentRunManager) -> type[BaseHTTPRequestHandler]:
                         {
                             "status": "error",
                             "error": str(exc),
-                            "models": [MODEL],
+                            "models": AVAILABLE_MODELS,
                         },
                         HTTPStatus.BAD_REQUEST,
                     )
@@ -331,7 +338,11 @@ def make_handler(manager: AgentRunManager) -> type[BaseHTTPRequestHandler]:
                 config = RunConfig(
                     task_id=str(payload.get("task_id") or "salary_prediction"),
                     model=str(payload.get("model") or MODEL),
-                    llm_url=str(payload.get("llm_url") or URL),
+                    llm_url=(
+                        str(payload["llm_url"])
+                        if payload.get("llm_url")
+                        else None
+                    ),
                     mode=str(payload.get("mode") or "multi-shot"),
                     max_steps=int(payload["max_steps"]) if "max_steps" in payload else 40,
                     token_limit=int(payload["token_limit"]) if "token_limit" in payload else 120000,
@@ -563,6 +574,8 @@ def build_chat_completions_url(base_url: str) -> str:
     stripped = base_url.rstrip("/")
     if stripped.endswith("/chat/completions"):
         return stripped
+    if stripped == "https://api.openai.com":
+        return f"{stripped}/v1/chat/completions"
     if stripped.endswith("/openai"):
         return f"{stripped}/chat/completions"
     if stripped.endswith("/v1") or stripped.endswith("/compatible-mode/v1"):
@@ -579,9 +592,10 @@ def build_models_url(base_url: str) -> str:
 
 
 def fetch_model_options(base_url: str, timeout: int = 10) -> list[str]:
-    request = urllib.request.Request(build_models_url(base_url), headers=auth_headers(), method="GET")
+    models_url = build_models_url(base_url)
+    request = urllib.request.Request(models_url, headers=auth_headers(url=models_url), method="GET")
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with open_url(request, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
@@ -605,7 +619,19 @@ def _first_query_value(query: str, name: str) -> str | None:
 
 
 def render_agent_page() -> str:
-    return """<!doctype html>
+    model_options = "\n".join(
+        "            <optgroup label=\""
+        + html.escape(group_name, quote=True)
+        + "\">\n"
+        + "\n".join(
+            f'              <option value="{html.escape(model, quote=True)}">'
+            f"{html.escape(model)}</option>"
+            for model in models
+        )
+        + "\n            </optgroup>"
+        for group_name, models in MODEL_GROUPS
+    )
+    page = """<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -657,12 +683,10 @@ def render_agent_page() -> str:
       <section>
         <h2>Run Settings</h2>
         <div class="field"><label for="task">Task</label><select id="task"></select></div>
-        <div class="field"><label for="url">LLM URL</label><input id="url" value="http://llm.letovo.site:8809/openai"></div>
         <div class="field">
           <label for="model">Model</label>
           <select id="model">
-            <option value="deepseek-v4-flash">deepseek-v4-flash</option>
-            <option value="gemma-4-26b">gemma-4-26b</option>
+__MODEL_OPTIONS__
           </select>
         </div>
         <div class="field">
@@ -705,7 +729,6 @@ def render_agent_page() -> str:
 let currentRun = null;
 let timer = null;
 const task = document.getElementById('task');
-const url = document.getElementById('url');
 const model = document.getElementById('model');
 const mode = document.getElementById('mode');
 const steps = document.getElementById('steps');
@@ -725,7 +748,6 @@ async function startRun(){
   start.disabled = true; stop.disabled = false; message.textContent = 'Starting run...';
   const res = await fetch('/api/runs', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({
     task_id: task.value,
-    llm_url: url.value,
     model: model.value,
     mode: mode.value,
     max_steps: Number(steps.value),
@@ -791,6 +813,7 @@ loadTasks();
 </script>
 </body>
 </html>"""
+    return page.replace("__MODEL_OPTIONS__", model_options)
 
 
 def parse_args() -> argparse.Namespace:
