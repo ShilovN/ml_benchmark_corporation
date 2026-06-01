@@ -47,6 +47,13 @@ DEFAULT_RUN_ROOT = Path("benchmark_runs")
 TEXT_EXTENSIONS = {".csv", ".json", ".md", ".py", ".txt", ".tsv", ".yaml", ".yml"}
 MAX_CONTEXT_CHARS = 28000
 MAX_FILE_PREVIEW_CHARS = 2500
+FINALIZE_REMAINING_STEPS = 4
+FINALIZE_REMAINING_TOKEN_RATIO = 0.12
+LLM_REQUEST_TOKEN_RESERVE = 1000
+TOKEN_ESTIMATE_CHARS_PER_TOKEN = 3
+MAX_HISTORY_MESSAGES = 6
+FINAL_SUBMIT_MAX_TOKENS = 1200
+FINAL_SUBMIT_TOKEN_RESERVE = 300
 ALLOWED_MODES = {"single-shot", "repeated", "fixed-transitions", "flexible"}
 DEFAULT_MODE = "flexible"
 REPEATED_MAX_ATTEMPTS = 5
@@ -112,6 +119,7 @@ class RunState:
     error: str | None = None
     thread: threading.Thread | None = None
     stop_requested: bool = False
+    final_submit_requested: bool = False
     fixed_stage_index: int = 0
 
     def public_dict(self) -> dict[str, Any]:
@@ -208,6 +216,29 @@ class AgentRunManager:
                 if state.config.token_limit and state.total_tokens >= state.config.token_limit:
                     state.stop_reason = "token_limit"
                     break
+                history = compact_history(history)
+                request_max_tokens = state.config.max_tokens
+                if should_stop_before_next_llm_request(state, user_message, history, request_max_tokens):
+                    final_message = build_emergency_submit_prompt(state)
+                    if state.final_submit_requested or not can_send_llm_request(
+                        state,
+                        final_message,
+                        [],
+                        FINAL_SUBMIT_MAX_TOKENS,
+                        FINAL_SUBMIT_TOKEN_RESERVE,
+                    ):
+                        state.stop_reason = "token_margin"
+                        break
+                    user_message = final_message
+                    history = []
+                    request_max_tokens = FINAL_SUBMIT_MAX_TOKENS
+                    state.final_submit_requested = True
+                    add_event(
+                        state,
+                        "system",
+                        "Emergency final prompt",
+                        {"reason": "next normal LLM request would exceed token budget"},
+                    )
 
                 add_event(state, "prompt", "Prompt sent to LLM", {"content": user_message})
                 response = chat_completion(
@@ -218,7 +249,7 @@ class AgentRunManager:
                         state.config.llm_url or resolve_model_url(state.config.model)
                     ),
                     model=state.config.model,
-                    max_tokens=state.config.max_tokens,
+                    max_tokens=request_max_tokens,
                     temperature=state.config.temperature,
                     timeout=state.config.request_timeout,
                 )
@@ -236,7 +267,7 @@ class AgentRunManager:
                     commands = extract_commands(assistant_text)
                 except ValueError as exc:
                     add_event(state, "parse_error", "Could not parse command", {"error": str(exc)})
-                    if state.config.mode == "single-shot":
+                    if state.config.mode == "single-shot" or state.final_submit_requested:
                         state.stop_reason = "single_shot_parse_error"
                         break
                     if state.config.mode == "repeated" and state.requests >= REPEATED_MAX_ATTEMPTS:
@@ -529,7 +560,9 @@ def build_initial_prompt(workspace: Path, task_id: str) -> str:
     return (
         "Ты решаешь ML benchmark task через агентские команды.\n"
         "В одном ответе можно вернуть одну или несколько команд, по одной на строку.\n"
-        "Когда подготовишь файл submission.csv, вызови submit(\"submission.csv\").\n\n"
+        "Работай как в обычной ML-задаче: осмотри данные, сделай признаки, обучи и проверь модель. "
+        "Перед submit проверь, что submission.csv существует, имеет нужные колонки, правильное число строк "
+        "и не содержит пустых предсказаний. Когда всё готово, вызови submit(\"submission.csv\").\n\n"
         f"task_id: {task_id}\n\n"
         "Файлы workspace:\n"
         f"{collect_file_previews(workspace)}"
@@ -713,6 +746,115 @@ def short_web_text(value: str, limit: int) -> str:
 def indent_web_block(text: str, prefix: str) -> list[str]:
     lines = text.splitlines()
     return [prefix + line for line in lines] if lines else [prefix]
+
+
+def build_emergency_submit_prompt(state: RunState) -> str:
+    files = sorted(
+        str(path.relative_to(state.workspace))
+        for path in state.workspace.rglob("*")
+        if path.is_file() and not path.name.startswith("answers")
+    )
+    budget = build_budget_payload(state)
+    task_config = read_workspace_task_config(state.workspace)
+    if (state.workspace / "submission.csv").exists():
+        instruction = (
+            "FINAL SUBMIT NOW.\n"
+            "В workspace уже есть submission.csv. Не улучшай решение и не запускай EDA.\n"
+            "Верни только одну команду:\n"
+            "submit(\"submission.csv\")\n\n"
+        )
+    else:
+        instruction = (
+            "FINAL SUBMIT NOW.\n"
+            "Нужно дать последнее лучшее решение. Не делай EDA и долгие улучшения.\n"
+            "Создай submission.csv самым надежным быстрым способом и в этом же ответе вызови submit(\"submission.csv\").\n"
+            "Верни только команды.\n\n"
+        )
+    payload = {
+        "task": task_config,
+        "workspace_files": files[-80:],
+        "budget": budget,
+    }
+    return instruction + json.dumps(payload, ensure_ascii=False, default=str)
+
+
+def read_workspace_task_config(workspace: Path) -> dict[str, Any]:
+    path = workspace / "task.json"
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def build_budget_payload(state: RunState) -> dict[str, Any]:
+    remaining_steps = max(0, state.config.max_steps - state.executor.context.used_steps)
+    if state.config.token_limit:
+        remaining_tokens = max(0, state.config.token_limit - state.total_tokens)
+        remaining_token_ratio = remaining_tokens / state.config.token_limit
+    else:
+        remaining_tokens = None
+        remaining_token_ratio = None
+    return {
+        "used_steps": state.executor.context.used_steps,
+        "max_steps": state.config.max_steps,
+        "remaining_steps": remaining_steps,
+        "requests": state.requests,
+        "total_tokens": state.total_tokens,
+        "token_limit": state.config.token_limit,
+        "remaining_tokens": remaining_tokens,
+        "remaining_token_percent": (
+            round(remaining_token_ratio * 100, 1) if remaining_token_ratio is not None else None
+        ),
+    }
+
+
+def should_request_final_submit(state: RunState) -> bool:
+    budget = build_budget_payload(state)
+    if budget["remaining_steps"] <= FINALIZE_REMAINING_STEPS:
+        return True
+    percent = budget["remaining_token_percent"]
+    return percent is not None and percent <= FINALIZE_REMAINING_TOKEN_RATIO * 100
+
+
+def compact_history(history: list[dict[str, str]]) -> list[dict[str, str]]:
+    if len(history) <= MAX_HISTORY_MESSAGES:
+        return history
+    return history[-MAX_HISTORY_MESSAGES:]
+
+
+def estimate_message_tokens(system_message: str, user_message: str, history: list[dict[str, str]]) -> int:
+    total_chars = len(system_message) + len(user_message)
+    total_chars += sum(len(message.get("content", "")) for message in history)
+    return max(1, total_chars // TOKEN_ESTIMATE_CHARS_PER_TOKEN)
+
+
+def can_send_llm_request(
+    state: RunState,
+    user_message: str,
+    history: list[dict[str, str]],
+    max_tokens: int,
+    reserve: int = LLM_REQUEST_TOKEN_RESERVE,
+) -> bool:
+    remaining_tokens = state.config.token_limit - state.total_tokens
+    estimated_request_tokens = (
+        estimate_message_tokens(SYSTEM_MESSAGE, user_message, history)
+        + max_tokens
+        + reserve
+    )
+    return remaining_tokens > estimated_request_tokens
+
+
+def should_stop_before_next_llm_request(
+    state: RunState,
+    user_message: str,
+    history: list[dict[str, str]],
+    max_tokens: int,
+) -> bool:
+    if not state.config.token_limit:
+        return False
+    return not can_send_llm_request(state, user_message, history, max_tokens)
 
 
 def collect_file_previews(workspace: Path) -> str:
