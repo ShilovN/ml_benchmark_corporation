@@ -876,29 +876,120 @@ def build_followup_prompt(
     args: argparse.Namespace,
     feedback: dict[str, Any] | None = None,
 ) -> str:
-    budget_status = build_budget_status(stats, args)
-    payload = {
-        "command_results": command_results,
-        "benchmark_status": {
-            "elapsed_seconds": stats.elapsed_seconds,
-            "requests": stats.requests,
-            "total_tokens": stats.total_tokens,
-            "token_limit": args.token_limit,
-            "remaining_tokens": budget_status["remaining_tokens"],
-            "remaining_token_percent": budget_status["remaining_token_percent"],
-            "used_steps": stats.executed_commands,
-            "max_steps": args.max_steps,
-            "remaining_iterations": budget_status["remaining_iterations"],
-            "remaining_seconds": max(0.0, args.time_limit_seconds - stats.elapsed_seconds),
-        },
-    }
-    if feedback is not None:
-        payload["feedback"] = feedback
     prefix = (
         f"{format_budget_line(stats, args)} "
         "Дальше верни только команды.\n\n"
     )
-    return prefix + compact_json_for_prompt(payload, MAX_FOLLOWUP_PROMPT_CHARS - len(prefix))
+    body = format_followup_body(command_results, stats, args, feedback)
+    return prefix + truncate_middle(body, MAX_FOLLOWUP_PROMPT_CHARS - len(prefix))
+
+
+def format_followup_body(
+    command_results: list[dict[str, Any]],
+    stats: BenchmarkStats,
+    args: argparse.Namespace,
+    feedback: dict[str, Any] | None,
+) -> str:
+    budget = build_budget_status(stats, args)
+    remaining_seconds = max(0.0, args.time_limit_seconds - stats.elapsed_seconds)
+    lines = [
+        "Статус benchmark:",
+        (
+            f"requests={stats.requests}; tokens={stats.total_tokens}/{args.token_limit or 'без лимита'}; "
+            f"steps={stats.executed_commands}/{args.max_steps}; "
+            f"remaining_steps={budget['remaining_iterations']}; "
+            f"remaining_seconds={remaining_seconds:.1f}"
+        ),
+        "",
+        "Результаты команд:",
+    ]
+    if command_results:
+        for index, result in enumerate(command_results, start=1):
+            lines.extend(format_command_result_for_prompt(index, result))
+    else:
+        lines.append("- команд не было")
+    if feedback:
+        lines.extend(["", "Подсказки:"])
+        lines.extend(format_feedback_for_prompt(feedback))
+    return "\n".join(lines)
+
+
+def format_command_result_for_prompt(index: int, result: dict[str, Any]) -> list[str]:
+    command = str(result.get("command", "unknown"))
+    status = str(result.get("status", "unknown"))
+    if status != "ok":
+        return [
+            f"{index}. {command}: error",
+            f"   {truncate_middle(str(result.get('error', 'unknown error')), 1200)}",
+        ]
+    lines = [f"{index}. {command}: ok"]
+    lines.extend(f"   {line}" for line in format_result_payload(command, result.get("result")))
+    return lines
+
+
+def format_result_payload(command: str, payload: Any) -> list[str]:
+    if command == "read_file" and isinstance(payload, dict):
+        lines = [f"path={payload.get('path', '?')}; truncated={payload.get('truncated', False)}"]
+        content = str(payload.get("content", ""))
+        if content:
+            lines.append("content:")
+            lines.extend(indent_block(truncate_middle(content, 2500), "  "))
+        return lines
+    if command == "run_python" and isinstance(payload, dict):
+        lines = [f"returncode={payload.get('returncode', '?')}"]
+        stdout = str(payload.get("stdout", ""))
+        stderr = str(payload.get("stderr", ""))
+        if stdout:
+            lines.append("stdout:")
+            lines.extend(indent_block(truncate_middle(stdout, 1800), "  "))
+        if stderr:
+            lines.append("stderr:")
+            lines.extend(indent_block(truncate_middle(stderr, 1800), "  "))
+        return lines
+    if command == "list_files" and isinstance(payload, list):
+        shown = [str(item) for item in payload[:30]]
+        suffix = f" ... (+{len(payload) - len(shown)} more)" if len(payload) > len(shown) else ""
+        return [", ".join(shown) + suffix if shown else "(empty)"]
+    if command == "load_dataset" and isinstance(payload, dict):
+        return [
+            f"path={payload.get('path', '?')}; rows={payload.get('rows', '?')}; "
+            f"columns={format_short_value(payload.get('columns', []), 1200)}"
+        ]
+    if command == "show_dataset_info" and isinstance(payload, dict):
+        return [
+            f"path={payload.get('path', '?')}; rows={payload.get('rows', '?')}",
+            f"columns={format_short_value(payload.get('columns', []), 1200)}",
+            f"missing={format_short_value(payload.get('missing_by_column', {}), 1200)}",
+        ]
+    if command == "show_sample_rows" and isinstance(payload, list):
+        return indent_block(format_short_value(payload[:5], 2500), "")
+    return indent_block(format_short_value(payload, 2500), "")
+
+
+def format_feedback_for_prompt(feedback: dict[str, Any]) -> list[str]:
+    hints = feedback.get("hints")
+    if not isinstance(hints, list) or not hints:
+        return [f"- {format_short_value(feedback, 1500)}"]
+    lines: list[str] = []
+    for hint in hints[:8]:
+        if isinstance(hint, dict):
+            lines.append(f"- {hint.get('stage', 'hint')}: {hint.get('message', '')}")
+        else:
+            lines.append(f"- {hint}")
+    if len(hints) > 8:
+        lines.append(f"- ... (+{len(hints) - 8} more hints)")
+    return lines
+
+
+def format_short_value(value: Any, limit: int) -> str:
+    if isinstance(value, str):
+        return truncate_middle(value, limit)
+    return truncate_middle(json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str), limit)
+
+
+def indent_block(text: str, prefix: str) -> list[str]:
+    lines = text.splitlines()
+    return [prefix + line for line in lines] if lines else [prefix]
 
 
 def compact_json_for_prompt(payload: dict[str, Any], max_chars: int) -> str:
