@@ -27,10 +27,11 @@ from agent.llm_client import (
     DEFAULT_TIMEOUT,
     MODEL,
     SYSTEM_MESSAGE,
-    URL,
     Message,
     auth_headers,
     chat_completion,
+    open_url,
+    resolve_model_url,
 )
 from agent.parser import (
     COMMAND_NAMES,
@@ -360,7 +361,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workspace", type=Path, default=Path.cwd())
     parser.add_argument("--task-id", default="salary_prediction")
     parser.add_argument("--tasks-dir", type=Path, default=Path("checker/tasks"))
-    parser.add_argument("--url", default=URL, help="OpenAI-compatible chat completions endpoint.")
+    parser.add_argument(
+        "--url",
+        help="Override the model's default OpenAI-compatible chat completions endpoint.",
+    )
     parser.add_argument(
         "--base-url",
         help=(
@@ -663,13 +667,17 @@ def create_run_workspace(source_workspace: Path, run_root: Path, task_id: str) -
 def resolve_llm_url(args: argparse.Namespace) -> str:
     if args.base_url:
         return build_chat_completions_url(args.base_url)
-    return build_chat_completions_url(args.url)
+    if args.url:
+        return build_chat_completions_url(args.url)
+    return build_chat_completions_url(resolve_model_url(args.model))
 
 
 def build_chat_completions_url(base_url: str) -> str:
     stripped = base_url.rstrip("/")
     if stripped.endswith("/chat/completions"):
         return stripped
+    if stripped == "https://api.openai.com":
+        return f"{stripped}/v1/chat/completions"
     if stripped.endswith("/openai"):
         return f"{stripped}/chat/completions"
     if stripped.endswith("/v1") or stripped.endswith("/compatible-mode/v1"):
@@ -679,9 +687,9 @@ def build_chat_completions_url(base_url: str) -> str:
 
 def preflight_llm(chat_url: str, timeout: int) -> None:
     models_url = build_models_url(chat_url)
-    request = urllib.request.Request(models_url, headers=auth_headers(), method="GET")
+    request = urllib.request.Request(models_url, headers=auth_headers(url=models_url), method="GET")
     try:
-        with urllib.request.urlopen(request, timeout=min(timeout, 10)) as response:
+        with open_url(request, timeout=min(timeout, 10)) as response:
             payload = response.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")

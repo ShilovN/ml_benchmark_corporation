@@ -10,3 +10,4 @@ xgboost<3
 lightgbm
 catboost
 optuna
+certifi
