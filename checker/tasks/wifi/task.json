@@ -1,0 +1,8 @@
+{
+  "id": "wifi",
+  "name": "Wifi packets",
+  "metric": "roc_auc",
+  "answer_file": "answers.csv",
+  "id_column": "packet_id",
+  "column": "delivered"
+}

@@ -45,6 +45,44 @@ class MetricCheckerTest(unittest.TestCase):
 
         self.assertAlmostEqual(result, 2 / 3)
 
+    def test_roc_auc_from_csv_scores(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            true_path = Path(tmp_dir) / "true.csv"
+            pred_path = Path(tmp_dir) / "pred.csv"
+            true_path.write_text("label\n0\n0\n1\n1\n", encoding="utf-8")
+            pred_path.write_text("score\n0.1\n0.4\n0.35\n0.8\n", encoding="utf-8")
+
+            result = compute_metric(
+                true_path,
+                pred_path,
+                "roc_auc",
+                true_column="label",
+                pred_column="score",
+            )
+
+        self.assertAlmostEqual(result, 0.75)
+
+    def test_roc_auc_handles_tied_scores(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            true_path = Path(tmp_dir) / "true.txt"
+            pred_path = Path(tmp_dir) / "pred.txt"
+            true_path.write_text("0\n1\n", encoding="utf-8")
+            pred_path.write_text("0.5\n0.5\n", encoding="utf-8")
+
+            result = compute_metric(true_path, pred_path, "roc_auc")
+
+        self.assertAlmostEqual(result, 0.5)
+
+    def test_roc_auc_requires_binary_true_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            true_path = Path(tmp_dir) / "true.txt"
+            pred_path = Path(tmp_dir) / "pred.txt"
+            true_path.write_text("0\n1\n2\n", encoding="utf-8")
+            pred_path.write_text("0.1\n0.5\n0.9\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "exactly two classes"):
+                compute_metric(true_path, pred_path, "roc_auc")
+
     def test_missing_submission_id_raises_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             true_path = Path(tmp_dir) / "true.csv"
