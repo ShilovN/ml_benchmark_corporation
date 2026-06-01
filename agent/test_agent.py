@@ -1,12 +1,26 @@
 import argparse
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from agent.executor import AgentContext, CommandExecutor
+from agent.hints import CsvTable, HintEngine, _contains_metric_value, _perfect_numeric_correlations
+from agent.llm_client import ask_llm, build_messages, chat_completion
 from agent.parser import extract_command_text, parse_command, parse_model_response
-from main import BenchmarkStats, build_followup_prompt, compact_json_for_prompt
+from main import (
+    BenchmarkStats,
+    build_followup_prompt,
+    compact_history_for_model,
+    compact_json_for_prompt,
+    response_max_tokens,
+)
 
 
 class ParserTest(unittest.TestCase):
@@ -64,6 +78,25 @@ read_file("b.txt")"""
         with self.assertRaisesRegex(ValueError, "No executable command"):
             extract_command_text("Я пока думаю, какую команду вызвать.")
 
+    def test_rejects_mixed_positional_and_keyword_args(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Do not mix"):
+            parse_command('read_file("a.txt", path="b.txt")')
+
+    def test_rejects_args_for_no_arg_command(self) -> None:
+        with self.assertRaisesRegex(ValueError, "does not accept arguments"):
+            parse_command('get_budget_status("extra")')
+
+    def test_extract_ignores_invalid_fenced_block_and_uses_valid_one(self) -> None:
+        text = """```command
+not a command
+```
+
+```command
+get_remaining_time()
+```"""
+
+        self.assertEqual(extract_command_text(text), "get_remaining_time()")
+
 
 class ExecutorTest(unittest.TestCase):
     def test_file_commands_and_trajectory(self) -> None:
@@ -93,11 +126,14 @@ class ExecutorTest(unittest.TestCase):
         feedback = {"hints": [{"stage": "EDA", "message": "hint"}]}
 
         prompt = build_followup_prompt(command_results, BenchmarkStats(), args, feedback)
-        payload = json.loads(prompt.split("\n\n", 1)[1])
 
-        self.assertEqual(payload["feedback"], feedback)
-        self.assertNotIn("feedback", payload["command_results"][0])
-        self.assertNotIn("feedback", payload["command_results"][1])
+        self.assertIn("Результаты команд:", prompt)
+        self.assertIn("1. write_file: ok", prompt)
+        self.assertIn("2. read_file: ok", prompt)
+        self.assertIn("Подсказки:", prompt)
+        self.assertIn("- EDA: hint", prompt)
+        self.assertNotIn('"command_results"', prompt)
+        self.assertNotIn('"feedback"', prompt)
 
     def test_followup_prompt_contains_remaining_budget(self) -> None:
         args = argparse.Namespace(token_limit=1000, max_steps=10, time_limit_seconds=3600)
@@ -106,14 +142,15 @@ class ExecutorTest(unittest.TestCase):
         stats.executed_commands = 4
 
         prompt = build_followup_prompt([], stats, args)
-        payload = json.loads(prompt.split("\n\n", 1)[1])
 
         self.assertIn("осталось 75.0% токенов", prompt)
         self.assertIn("осталось итераций: 6", prompt)
-        self.assertNotIn("\n  ", prompt)
-        self.assertEqual(payload["benchmark_status"]["remaining_tokens"], 750)
-        self.assertEqual(payload["benchmark_status"]["remaining_token_percent"], 75.0)
-        self.assertEqual(payload["benchmark_status"]["remaining_iterations"], 6)
+        self.assertIn("Статус benchmark:", prompt)
+        self.assertIn("tokens=250/1000", prompt)
+        self.assertIn("steps=4/10", prompt)
+        self.assertIn("remaining_steps=6", prompt)
+        self.assertIn("- команд не было", prompt)
+        self.assertNotIn('"benchmark_status"', prompt)
 
     def test_followup_prompt_warns_when_token_budget_is_low(self) -> None:
         args = argparse.Namespace(token_limit=1000, max_steps=10, time_limit_seconds=3600)
@@ -124,10 +161,10 @@ class ExecutorTest(unittest.TestCase):
 
         self.assertIn("осталось 29.9% токенов", prompt)
         self.assertIn("Экономь токены", prompt)
-        self.assertIn("сделай submit", prompt)
+        self.assertIn("делать submit", prompt)
         self.assertIn("иначе проиграешь", prompt)
 
-    def test_followup_prompt_does_not_warn_at_exactly_30_percent(self) -> None:
+    def test_followup_prompt_uses_soft_warning_at_exactly_30_percent(self) -> None:
         args = argparse.Namespace(token_limit=1000, max_steps=10, time_limit_seconds=3600)
         stats = BenchmarkStats()
         stats.total_tokens = 700
@@ -135,7 +172,46 @@ class ExecutorTest(unittest.TestCase):
         prompt = build_followup_prompt([], stats, args)
 
         self.assertIn("осталось 30.0% токенов", prompt)
-        self.assertNotIn("Экономь токены", prompt)
+        self.assertIn("прекращай исследование", prompt)
+        self.assertNotIn("иначе проиграешь", prompt)
+
+    def test_followup_prompt_pushes_submit_when_token_budget_is_critical(self) -> None:
+        args = argparse.Namespace(token_limit=1000, max_steps=10, time_limit_seconds=3600)
+        stats = BenchmarkStats()
+        stats.total_tokens = 851
+
+        prompt = build_followup_prompt([], stats, args)
+
+        self.assertIn("осталось 14.9% токенов", prompt)
+        self.assertIn("КРИТИЧНО", prompt)
+        self.assertIn("вызывай submit", prompt)
+
+    def test_response_max_tokens_shrinks_when_budget_is_low(self) -> None:
+        args = argparse.Namespace(token_limit=1000, max_steps=10, max_tokens=4096)
+        stats = BenchmarkStats()
+
+        stats.total_tokens = 200
+        self.assertEqual(response_max_tokens(stats, args), 4096)
+        stats.total_tokens = 501
+        self.assertEqual(response_max_tokens(stats, args), 1024)
+        stats.total_tokens = 701
+        self.assertEqual(response_max_tokens(stats, args), 768)
+        stats.total_tokens = 851
+        self.assertEqual(response_max_tokens(stats, args), 512)
+
+    def test_compact_history_limits_old_messages_and_long_content(self) -> None:
+        history = [
+            {"role": "user", "content": f"message-{index}-" + ("x" * 4000)}
+            for index in range(12)
+        ]
+
+        compacted = compact_history_for_model(history)
+
+        self.assertEqual(len(compacted), 9)
+        self.assertIn("history compacted", compacted[0]["content"])
+        self.assertTrue(all(len(message["content"]) <= 2600 for message in compacted[1:]))
+        self.assertIn("message-4", compacted[1]["content"])
+        self.assertIn("[truncated", compacted[1]["content"])
 
     def test_compact_json_truncates_long_strings_from_middle_only_when_needed(self) -> None:
         payload = {"result": {"content": "a" * 3000 + "middle" + "z" * 3000}}
@@ -243,10 +319,31 @@ class ExecutorTest(unittest.TestCase):
         self.assertEqual(sample_result["result"], [{"id": "1", "value": "10"}])
 
     def test_submit_salary_task(self) -> None:
-        workspace = Path.cwd()
-        executor = CommandExecutor(AgentContext(workspace=workspace, task_id="salary_prediction"))
+        project_root = Path.cwd()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            tasks_dir = workspace / "checker" / "tasks" / "salary_prediction"
+            tasks_dir.mkdir(parents=True)
+            (tasks_dir / "task.json").write_text(
+                json.dumps(
+                    {
+                        "id": "salary_prediction",
+                        "metric": "mae",
+                        "answer_file": "answers.csv",
+                        "column": "salary",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (tasks_dir / "answers.csv").write_text(
+                (project_root / "checker" / "tasks" / "salary_prediction" / "answers.csv").read_text(
+                    encoding="utf-8"
+                ),
+                encoding="utf-8",
+            )
+            executor = CommandExecutor(AgentContext(workspace=workspace, task_id="salary_prediction"))
 
-        result = executor.execute_text('submit("checker/tasks/salary_prediction/answers.csv")')
+            result = executor.execute_text('submit("checker/tasks/salary_prediction/answers.csv")')
 
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["result"]["metric"], "mae")
@@ -265,6 +362,122 @@ class ExecutorTest(unittest.TestCase):
 
         self.assertEqual(result["status"], "ok")
         self.assertEqual(content, "hello new")
+
+    def test_run_python_inline_code_and_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            (workspace / "script.py").write_text('print("from file")', encoding="utf-8")
+            executor = CommandExecutor(AgentContext(workspace=workspace))
+
+            inline_result = executor.execute_text('run_python("print(2 + 3)")')
+            file_result = executor.execute_text('run_python("script.py")')
+
+        self.assertEqual(inline_result["result"]["returncode"], 0)
+        self.assertIn("5", inline_result["result"]["stdout"])
+        self.assertEqual(file_result["result"]["returncode"], 0)
+        self.assertIn("from file", file_result["result"]["stdout"])
+
+    def test_step_budget_exceeded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            executor = CommandExecutor(AgentContext(workspace=Path(tmp_dir), max_steps=1))
+
+            first = executor.execute_text("get_budget_status()")
+            second = executor.execute_text("get_budget_status()")
+
+        self.assertEqual(first["status"], "ok")
+        self.assertEqual(second["status"], "error")
+        self.assertIn("Step budget exceeded", second["error"])
+
+
+class HintEngineTest(unittest.TestCase):
+    def test_perfect_numeric_correlations_detects_positive_and_negative_pairs(self) -> None:
+        table = CsvTable(
+            path=Path("train.csv"),
+            columns=["x", "double_x", "negative_x", "target"],
+            rows=[
+                {"x": "1", "double_x": "2", "negative_x": "-1", "target": "10"},
+                {"x": "2", "double_x": "4", "negative_x": "-2", "target": "20"},
+                {"x": "3", "double_x": "6", "negative_x": "-3", "target": "30"},
+            ],
+        )
+
+        pairs = _perfect_numeric_correlations(table, exclude={"target"})
+
+        self.assertIn(("x", "double_x"), pairs)
+        self.assertIn(("x", "negative_x"), pairs)
+
+    def test_contains_metric_value_nested_data(self) -> None:
+        self.assertTrue(_contains_metric_value({"folds": [{"validation_rmse": 12.5}]}))
+        self.assertFalse(_contains_metric_value({"folds": [{"validation_rmse": "bad"}]}))
+
+    def test_build_feedback_detects_leakage_and_validation_signal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            task_dir = workspace / "tasks" / "toy"
+            task_dir.mkdir(parents=True)
+            (task_dir / "task.json").write_text(
+                json.dumps({"id": "toy", "metric": "mae", "column": "target"}),
+                encoding="utf-8",
+            )
+            (workspace / "train.csv").write_text(
+                "id,x,target\n1,10,100\n2,20,200\n3,30,300\n",
+                encoding="utf-8",
+            )
+            (workspace / "leaky.csv").write_text("id,target\n1,100\n", encoding="utf-8")
+            (workspace / "metrics.json").write_text('{"mae": 0.1}', encoding="utf-8")
+
+            feedback = HintEngine(workspace, "toy", workspace / "tasks").build_feedback()
+
+        messages = [hint["message"] for hint in feedback["hints"]]
+        self.assertTrue(any("утеч" in message for message in messages))
+        self.assertFalse(any("валидац" in message for message in messages))
+
+
+class LlmClientTest(unittest.TestCase):
+    def test_build_messages_orders_system_history_and_user_message(self) -> None:
+        history = [{"role": "assistant", "content": "old"}]
+
+        messages = build_messages("new", system_message="system", history=history)
+
+        self.assertEqual(messages, [
+            {"role": "system", "content": "system"},
+            {"role": "assistant", "content": "old"},
+            {"role": "user", "content": "new"},
+        ])
+
+    @patch("agent.llm_client.urllib.request.urlopen")
+    def test_chat_completion_posts_payload_and_decodes_json(self, urlopen_mock: Mock) -> None:
+        response = Mock()
+        response.read.return_value = b'{"choices":[{"message":{"content":"ok"}}]}'
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=None)
+        urlopen_mock.return_value = response
+
+        result = chat_completion(
+            "hello",
+            system_message="system",
+            history=[{"role": "assistant", "content": "old"}],
+            url="http://example.test/chat",
+            model="toy-model",
+            max_tokens=7,
+            temperature=0.2,
+            timeout=3,
+            extra_payload={"top_p": 0.9},
+        )
+
+        request = urlopen_mock.call_args.args[0]
+        payload = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(result["choices"][0]["message"]["content"], "ok")
+        self.assertEqual(payload["model"], "toy-model")
+        self.assertEqual(payload["messages"][-1]["content"], "hello")
+        self.assertEqual(payload["top_p"], 0.9)
+        self.assertEqual(urlopen_mock.call_args.kwargs["timeout"], 3)
+
+    @patch("agent.llm_client.chat_completion")
+    def test_ask_llm_returns_first_message_content(self, chat_completion_mock: Mock) -> None:
+        chat_completion_mock.return_value = {"choices": [{"message": {"content": "answer"}}]}
+
+        self.assertEqual(ask_llm("question"), "answer")
 
 
 if __name__ == "__main__":

@@ -30,7 +30,8 @@ budget counters, and the final submission result.
 Run:
 
 ```bash
-python3 -m agent.web_server --host 127.0.0.1 --port 8010
+export OPENAI_API_KEY="your_api_key_here"
+python3 web_server.py --host 127.0.0.1 --port 8010
 ```
 
 Open:
@@ -42,8 +43,9 @@ http://127.0.0.1:8010/
 From the page you can:
 
 - choose a task;
-- set the OpenAI-compatible LLM URL;
-- choose one of the available models: `deepseek-v4-flash` or `gemma-4-26b`;
+- choose a model; Letovo models and ChatGPT models switch endpoints automatically;
+- use Letovo models: `deepseek-v4-flash`, `gemma-4-26b`;
+- use ChatGPT models: `gpt-5-mini`, `gpt-4.1-mini`, `gpt-4o-mini`, `gpt-4.1-nano`;
 - choose a run mode: `single-shot` or `multi-shot`;
 - start or stop a benchmark run;
 - watch the live trajectory of prompts, model responses, commands, results, and hints;
@@ -68,7 +70,7 @@ from answer files and submission files. It supports:
 - text, CSV, TSV, and JSON inputs;
 - row alignment by `id`;
 - validation for missing, extra, and duplicated ids;
-- classification metrics: `accuracy`, `precision`, `recall`, `f1`;
+- classification metrics: `accuracy`, `precision`, `recall`, `f1`, `roc_auc`;
 - regression metrics: `mae`, `mse`, `rmse`, `r2`;
 - an HTTP server for uploads and task files.
 

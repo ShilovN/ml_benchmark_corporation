@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html
 import json
 import shutil
 import sys
@@ -26,14 +27,17 @@ if __package__ in {None, ""}:
 
 from agent.executor import AgentContext, CommandExecutor
 from agent.llm_client import (
+    AVAILABLE_MODELS,
     DEFAULT_MAX_TOKENS,
     DEFAULT_TEMPERATURE,
     DEFAULT_TIMEOUT,
     MODEL,
+    MODEL_GROUPS,
     SYSTEM_MESSAGE,
-    URL,
     auth_headers,
     chat_completion,
+    open_url,
+    resolve_model_url,
 )
 from agent.parser import COMMAND_NAMES, FENCED_BLOCK_RE, ParsedCommand, parse_command, parse_model_response
 
@@ -49,7 +53,7 @@ MAX_FILE_PREVIEW_CHARS = 2500
 class RunConfig:
     task_id: str
     model: str = MODEL
-    llm_url: str = URL
+    llm_url: str | None = None
     mode: str = "multi-shot"
     max_steps: int = 40
     token_limit: int = 120000
@@ -176,7 +180,9 @@ class AgentRunManager:
                     user_message,
                     system_message=SYSTEM_MESSAGE,
                     history=history,
-                    url=build_chat_completions_url(state.config.llm_url),
+                    url=build_chat_completions_url(
+                        state.config.llm_url or resolve_model_url(state.config.model)
+                    ),
                     model=state.config.model,
                     max_tokens=state.config.max_tokens,
                     temperature=state.config.temperature,
@@ -297,7 +303,8 @@ def make_handler(manager: AgentRunManager) -> type[BaseHTTPRequestHandler]:
                 self._send_json({"status": "ok", "tasks": manager.list_tasks()})
                 return
             if parsed.path == "/api/models":
-                llm_url = _first_query_value(parsed.query, "url") or URL
+                model = _first_query_value(parsed.query, "model") or MODEL
+                llm_url = resolve_model_url(model)
                 try:
                     self._send_json({"status": "ok", "models": fetch_model_options(llm_url)})
                 except Exception as exc:
@@ -305,7 +312,7 @@ def make_handler(manager: AgentRunManager) -> type[BaseHTTPRequestHandler]:
                         {
                             "status": "error",
                             "error": str(exc),
-                            "models": [MODEL],
+                            "models": AVAILABLE_MODELS,
                         },
                         HTTPStatus.BAD_REQUEST,
                     )
@@ -331,7 +338,11 @@ def make_handler(manager: AgentRunManager) -> type[BaseHTTPRequestHandler]:
                 config = RunConfig(
                     task_id=str(payload.get("task_id") or "salary_prediction"),
                     model=str(payload.get("model") or MODEL),
-                    llm_url=str(payload.get("llm_url") or URL),
+                    llm_url=(
+                        str(payload["llm_url"])
+                        if payload.get("llm_url")
+                        else None
+                    ),
                     mode=str(payload.get("mode") or "multi-shot"),
                     max_steps=int(payload["max_steps"]) if "max_steps" in payload else 40,
                     token_limit=int(payload["token_limit"]) if "token_limit" in payload else 120000,
@@ -473,23 +484,103 @@ def build_initial_prompt(workspace: Path, task_id: str) -> str:
 
 
 def build_followup_prompt(results: list[dict[str, Any]], feedback: dict[str, Any], state: RunState) -> str:
-    payload = {
-        "command_results": results,
-        "feedback": feedback,
-        "budget": {
-            "used_steps": state.executor.context.used_steps,
-            "max_steps": state.config.max_steps,
-            "remaining_steps": max(0, state.config.max_steps - state.executor.context.used_steps),
-            "requests": state.requests,
-            "total_tokens": state.total_tokens,
-            "token_limit": state.config.token_limit,
-        },
-    }
-    return "Продолжай решение. Верни только следующую команду или команды.\n\n" + json.dumps(
-        payload,
-        ensure_ascii=False,
-        default=str,
-    )
+    used_steps = state.executor.context.used_steps
+    max_steps = state.config.max_steps
+    remaining_steps = max(0, max_steps - used_steps)
+    lines = [
+        "Продолжай решение. Верни только следующую команду или команды.",
+        "",
+        "Статус benchmark:",
+        (
+            f"requests={state.requests}; tokens={state.total_tokens}/{state.config.token_limit or 'без лимита'}; "
+            f"steps={used_steps}/{max_steps}; remaining_steps={remaining_steps}"
+        ),
+        "",
+        "Результаты команд:",
+    ]
+    if results:
+        for index, result in enumerate(results, start=1):
+            lines.extend(format_web_command_result(index, result))
+    else:
+        lines.append("- команд не было")
+    if feedback:
+        lines.extend(["", "Подсказки:"])
+        lines.extend(format_web_feedback(feedback))
+    return "\n".join(lines)
+
+
+def format_web_command_result(index: int, result: dict[str, Any]) -> list[str]:
+    command = str(result.get("command", "unknown"))
+    status = str(result.get("status", "unknown"))
+    if status != "ok":
+        return [f"{index}. {command}: error", f"   {short_web_text(str(result.get('error', 'unknown error')), 1200)}"]
+    lines = [f"{index}. {command}: ok"]
+    lines.extend(f"   {line}" for line in format_web_result_payload(command, result.get("result")))
+    return lines
+
+
+def format_web_result_payload(command: str, payload: Any) -> list[str]:
+    if command == "read_file" and isinstance(payload, dict):
+        lines = [f"path={payload.get('path', '?')}; truncated={payload.get('truncated', False)}"]
+        content = str(payload.get("content", ""))
+        if content:
+            lines.append("content:")
+            lines.extend(indent_web_block(short_web_text(content, 2500), "  "))
+        return lines
+    if command == "run_python" and isinstance(payload, dict):
+        lines = [f"returncode={payload.get('returncode', '?')}"]
+        stdout = str(payload.get("stdout", ""))
+        stderr = str(payload.get("stderr", ""))
+        if stdout:
+            lines.append("stdout:")
+            lines.extend(indent_web_block(short_web_text(stdout, 1800), "  "))
+        if stderr:
+            lines.append("stderr:")
+            lines.extend(indent_web_block(short_web_text(stderr, 1800), "  "))
+        return lines
+    if command == "list_files" and isinstance(payload, list):
+        shown = [str(item) for item in payload[:30]]
+        suffix = f" ... (+{len(payload) - len(shown)} more)" if len(payload) > len(shown) else ""
+        return [", ".join(shown) + suffix if shown else "(empty)"]
+    if isinstance(payload, (dict, list)):
+        return indent_web_block(short_web_json(payload, 2500), "")
+    return [short_web_text(str(payload), 2500)]
+
+
+def format_web_feedback(feedback: dict[str, Any]) -> list[str]:
+    hints = feedback.get("hints")
+    if not isinstance(hints, list) or not hints:
+        return [f"- {short_web_json(feedback, 1500)}"]
+    lines: list[str] = []
+    for hint in hints[:8]:
+        if isinstance(hint, dict):
+            lines.append(f"- {hint.get('stage', 'hint')}: {hint.get('message', '')}")
+        else:
+            lines.append(f"- {hint}")
+    if len(hints) > 8:
+        lines.append(f"- ... (+{len(hints) - 8} more hints)")
+    return lines
+
+
+def short_web_json(value: Any, limit: int) -> str:
+    return short_web_text(json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str), limit)
+
+
+def short_web_text(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    if limit < 80:
+        return value[:limit]
+    marker = f"...[truncated {len(value) - limit} chars]..."
+    keep = max(0, limit - len(marker))
+    head = keep // 2
+    tail = keep - head
+    return value[:head] + marker + value[-tail:]
+
+
+def indent_web_block(text: str, prefix: str) -> list[str]:
+    lines = text.splitlines()
+    return [prefix + line for line in lines] if lines else [prefix]
 
 
 def collect_file_previews(workspace: Path) -> str:
@@ -563,6 +654,8 @@ def build_chat_completions_url(base_url: str) -> str:
     stripped = base_url.rstrip("/")
     if stripped.endswith("/chat/completions"):
         return stripped
+    if stripped == "https://api.openai.com":
+        return f"{stripped}/v1/chat/completions"
     if stripped.endswith("/openai"):
         return f"{stripped}/chat/completions"
     if stripped.endswith("/v1") or stripped.endswith("/compatible-mode/v1"):
@@ -579,9 +672,10 @@ def build_models_url(base_url: str) -> str:
 
 
 def fetch_model_options(base_url: str, timeout: int = 10) -> list[str]:
-    request = urllib.request.Request(build_models_url(base_url), headers=auth_headers(), method="GET")
+    models_url = build_models_url(base_url)
+    request = urllib.request.Request(models_url, headers=auth_headers(url=models_url), method="GET")
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with open_url(request, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
@@ -605,7 +699,19 @@ def _first_query_value(query: str, name: str) -> str | None:
 
 
 def render_agent_page() -> str:
-    return r"""<!doctype html>
+    model_options = "\n".join(
+        "            <optgroup label=\""
+        + html.escape(group_name, quote=True)
+        + "\">\n"
+        + "\n".join(
+            f'              <option value="{html.escape(model, quote=True)}">'
+            f"{html.escape(model)}</option>"
+            for model in models
+        )
+        + "\n            </optgroup>"
+        for group_name, models in MODEL_GROUPS
+    )
+    page = r"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -697,12 +803,10 @@ def render_agent_page() -> str:
       <section>
         <h2>Run Settings</h2>
         <div class="field"><label for="task">Task</label><select id="task"></select></div>
-        <div class="field"><label for="url">LLM URL</label><input id="url" value="http://llm.letovo.site:8809/openai"></div>
         <div class="field">
           <label for="model">Model</label>
           <select id="model">
-            <option value="deepseek-v4-flash">deepseek-v4-flash</option>
-            <option value="gemma-4-26b">gemma-4-26b</option>
+__MODEL_OPTIONS__
           </select>
         </div>
         <div class="field">
@@ -745,7 +849,6 @@ def render_agent_page() -> str:
 let currentRun = null;
 let timer = null;
 const task = document.getElementById('task');
-const url = document.getElementById('url');
 const model = document.getElementById('model');
 const mode = document.getElementById('mode');
 const steps = document.getElementById('steps');
@@ -1186,7 +1289,6 @@ async function startRun(){
   start.disabled = true; stop.disabled = false; message.textContent = 'Starting run...';
   const res = await fetch('/api/runs', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({
     task_id: task.value,
-    llm_url: url.value,
     model: model.value,
     mode: mode.value,
     max_steps: Number(steps.value),
@@ -1306,6 +1408,7 @@ loadTasks();
 </script>
 </body>
 </html>"""
+    return page.replace("__MODEL_OPTIONS__", model_options)
 
 
 def parse_args() -> argparse.Namespace:

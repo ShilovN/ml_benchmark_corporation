@@ -4,13 +4,45 @@ from __future__ import annotations
 
 import json
 import os
+import ssl
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any
 
 
-URL = os.environ.get("LLM_URL", "http://llm.letovo.site:8809/openai")
-MODEL = os.environ.get("LLM_MODEL", "deepseek-v4-flash")
+LETOVO_URL = "http://llm.letovo.site:8809/openai"
+OPENAI_URL = "https://api.openai.com/v1"
+LETOVO_MODELS = [
+    "deepseek-v4-flash",
+    "gemma-4-26b",
+]
+CHATGPT_MODELS = [
+    "gpt-5-mini",
+    "gpt-4.1-mini",
+    "gpt-4o-mini",
+    "gpt-4.1-nano",
+]
+MODEL_GROUPS = [
+    ("Letovo", LETOVO_MODELS),
+    ("ChatGPT", CHATGPT_MODELS),
+]
+AVAILABLE_MODELS = [model for _name, models in MODEL_GROUPS for model in models]
+
+MODEL = os.environ.get("LLM_MODEL", CHATGPT_MODELS[0])
+URL = os.environ.get("LLM_URL", "")
+
+
+def resolve_model_url(model: str) -> str:
+    if model in LETOVO_MODELS:
+        return LETOVO_URL
+    if model in CHATGPT_MODELS:
+        return OPENAI_URL
+    return URL or LETOVO_URL
+
+
+if not URL:
+    URL = resolve_model_url(MODEL)
 
 
 def _dotenv_value(name: str) -> str | None:
@@ -29,45 +61,65 @@ def _dotenv_value(name: str) -> str | None:
     return None
 
 
-API_KEY = (
-    os.environ.get("LLM_API_KEY")
-    or _dotenv_value("LLM_API_KEY")
-    or os.environ.get("OPENAI_API_KEY")
-    or _dotenv_value("OPENAI_API_KEY")
-)
-SYSTEM_MESSAGE = """Твоя задача решить ML задачу, используя ТОЛЬКО предложенные агентские команды. Лучше не делай все за раз: у нас будет несколько итераций, и после каждой команды ты получишь ее результат.
-Доступные команды:
-list_files(path) - посмотреть список файлов и папок в директории path. path - строка с относительным или абсолютным путем. Пример: list_files(".").
-read_file(path) - получить содержимое текстового файла path. Пример: read_file("README.md").
-write_file(path, content) - записать строку content в файл path. Если файла нет, он будет создан; если файл есть, его содержимое будет полностью заменено. Пример: write_file("solution.py", "print(1)").
-edit_file(path, diff) - заменить один фрагмент текста в существующем файле. diff должен быть объектом или JSON-строкой вида {"old": "...", "new": "..."}. Команда заменяет первое точное вхождение old на new, поэтому перед edit_file обычно нужно прочитать файл через read_file(path).
+def _llm_api_key() -> str | None:
+    return os.environ.get("LLM_API_KEY") or _dotenv_value("LLM_API_KEY")
 
-load_dataset(path) - загрузить CSV или TSV датасет из path во встроенное состояние датасета. Поддерживаются только .csv и .tsv. Пример: load_dataset("train.csv").
-show_dataset_info() - показать информацию о ранее загруженном датасете: путь, количество строк, колонки и пропуски. Обязательно сначала вызови load_dataset(path), иначе будет ошибка.
-show_sample_rows(n) - показать первые n строк ранее загруженного датасета. n - положительное целое число. Обязательно сначала вызови load_dataset(path), иначе будет ошибка.
 
-run_python(code) - выполнить Python-код из строки code через отдельный запуск Python. ВАЖНО: каждый вызов run_python(code) выполняется НЕЗАВИСИМО от всех предыдущих вызовов. Он не помнит импортированные библиотеки, переменные, функции, загруженные данные, обученные модели и любые другие объекты из прошлых run_python(code). Поэтому в каждом run_python(code) нужно заново импортировать все библиотеки, объявлять все нужные функции и переменные, читать нужные файлы и загружать данные. Если результат нужен в следующих итерациях, сохрани его в файл через Python или write_file, а потом прочитай/загрузи заново. Пример: run_python(\"\"\"import pandas as pd\ntrain = pd.read_csv("train.csv")\nprint(train.shape)\n\"\"\").
-run_python(file) - выполнить Python-файл, если строковый аргумент указывает на существующий файл в workspace. Пример: run_python("solution.py"). Файл тоже запускается отдельным процессом; состояние после завершения не сохраняется, кроме файлов, которые он записал.
+def _letovo_api_key() -> str | None:
+    return (
+        os.environ.get("LETOVO_API_KEY")
+        or _dotenv_value("LETOVO_API_KEY")
+        or _llm_api_key()
+    )
 
-get_budget_status() - получить информацию о количестве оставшихся шагов.
-get_remaining_time() - получить информацию об оставшемся времени.
-get_trajectory() - получить предыдущие команды, которые выполнялись, и краткие результаты.
 
-submit(file) - финальная отправка файла file в тестирующую систему. После этой команды ты не сможешь выполнять команды, так что подумай, что и когда отправлять на проверку.
+def _openai_api_key() -> str | None:
+    return os.environ.get("OPENAI_API_KEY") or _dotenv_value("OPENAI_API_KEY")
 
-Практические правила решения:
-- Начинай с осмотра файлов и данных: list_files, read_file, load_dataset, show_dataset_info, show_sample_rows.
-- Не отправляй submit в первой итерации без крайней необходимости.
-- Перед submit обязательно проверь, что файл существует, имеет правильный формат и содержит нужные предсказания.
-- Делай submit только один раз за все итерации. После submit тебя отключат от среды, и исправить решение уже нельзя.
-- Экономь итерации, но не пытайся сделать все вслепую. Проверяй промежуточные результаты.
-- Постарайся решить задачу на максимальный балл.
 
-ТЕБЕ НЕ ОБЯЗАТЕЛЬНО И НЕ РЕКОМЕНДОВАНО ДЕЛАТЬ SUBMIT В ПЕРВОЙ ИТЕРАЦИИ. ТЫ МОЖЕШЬ ДЕЛАТЬ ПОСЫЛКУ ТОЛЬКО 1 РАЗ ЗА ВСЕ ИТЕРАЦИИ, ПОСЛЕ ЧЕГО ТЕБЯ ОТКЛЮЧАТ ОТ СРЕДЫ И ТЫ НЕ СМОЖЕШЬ БОЛЬШЕ ВЫПОЛНЯТЬ КОМАНДЫ. ПОСЛЕ КОМАНДЫ SUBMIT ТЫ МОЖЕШЬ ПОЛУЧИТЬ ОБРАТНУЮ СВЯЗЬ ОТ ПРОВЕРЯЮЩЕГО, НО НЕ СМОЖЕШЬ БОЛЬШЕ ВЫПОЛНЯТЬ КОМАНДЫ, ТАК ЧТО ПОДУМАЙ ХОРОШО, ЧТО И КОГДА ОТПРАВЛЯТЬ НА ПРОВЕРКУ.
-ЭКОНОМЬ ТОКЕНЫ И ИТЕРАЦИИ. ЕСЛИ ОНИ ЗАКОНЧАТЬСЯ, ТЫ ПРОИГРАЕШЬ. НЕ ПЫТАЙСЯ СДЕЛАТЬ ВСЕ ВОСЛЕПУЮ. ПРОВЕРЯЙ ПРОМЕЖУТОЧНЫЕ РЕЗУЛЬТАТЫ И ПОСТАРАЙСЯ РЕШИТЬ ЗАДАЧУ НА МАКСИМАЛЬНЫЙ БАЛЛ, НЕ ПОТРАТИВ ЛИМИТЫ."""
+def api_key(url: str | None = None) -> str | None:
+    resolved_url = url or URL
+    if _is_letovo_url(resolved_url):
+        return _letovo_api_key()
+    if _is_openai_url(resolved_url):
+        return _openai_api_key()
+    llm_key = _llm_api_key()
+    if llm_key:
+        return llm_key
+    return None
+
+
+def _is_openai_url(url: str) -> bool:
+    return url.rstrip("/").lower().startswith("https://api.openai.com")
+
+
+def _is_letovo_url(url: str) -> bool:
+    return url.rstrip("/").lower().startswith(LETOVO_URL.lower())
+
+
+SYSTEM_MESSAGE = """Решай ML benchmark только агентскими командами. Любой ответ без команд считается ошибкой и тратой бюджета.
+
+ЖЕСТКИЙ БЮДЖЕТ:
+- В каждом user prompt есть процент оставшихся токенов и итераций. Это главный сигнал управления.
+- Если осталось <50% токенов: прекращай долгие исследования, делай простой надежный baseline и проверяй файл.
+- Если осталось <30% токенов: следующий шаг должен быть подготовкой/проверкой submission или submit.
+- Если осталось <15% токенов: вызывай submit с лучшим текущим файлом.
+- Не пиши объяснения, планы, Markdown или рассуждения. Возвращай только команды.
+
+Команды:
+list_files(path), read_file(path), write_file(path, content), edit_file(path, diff)
+load_dataset(path), show_dataset_info(), show_sample_rows(n)
+run_python(code) или run_python(file)
+get_budget_status(), get_remaining_time(), get_trajectory(), submit(file)
+
+Правила:
+- Каждая команда отдельной строкой: command_name(args).
+- run_python запускается заново каждый раз; все импорты и чтение файлов пиши внутри каждого вызова.
+- Сначала быстро осмотри данные, затем создай submission.csv, проверь формат и вызови submit("submission.csv").
+- submit можно сделать только один раз; после него команды больше не выполняются."""
 
 DEFAULT_TIMEOUT = 300
-DEFAULT_MAX_TOKENS = 10240
+DEFAULT_MAX_TOKENS = 2048
 DEFAULT_TEMPERATURE = 0.7
 
 
@@ -75,10 +127,53 @@ Message = dict[str, str]
 JsonDict = dict[str, Any]
 
 
-def auth_headers(api_key: str | None = API_KEY) -> dict[str, str]:
+def https_context(url: str) -> ssl.SSLContext | None:
+    if not url.lower().startswith("https://"):
+        return None
+
+    certifi_path = _certifi_path()
+    cafile = certifi_path or _system_ca_path()
+    if cafile:
+        return ssl.create_default_context(cafile=cafile)
+    return ssl.create_default_context()
+
+
+def _certifi_path() -> str | None:
+    try:
+        import certifi  # type: ignore[import-not-found]
+    except ImportError:
+        return None
+    return str(certifi.where())
+
+
+def _system_ca_path() -> str | None:
+    env_cafile = os.environ.get("SSL_CERT_FILE")
+    candidates = [
+        env_cafile,
+        "/opt/homebrew/etc/openssl@3/cert.pem",
+        "/opt/homebrew/etc/ca-certificates/cert.pem",
+        "/etc/ssl/cert.pem",
+        "/usr/local/etc/openssl@3/cert.pem",
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return candidate
+    return None
+
+
+def open_url(request: urllib.request.Request, *, timeout: int) -> Any:
+    return urllib.request.urlopen(
+        request,
+        timeout=timeout,
+        context=https_context(request.full_url),
+    )
+
+
+def auth_headers(api_key_value: str | None = None, url: str | None = None) -> dict[str, str]:
     headers = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+    key = api_key_value if api_key_value is not None else api_key(url)
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
     return headers
 
 
@@ -116,21 +211,25 @@ def chat_completion(
             system_message=system_message,
             history=history,
         ),
-        "max_tokens": max_tokens,
-        "temperature": temperature,
     }
+    if not _uses_default_temperature(model):
+        payload["temperature"] = temperature
+    if _uses_max_completion_tokens(model):
+        payload["max_completion_tokens"] = max_tokens
+    else:
+        payload["max_tokens"] = max_tokens
     if extra_payload:
         payload.update(extra_payload)
 
     request = urllib.request.Request(
         url,
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers=auth_headers(),
+        headers=auth_headers(url=url),
         method="POST",
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with open_url(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
@@ -143,6 +242,14 @@ def ask_llm(user_message: str, **kwargs: Any) -> str:
     """Send a prompt and return the first assistant message content."""
     data = chat_completion(user_message, **kwargs)
     return data["choices"][0]["message"]["content"]
+
+
+def _uses_max_completion_tokens(model: str) -> bool:
+    return model.startswith("gpt-5")
+
+
+def _uses_default_temperature(model: str) -> bool:
+    return model.startswith("gpt-5")
 
 
 if __name__ == "__main__":

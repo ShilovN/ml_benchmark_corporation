@@ -27,10 +27,11 @@ from agent.llm_client import (
     DEFAULT_TIMEOUT,
     MODEL,
     SYSTEM_MESSAGE,
-    URL,
     Message,
     auth_headers,
     chat_completion,
+    open_url,
+    resolve_model_url,
 )
 from agent.parser import (
     COMMAND_NAMES,
@@ -63,10 +64,12 @@ SKIP_DIRS = {
 SKIP_FILENAMES = {
     "agent_history.txt",
 }
-DEFAULT_CONTEXT_CHARS_PER_FILE = 2500
-DEFAULT_CONTEXT_TOTAL_CHARS = 30000
+DEFAULT_CONTEXT_CHARS_PER_FILE = 900
+DEFAULT_CONTEXT_TOTAL_CHARS = 10000
 DEFAULT_DOCKER_IMAGE = "ml-benchmark-runner:latest"
-MAX_FOLLOWUP_PROMPT_CHARS = 60000
+MAX_HISTORY_MESSAGES = 8
+MAX_HISTORY_MESSAGE_CHARS = 2500
+MAX_FOLLOWUP_PROMPT_CHARS = 30000
 MIN_COMPACT_STRING_CHARS = 1000
 
 
@@ -358,7 +361,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workspace", type=Path, default=Path.cwd())
     parser.add_argument("--task-id", default="salary_prediction")
     parser.add_argument("--tasks-dir", type=Path, default=Path("checker/tasks"))
-    parser.add_argument("--url", default=URL, help="OpenAI-compatible chat completions endpoint.")
+    parser.add_argument(
+        "--url",
+        help="Override the model's default OpenAI-compatible chat completions endpoint.",
+    )
     parser.add_argument(
         "--base-url",
         help=(
@@ -502,10 +508,10 @@ def main() -> int:
                 response = chat_completion(
                     user_message,
                     system_message=SYSTEM_MESSAGE,
-                    history=history,
+                    history=compact_history_for_model(history),
                     url=llm_url,
                     model=args.model,
-                    max_tokens=args.max_tokens,
+                    max_tokens=response_max_tokens(stats, args),
                     temperature=args.temperature,
                     timeout=args.request_timeout,
                 )
@@ -661,13 +667,17 @@ def create_run_workspace(source_workspace: Path, run_root: Path, task_id: str) -
 def resolve_llm_url(args: argparse.Namespace) -> str:
     if args.base_url:
         return build_chat_completions_url(args.base_url)
-    return build_chat_completions_url(args.url)
+    if args.url:
+        return build_chat_completions_url(args.url)
+    return build_chat_completions_url(resolve_model_url(args.model))
 
 
 def build_chat_completions_url(base_url: str) -> str:
     stripped = base_url.rstrip("/")
     if stripped.endswith("/chat/completions"):
         return stripped
+    if stripped == "https://api.openai.com":
+        return f"{stripped}/v1/chat/completions"
     if stripped.endswith("/openai"):
         return f"{stripped}/chat/completions"
     if stripped.endswith("/v1") or stripped.endswith("/compatible-mode/v1"):
@@ -677,9 +687,9 @@ def build_chat_completions_url(base_url: str) -> str:
 
 def preflight_llm(chat_url: str, timeout: int) -> None:
     models_url = build_models_url(chat_url)
-    request = urllib.request.Request(models_url, headers=auth_headers(), method="GET")
+    request = urllib.request.Request(models_url, headers=auth_headers(url=models_url), method="GET")
     try:
-        with urllib.request.urlopen(request, timeout=min(timeout, 10)) as response:
+        with open_url(request, timeout=min(timeout, 10)) as response:
             payload = response.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
@@ -733,12 +743,11 @@ def build_initial_prompt(
     budget_line = format_budget_line(stats, args)
     return (
         f"{budget_line}\n\n"
-        "Ты решаешь ML benchmark task. Работай только через доступные агентские команды. "
-        "В одном ответе можно вернуть одну или несколько команд, но каждая команда должна быть "
-        "отдельной строкой или отдельным fenced-блоком. Вызови submit(file) ровно один раз, "
-        "когда файл submission готов.\n\n"
+        "ML benchmark. Отвечай только агентскими командами, по одной на строку. "
+        "Сначала проверь данные, затем быстро готовь submission.csv и вызови submit(\"submission.csv\"). "
+        "Не трать токены на объяснения.\n\n"
         f"task_id: {task_id}\n"
-        "Ниже частичное содержимое файлов workspace. Секретные answer/submission файлы не включены.\n\n"
+        "Компактный обзор workspace. Для деталей используй read_file/load_dataset/show_sample_rows.\n\n"
         f"{file_previews}"
     )
 
@@ -761,16 +770,28 @@ def collect_file_previews(workspace: Path, *, per_file_limit: int, total_limit: 
         if hidden_answer_file:
             continue
 
-        preview = content[:per_file_limit]
-        if len(content) > per_file_limit:
-            preview += "\n...[truncated]"
-        chunk = f"### {relative}\n```text\n{preview}\n```\n"
+        preview = compact_file_preview(relative, content, per_file_limit)
+        chunk = f"{relative} ({len(content)} chars)\n{preview}\n"
         if used_chars + len(chunk) > total_limit:
             chunks.append("...[initial context truncated]")
             break
         chunks.append(chunk)
         used_chars += len(chunk)
     return "\n".join(chunks) if chunks else "(no readable text files found)"
+
+
+def compact_file_preview(relative: Path, content: str, limit: int) -> str:
+    suffix = relative.suffix.lower()
+    if suffix in {".csv", ".tsv"}:
+        lines = content.splitlines()
+        delimiter = "\\t" if suffix == ".tsv" else ","
+        preview_lines = lines[:4]
+        preview = "\n".join(preview_lines)
+        if len(lines) > len(preview_lines):
+            preview += f"\n...[{len(lines) - len(preview_lines)} more rows; delimiter={delimiter}]"
+    else:
+        preview = content
+    return truncate_middle(preview, limit)
 
 
 def should_skip_path(workspace: Path, path: Path) -> bool:
@@ -842,11 +863,10 @@ def build_parse_error_prompt(
 ) -> str:
     return (
         f"{format_budget_line(stats, args)}\n\n"
-        "Твой прошлый ответ не удалось распарсить как агентскую команду.\n"
+        "Твой прошлый ответ не распарсился как команда.\n"
         f"Ошибка парсинга: {exc}\n\n"
-        "Верни только валидные команды, по одной на строку. "
-        "Не объясняй ход мыслей вне команд.\n\n"
-        f"Прошлый ответ:\n{assistant_text[:4000]}"
+        "Верни только валидные команды, по одной на строку. Без объяснений.\n\n"
+        f"Прошлый ответ:\n{truncate_middle(assistant_text, 1200)}"
     )
 
 
@@ -856,29 +876,120 @@ def build_followup_prompt(
     args: argparse.Namespace,
     feedback: dict[str, Any] | None = None,
 ) -> str:
-    budget_status = build_budget_status(stats, args)
-    payload = {
-        "command_results": command_results,
-        "benchmark_status": {
-            "elapsed_seconds": stats.elapsed_seconds,
-            "requests": stats.requests,
-            "total_tokens": stats.total_tokens,
-            "token_limit": args.token_limit,
-            "remaining_tokens": budget_status["remaining_tokens"],
-            "remaining_token_percent": budget_status["remaining_token_percent"],
-            "used_steps": stats.executed_commands,
-            "max_steps": args.max_steps,
-            "remaining_iterations": budget_status["remaining_iterations"],
-            "remaining_seconds": max(0.0, args.time_limit_seconds - stats.elapsed_seconds),
-        },
-    }
-    if feedback is not None:
-        payload["feedback"] = feedback
     prefix = (
         f"{format_budget_line(stats, args)} "
         "Дальше верни только команды.\n\n"
     )
-    return prefix + compact_json_for_prompt(payload, MAX_FOLLOWUP_PROMPT_CHARS - len(prefix))
+    body = format_followup_body(command_results, stats, args, feedback)
+    return prefix + truncate_middle(body, MAX_FOLLOWUP_PROMPT_CHARS - len(prefix))
+
+
+def format_followup_body(
+    command_results: list[dict[str, Any]],
+    stats: BenchmarkStats,
+    args: argparse.Namespace,
+    feedback: dict[str, Any] | None,
+) -> str:
+    budget = build_budget_status(stats, args)
+    remaining_seconds = max(0.0, args.time_limit_seconds - stats.elapsed_seconds)
+    lines = [
+        "Статус benchmark:",
+        (
+            f"requests={stats.requests}; tokens={stats.total_tokens}/{args.token_limit or 'без лимита'}; "
+            f"steps={stats.executed_commands}/{args.max_steps}; "
+            f"remaining_steps={budget['remaining_iterations']}; "
+            f"remaining_seconds={remaining_seconds:.1f}"
+        ),
+        "",
+        "Результаты команд:",
+    ]
+    if command_results:
+        for index, result in enumerate(command_results, start=1):
+            lines.extend(format_command_result_for_prompt(index, result))
+    else:
+        lines.append("- команд не было")
+    if feedback:
+        lines.extend(["", "Подсказки:"])
+        lines.extend(format_feedback_for_prompt(feedback))
+    return "\n".join(lines)
+
+
+def format_command_result_for_prompt(index: int, result: dict[str, Any]) -> list[str]:
+    command = str(result.get("command", "unknown"))
+    status = str(result.get("status", "unknown"))
+    if status != "ok":
+        return [
+            f"{index}. {command}: error",
+            f"   {truncate_middle(str(result.get('error', 'unknown error')), 1200)}",
+        ]
+    lines = [f"{index}. {command}: ok"]
+    lines.extend(f"   {line}" for line in format_result_payload(command, result.get("result")))
+    return lines
+
+
+def format_result_payload(command: str, payload: Any) -> list[str]:
+    if command == "read_file" and isinstance(payload, dict):
+        lines = [f"path={payload.get('path', '?')}; truncated={payload.get('truncated', False)}"]
+        content = str(payload.get("content", ""))
+        if content:
+            lines.append("content:")
+            lines.extend(indent_block(truncate_middle(content, 2500), "  "))
+        return lines
+    if command == "run_python" and isinstance(payload, dict):
+        lines = [f"returncode={payload.get('returncode', '?')}"]
+        stdout = str(payload.get("stdout", ""))
+        stderr = str(payload.get("stderr", ""))
+        if stdout:
+            lines.append("stdout:")
+            lines.extend(indent_block(truncate_middle(stdout, 1800), "  "))
+        if stderr:
+            lines.append("stderr:")
+            lines.extend(indent_block(truncate_middle(stderr, 1800), "  "))
+        return lines
+    if command == "list_files" and isinstance(payload, list):
+        shown = [str(item) for item in payload[:30]]
+        suffix = f" ... (+{len(payload) - len(shown)} more)" if len(payload) > len(shown) else ""
+        return [", ".join(shown) + suffix if shown else "(empty)"]
+    if command == "load_dataset" and isinstance(payload, dict):
+        return [
+            f"path={payload.get('path', '?')}; rows={payload.get('rows', '?')}; "
+            f"columns={format_short_value(payload.get('columns', []), 1200)}"
+        ]
+    if command == "show_dataset_info" and isinstance(payload, dict):
+        return [
+            f"path={payload.get('path', '?')}; rows={payload.get('rows', '?')}",
+            f"columns={format_short_value(payload.get('columns', []), 1200)}",
+            f"missing={format_short_value(payload.get('missing_by_column', {}), 1200)}",
+        ]
+    if command == "show_sample_rows" and isinstance(payload, list):
+        return indent_block(format_short_value(payload[:5], 2500), "")
+    return indent_block(format_short_value(payload, 2500), "")
+
+
+def format_feedback_for_prompt(feedback: dict[str, Any]) -> list[str]:
+    hints = feedback.get("hints")
+    if not isinstance(hints, list) or not hints:
+        return [f"- {format_short_value(feedback, 1500)}"]
+    lines: list[str] = []
+    for hint in hints[:8]:
+        if isinstance(hint, dict):
+            lines.append(f"- {hint.get('stage', 'hint')}: {hint.get('message', '')}")
+        else:
+            lines.append(f"- {hint}")
+    if len(hints) > 8:
+        lines.append(f"- ... (+{len(hints) - 8} more hints)")
+    return lines
+
+
+def format_short_value(value: Any, limit: int) -> str:
+    if isinstance(value, str):
+        return truncate_middle(value, limit)
+    return truncate_middle(json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str), limit)
+
+
+def indent_block(text: str, prefix: str) -> list[str]:
+    lines = text.splitlines()
+    return [prefix + line for line in lines] if lines else [prefix]
 
 
 def compact_json_for_prompt(payload: dict[str, Any], max_chars: int) -> str:
@@ -963,9 +1074,59 @@ def format_budget_line(stats: BenchmarkStats, args: argparse.Namespace) -> str:
     else:
         token_text = f"осталось {percent}% токенов"
     line = f"Бюджет: {token_text}; осталось итераций: {status['remaining_iterations']}."
-    if percent is not None and percent < 30:
-        line += " Экономь токены: скоро сделай submit, иначе проиграешь."
+    directive = budget_directive(percent)
+    if directive:
+        line += f" {directive}"
     return line
+
+
+def budget_directive(percent: float | None) -> str:
+    if percent is None:
+        return ""
+    if percent < 15:
+        return "КРИТИЧНО: вызывай submit с лучшим текущим файлом сейчас, иначе проиграешь."
+    if percent < 30:
+        return "Экономь токены: следующий шаг должен готовить/проверять submission или делать submit, иначе проиграешь."
+    if percent < 50:
+        return "Экономь токены: прекращай исследование, делай простой baseline и двигайся к submit."
+    return ""
+
+
+def response_max_tokens(stats: BenchmarkStats, args: argparse.Namespace) -> int:
+    configured = getattr(args, "max_tokens", DEFAULT_MAX_TOKENS)
+    percent = build_budget_status(stats, args)["remaining_token_percent"]
+    if percent is None:
+        return configured
+    if percent < 15:
+        return min(configured, 512)
+    if percent < 30:
+        return min(configured, 768)
+    if percent < 50:
+        return min(configured, 1024)
+    return configured
+
+
+def compact_history_for_model(history: list[Message]) -> list[Message]:
+    if len(history) <= MAX_HISTORY_MESSAGES:
+        return [compact_history_message(message) for message in history]
+    compacted = [
+        {
+            "role": "user",
+            "content": (
+                f"[history compacted: hidden {len(history) - MAX_HISTORY_MESSAGES} old messages. "
+                "Use get_trajectory() if old command results are needed.]"
+            ),
+        }
+    ]
+    compacted.extend(compact_history_message(message) for message in history[-MAX_HISTORY_MESSAGES:])
+    return compacted
+
+
+def compact_history_message(message: Message) -> Message:
+    return {
+        "role": message.get("role", "user"),
+        "content": truncate_middle(message.get("content", ""), MAX_HISTORY_MESSAGE_CHARS),
+    }
 
 
 def print_debug_state(
@@ -991,6 +1152,7 @@ def print_debug_state(
         f"remaining {format_optional_int(budget_status['remaining_tokens'])} "
         f"({format_optional_percent(budget_status['remaining_token_percent'])})"
     )
+    print(f"Next max_tokens: {response_max_tokens(stats, args)}")
     print(
         "Iterations: "
         f"{stats.executed_commands}/{format_optional_int(max_steps)} used | "
