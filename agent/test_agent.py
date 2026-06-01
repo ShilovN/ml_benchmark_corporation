@@ -21,6 +21,15 @@ from main import (
     compact_json_for_prompt,
     response_max_tokens,
 )
+from web_server import (
+    REPEATED_MAX_ATTEMPTS,
+    RunConfig,
+    RunState,
+    apply_mode_after_results,
+    apply_mode_instruction,
+    current_fixed_stage,
+    validate_mode_command,
+)
 
 
 class ParserTest(unittest.TestCase):
@@ -126,11 +135,14 @@ class ExecutorTest(unittest.TestCase):
         feedback = {"hints": [{"stage": "EDA", "message": "hint"}]}
 
         prompt = build_followup_prompt(command_results, BenchmarkStats(), args, feedback)
-        payload = json.loads(prompt.split("\n\n", 1)[1])
 
-        self.assertEqual(payload["feedback"], feedback)
-        self.assertNotIn("feedback", payload["command_results"][0])
-        self.assertNotIn("feedback", payload["command_results"][1])
+        self.assertIn("Результаты команд:", prompt)
+        self.assertIn("1. write_file: ok", prompt)
+        self.assertIn("2. read_file: ok", prompt)
+        self.assertIn("Подсказки:", prompt)
+        self.assertIn("- EDA: hint", prompt)
+        self.assertNotIn('"command_results"', prompt)
+        self.assertNotIn('"feedback"', prompt)
 
     def test_followup_prompt_contains_remaining_budget(self) -> None:
         args = argparse.Namespace(token_limit=1000, max_steps=10, time_limit_seconds=3600)
@@ -139,14 +151,15 @@ class ExecutorTest(unittest.TestCase):
         stats.executed_commands = 4
 
         prompt = build_followup_prompt([], stats, args)
-        payload = json.loads(prompt.split("\n\n", 1)[1])
 
         self.assertIn("осталось 75.0% токенов", prompt)
         self.assertIn("осталось итераций: 6", prompt)
-        self.assertNotIn("\n  ", prompt)
-        self.assertEqual(payload["benchmark_status"]["remaining_tokens"], 750)
-        self.assertEqual(payload["benchmark_status"]["remaining_token_percent"], 75.0)
-        self.assertEqual(payload["benchmark_status"]["remaining_iterations"], 6)
+        self.assertIn("Статус benchmark:", prompt)
+        self.assertIn("tokens=250/1000", prompt)
+        self.assertIn("steps=4/10", prompt)
+        self.assertIn("remaining_steps=6", prompt)
+        self.assertIn("- команд не было", prompt)
+        self.assertNotIn('"benchmark_status"', prompt)
 
     def test_followup_prompt_warns_when_token_budget_is_low(self) -> None:
         args = argparse.Namespace(token_limit=1000, max_steps=10, time_limit_seconds=3600)
@@ -383,6 +396,60 @@ class ExecutorTest(unittest.TestCase):
         self.assertEqual(first["status"], "ok")
         self.assertEqual(second["status"], "error")
         self.assertIn("Step budget exceeded", second["error"])
+
+
+class WebServerModeTest(unittest.TestCase):
+    def _state(self, mode: str) -> RunState:
+        workspace = Path(tempfile.mkdtemp())
+        executor = CommandExecutor(AgentContext(workspace=workspace))
+        return RunState(
+            run_id="test",
+            config=RunConfig(task_id="toy", mode=mode),
+            workspace=workspace,
+            executor=executor,
+        )
+
+    def test_fixed_transitions_blocks_submit_before_train(self) -> None:
+        state = self._state("fixed-transitions")
+
+        error = validate_mode_command(state, parse_command('submit("submission.csv")'))
+        allowed = validate_mode_command(state, parse_command('read_file("train.csv")'))
+
+        self.assertIsNotNone(error)
+        self.assertEqual(error["status"], "error")
+        self.assertIn("not allowed during EDA", error["error"])
+        self.assertIsNone(allowed)
+
+    def test_fixed_transitions_advances_stages_and_finishes_after_train(self) -> None:
+        state = self._state("fixed-transitions")
+
+        self.assertEqual(current_fixed_stage(state), "EDA")
+        self.assertIsNone(apply_mode_after_results(state, [{"status": "ok", "command": "read_file"}]))
+        self.assertEqual(current_fixed_stage(state), "FEATURES")
+        self.assertIsNone(apply_mode_after_results(state, [{"status": "error", "command": "write_file"}]))
+        self.assertEqual(current_fixed_stage(state), "FEATURES")
+        self.assertIsNone(apply_mode_after_results(state, [{"status": "ok", "command": "write_file"}]))
+        self.assertEqual(current_fixed_stage(state), "TRAIN")
+        self.assertEqual(
+            apply_mode_after_results(state, [{"status": "ok", "command": "run_python"}]),
+            "fixed_transitions_finished",
+        )
+
+    def test_repeated_mode_stops_after_attempt_limit(self) -> None:
+        state = self._state("repeated")
+        state.requests = REPEATED_MAX_ATTEMPTS
+
+        self.assertEqual(
+            apply_mode_after_results(state, [{"status": "ok", "command": "read_file"}]),
+            "repeated_attempt_limit",
+        )
+
+    def test_mode_instruction_mentions_current_mode(self) -> None:
+        fixed_state = self._state("fixed-transitions")
+        repeated_state = self._state("repeated")
+
+        self.assertIn("текущий обязательный этап EDA", apply_mode_instruction(fixed_state, "base"))
+        self.assertIn(f"попытка 1/{REPEATED_MAX_ATTEMPTS}", apply_mode_instruction(repeated_state, "base"))
 
 
 class HintEngineTest(unittest.TestCase):

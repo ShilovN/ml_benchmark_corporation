@@ -54,6 +54,39 @@ TOKEN_ESTIMATE_CHARS_PER_TOKEN = 3
 MAX_HISTORY_MESSAGES = 6
 FINAL_SUBMIT_MAX_TOKENS = 1200
 FINAL_SUBMIT_TOKEN_RESERVE = 300
+ALLOWED_MODES = {"single-shot", "repeated", "fixed-transitions", "flexible"}
+DEFAULT_MODE = "flexible"
+REPEATED_MAX_ATTEMPTS = 5
+FIXED_TRANSITION_STAGES = ["EDA", "FEATURES", "TRAIN"]
+FIXED_STAGE_ALLOWED_COMMANDS = {
+    "EDA": {
+        "list_files",
+        "read_file",
+        "load_dataset",
+        "show_dataset_info",
+        "show_sample_rows",
+        "run_python",
+        "get_budget_status",
+        "get_remaining_time",
+        "get_trajectory",
+        "get_hints",
+    },
+    "FEATURES": {
+        "list_files",
+        "read_file",
+        "write_file",
+        "edit_file",
+        "load_dataset",
+        "show_dataset_info",
+        "show_sample_rows",
+        "run_python",
+        "get_budget_status",
+        "get_remaining_time",
+        "get_trajectory",
+        "get_hints",
+    },
+    "TRAIN": set(COMMAND_NAMES),
+}
 
 
 @dataclass
@@ -61,7 +94,7 @@ class RunConfig:
     task_id: str
     model: str = MODEL
     llm_url: str | None = None
-    mode: str = "multi-shot"
+    mode: str = DEFAULT_MODE
     max_steps: int = 40
     token_limit: int = 120000
     temperature: float = DEFAULT_TEMPERATURE
@@ -87,6 +120,7 @@ class RunState:
     thread: threading.Thread | None = None
     stop_requested: bool = False
     final_submit_requested: bool = False
+    fixed_stage_index: int = 0
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -170,7 +204,7 @@ class AgentRunManager:
         return True
 
     def _run_loop(self, state: RunState) -> None:
-        user_message = build_initial_prompt(state.workspace, state.config.task_id)
+        user_message = apply_mode_instruction(state, build_initial_prompt(state.workspace, state.config.task_id))
         history: list[dict[str, str]] = []
         add_event(state, "system", "Run started", {"task_id": state.config.task_id, "mode": state.config.mode})
 
@@ -236,20 +270,28 @@ class AgentRunManager:
                     if state.config.mode == "single-shot" or state.final_submit_requested:
                         state.stop_reason = "single_shot_parse_error"
                         break
-                    user_message = (
+                    if state.config.mode == "repeated" and state.requests >= REPEATED_MAX_ATTEMPTS:
+                        state.stop_reason = "repeated_attempt_limit"
+                        break
+                    user_message = apply_mode_instruction(
+                        state,
                         "Твой ответ не удалось распарсить как команду.\n"
                         f"Ошибка: {exc}\n"
-                        "Верни только валидную команду или несколько команд, по одной на строку."
+                        "Верни только валидную команду или несколько команд, по одной на строку.",
                     )
                     continue
 
                 results: list[dict[str, Any]] = []
                 for command in commands:
                     add_event(state, "command", command.name, {"args": command.args})
-                    result = state.executor.execute(command)
+                    validation_error = validate_mode_command(state, command)
+                    if validation_error:
+                        result = validation_error
+                    else:
+                        result = state.executor.execute(command)
                     results.append(result)
                     add_event(state, "result", f"{command.name}: {result['status']}", result)
-                    if command.name == "submit":
+                    if command.name == "submit" and result["status"] == "ok":
                         state.submitted = True
                         state.submission_result = result
                         state.stop_reason = "submitted"
@@ -258,17 +300,14 @@ class AgentRunManager:
                 if state.submitted:
                     break
 
-                if state.final_submit_requested:
-                    state.stop_reason = "final_submit_prompt_finished_without_submit"
-                    break
-
-                if state.config.mode == "single-shot":
-                    state.stop_reason = "single_shot_finished"
+                mode_stop_reason = apply_mode_after_results(state, results)
+                if mode_stop_reason:
+                    state.stop_reason = mode_stop_reason
                     break
 
                 feedback = state.executor.build_feedback()
                 add_event(state, "feedback", "Feedback hints", feedback)
-                user_message = build_followup_prompt(results, feedback, state)
+                user_message = apply_mode_instruction(state, build_followup_prompt(results, feedback, state))
 
             if state.stop_requested:
                 state.status = "stopped"
@@ -370,6 +409,16 @@ def make_handler(manager: AgentRunManager) -> type[BaseHTTPRequestHandler]:
             parsed = urlparse(self.path)
             if parsed.path == "/api/runs":
                 payload = self._read_json()
+                mode = str(payload.get("mode") or DEFAULT_MODE)
+                if mode not in ALLOWED_MODES:
+                    self._send_json(
+                        {
+                            "status": "error",
+                            "error": f"Unknown mode: {mode}. Allowed modes: {sorted(ALLOWED_MODES)}",
+                        },
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                    return
                 config = RunConfig(
                     task_id=str(payload.get("task_id") or "salary_prediction"),
                     model=str(payload.get("model") or MODEL),
@@ -378,7 +427,7 @@ def make_handler(manager: AgentRunManager) -> type[BaseHTTPRequestHandler]:
                         if payload.get("llm_url")
                         else None
                     ),
-                    mode=str(payload.get("mode") or "multi-shot"),
+                    mode=mode,
                     max_steps=int(payload["max_steps"]) if "max_steps" in payload else 40,
                     token_limit=int(payload["token_limit"]) if "token_limit" in payload else 120000,
                     temperature=float(payload["temperature"]) if "temperature" in payload else DEFAULT_TEMPERATURE,
@@ -520,34 +569,183 @@ def build_initial_prompt(workspace: Path, task_id: str) -> str:
     )
 
 
-def build_followup_prompt(results: list[dict[str, Any]], feedback: dict[str, Any], state: RunState) -> str:
-    finalization = should_request_final_submit(state)
-    payload = {
-        "command_results": results,
-        "feedback": feedback,
+def apply_mode_instruction(state: RunState, prompt: str) -> str:
+    instruction = mode_instruction(state)
+    if not instruction:
+        return prompt
+    return f"{prompt}\n\n{instruction}"
+
+
+def mode_instruction(state: RunState) -> str:
+    mode = state.config.mode
+    if mode == "single-shot":
+        return (
+            "Режим single-shot: это единственный ответ модели. "
+            "Сразу создай/проверь submission.csv и вызови submit(\"submission.csv\")."
+        )
+    if mode == "repeated":
+        attempt = min(state.requests + 1, REPEATED_MAX_ATTEMPTS)
+        return (
+            f"Режим repeated: попытка {attempt}/{REPEATED_MAX_ATTEMPTS}. "
+            "Каждая попытка должна улучшать или проверять решение; при готовности вызывай submit."
+        )
+    if mode == "fixed-transitions":
+        stage = current_fixed_stage(state)
+        if stage == "EDA":
+            detail = "изучи файлы и данные; не вызывай submit на этом этапе"
+        elif stage == "FEATURES":
+            detail = "подготовь признаки, скрипты или промежуточные файлы; submit пока запрещен"
+        else:
+            detail = "обучи модель, создай submission.csv, проверь формат и вызови submit"
+        return f"Режим fixed-transitions: текущий обязательный этап {stage}. Задача этапа: {detail}."
+    if mode == "flexible":
+        return "Режим flexible: можно свободно выбирать следующие агентские команды до submit или лимитов."
+    return ""
+
+
+def current_fixed_stage(state: RunState) -> str:
+    index = min(state.fixed_stage_index, len(FIXED_TRANSITION_STAGES) - 1)
+    return FIXED_TRANSITION_STAGES[index]
+
+
+def validate_mode_command(state: RunState, command: ParsedCommand) -> dict[str, Any] | None:
+    if state.config.mode != "fixed-transitions":
+        return None
+    stage = current_fixed_stage(state)
+    allowed = FIXED_STAGE_ALLOWED_COMMANDS[stage]
+    if command.name in allowed:
+        return None
+    return {
+        "status": "error",
+        "command": command.name,
+        "error": (
+            f"Pipeline violation: command {command.name} is not allowed during {stage}. "
+            f"Allowed commands: {', '.join(sorted(allowed))}."
+        ),
     }
-    if finalization:
-        payload["budget"] = build_budget_payload(state)
-        payload["finalization_required"] = True
-        instruction = (
-            "FINALIZATION MODE.\n"
-            "Осталось мало бюджета. Больше не делай EDA и долгие улучшения.\n"
-            "Если submission.csv уже существует и его формат выглядит правильным, вызови submit(\"submission.csv\").\n"
-            "Если файла нет, создай самый лучший возможный submission.csv простым способом и затем вызови submit(\"submission.csv\").\n"
-            "Верни только команды.\n\n"
-        )
+
+
+def apply_mode_after_results(state: RunState, results: list[dict[str, Any]]) -> str | None:
+    if state.config.mode == "single-shot":
+        return "single_shot_finished"
+
+    if state.config.mode == "repeated" and state.requests >= REPEATED_MAX_ATTEMPTS:
+        return "repeated_attempt_limit"
+
+    if state.config.mode != "fixed-transitions":
+        return None
+
+    if any(result.get("status") == "error" for result in results):
+        return None
+
+    stage = current_fixed_stage(state)
+    add_event(state, "stage", f"{stage} completed", {"stage": stage})
+    if stage == "TRAIN":
+        return "fixed_transitions_finished"
+    state.fixed_stage_index += 1
+    next_stage = current_fixed_stage(state)
+    add_event(state, "stage", f"Next stage: {next_stage}", {"stage": next_stage})
+    return None
+
+
+def build_followup_prompt(results: list[dict[str, Any]], feedback: dict[str, Any], state: RunState) -> str:
+    used_steps = state.executor.context.used_steps
+    max_steps = state.config.max_steps
+    remaining_steps = max(0, max_steps - used_steps)
+    lines = [
+        "Продолжай решение. Верни только следующую команду или команды.",
+        "",
+        "Статус benchmark:",
+        (
+            f"requests={state.requests}; tokens={state.total_tokens}/{state.config.token_limit or 'без лимита'}; "
+            f"steps={used_steps}/{max_steps}; remaining_steps={remaining_steps}"
+        ),
+        "",
+        "Результаты команд:",
+    ]
+    if results:
+        for index, result in enumerate(results, start=1):
+            lines.extend(format_web_command_result(index, result))
     else:
-        instruction = (
-            "Продолжай улучшать решение: EDA, feature engineering, обучение и проверка модели. "
-            "Перед submit проверь файл через read_file/show_dataset_info или короткий run_python: "
-            "колонки, количество строк, отсутствие NaN/пустых предсказаний. "
-            "Верни только следующую команду или команды.\n\n"
-        )
-    return instruction + json.dumps(
-        payload,
-        ensure_ascii=False,
-        default=str,
-    )
+        lines.append("- команд не было")
+    if feedback:
+        lines.extend(["", "Подсказки:"])
+        lines.extend(format_web_feedback(feedback))
+    return "\n".join(lines)
+
+
+def format_web_command_result(index: int, result: dict[str, Any]) -> list[str]:
+    command = str(result.get("command", "unknown"))
+    status = str(result.get("status", "unknown"))
+    if status != "ok":
+        return [f"{index}. {command}: error", f"   {short_web_text(str(result.get('error', 'unknown error')), 1200)}"]
+    lines = [f"{index}. {command}: ok"]
+    lines.extend(f"   {line}" for line in format_web_result_payload(command, result.get("result")))
+    return lines
+
+
+def format_web_result_payload(command: str, payload: Any) -> list[str]:
+    if command == "read_file" and isinstance(payload, dict):
+        lines = [f"path={payload.get('path', '?')}; truncated={payload.get('truncated', False)}"]
+        content = str(payload.get("content", ""))
+        if content:
+            lines.append("content:")
+            lines.extend(indent_web_block(short_web_text(content, 2500), "  "))
+        return lines
+    if command == "run_python" and isinstance(payload, dict):
+        lines = [f"returncode={payload.get('returncode', '?')}"]
+        stdout = str(payload.get("stdout", ""))
+        stderr = str(payload.get("stderr", ""))
+        if stdout:
+            lines.append("stdout:")
+            lines.extend(indent_web_block(short_web_text(stdout, 1800), "  "))
+        if stderr:
+            lines.append("stderr:")
+            lines.extend(indent_web_block(short_web_text(stderr, 1800), "  "))
+        return lines
+    if command == "list_files" and isinstance(payload, list):
+        shown = [str(item) for item in payload[:30]]
+        suffix = f" ... (+{len(payload) - len(shown)} more)" if len(payload) > len(shown) else ""
+        return [", ".join(shown) + suffix if shown else "(empty)"]
+    if isinstance(payload, (dict, list)):
+        return indent_web_block(short_web_json(payload, 2500), "")
+    return [short_web_text(str(payload), 2500)]
+
+
+def format_web_feedback(feedback: dict[str, Any]) -> list[str]:
+    hints = feedback.get("hints")
+    if not isinstance(hints, list) or not hints:
+        return [f"- {short_web_json(feedback, 1500)}"]
+    lines: list[str] = []
+    for hint in hints[:8]:
+        if isinstance(hint, dict):
+            lines.append(f"- {hint.get('stage', 'hint')}: {hint.get('message', '')}")
+        else:
+            lines.append(f"- {hint}")
+    if len(hints) > 8:
+        lines.append(f"- ... (+{len(hints) - 8} more hints)")
+    return lines
+
+
+def short_web_json(value: Any, limit: int) -> str:
+    return short_web_text(json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str), limit)
+
+
+def short_web_text(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    if limit < 80:
+        return value[:limit]
+    marker = f"...[truncated {len(value) - limit} chars]..."
+    keep = max(0, limit - len(marker))
+    head = keep // 2
+    tail = keep - head
+    return value[:head] + marker + value[-tail:]
+
+
+def indent_web_block(text: str, prefix: str) -> list[str]:
+    lines = text.splitlines()
+    return [prefix + line for line in lines] if lines else [prefix]
 
 
 def build_emergency_submit_prompt(state: RunState) -> str:
@@ -787,7 +985,7 @@ def render_agent_page() -> str:
         + "\n            </optgroup>"
         for group_name, models in MODEL_GROUPS
     )
-    page = """<!doctype html>
+    page = r"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -796,13 +994,14 @@ def render_agent_page() -> str:
   <style>
     :root { --bg:#f5f7fa; --surface:#fff; --border:#d8e0ea; --text:#152033; --muted:#667085; --accent:#155eef; --ok:#067647; --bad:#b42318; }
     body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:var(--bg); color:var(--text); }
-    main { max-width:1240px; margin:0 auto; padding:28px 20px 44px; }
+    main { max-width:1240px; margin:0 auto; padding:28px 20px 44px; overflow-x:hidden; }
     header { display:flex; justify-content:space-between; gap:18px; align-items:flex-start; margin-bottom:20px; }
     h1 { margin:0 0 8px; font-size:30px; line-height:1.15; }
     h2 { margin:0 0 14px; font-size:18px; }
     p { margin:0; color:var(--muted); }
-    section { background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:18px; margin-bottom:16px; }
+    section { min-width:0; background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:18px; margin-bottom:16px; }
     .layout { display:grid; grid-template-columns:360px minmax(0,1fr); gap:18px; align-items:start; }
+    .layout > * { min-width:0; }
     label { display:block; margin:0 0 7px; font-weight:700; }
     input, select, button { box-sizing:border-box; width:100%; min-height:40px; font:inherit; }
     input, select { border:1px solid var(--border); border-radius:6px; padding:8px; background:white; }
@@ -815,11 +1014,50 @@ def render_agent_page() -> str:
     .cards { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; }
     .card { border:1px solid var(--border); border-radius:8px; padding:12px; background:#f8fafc; }
     .card strong { display:block; font-size:22px; margin-top:4px; }
-    .events { display:grid; gap:10px; }
-    .event { border:1px solid var(--border); border-radius:8px; padding:12px; background:white; }
-    .event-head { display:flex; justify-content:space-between; gap:10px; color:var(--muted); font-size:13px; margin-bottom:8px; }
+    .events { display:grid; gap:12px; min-width:0; max-height:72vh; overflow:auto; padding-right:4px; }
+    .event { min-width:0; max-width:100%; overflow:hidden; }
+    .chat-event { display:grid; gap:6px; }
+    .chat-row { display:flex; gap:10px; align-items:flex-start; }
+    .chat-row.user { flex-direction:row-reverse; }
+    .chat-avatar { flex:0 0 auto; width:34px; height:34px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-weight:800; font-size:12px; color:#fff; background:var(--accent); }
+    .chat-row.user .chat-avatar { background:#0f766e; }
+    .chat-meta { display:flex; justify-content:space-between; gap:12px; color:var(--muted); font-size:12px; margin:0 4px; }
+    .chat-row.user .chat-meta { flex-direction:row-reverse; }
+    .bubble { min-width:0; max-width:min(100%, 920px); border:1px solid var(--border); border-radius:14px; padding:12px 14px; background:#f8fafc; }
+    .chat-row.user .bubble { background:#effdf7; border-color:#c8e7da; }
+    .chat-title { font-weight:800; margin-bottom:8px; color:var(--text); }
+    .chat-body { width:100%; min-width:0; white-space:pre-wrap; line-height:1.5; background:transparent; border:0; padding:0; margin:0; max-height:none; overflow:visible; }
+    .chat-body.structured { white-space:normal; }
+    .chat-body .code-block { max-height:calc(1.45em * 5 + 24px); overflow:hidden; white-space:pre-wrap; word-break:break-word; }
+    .chat-body .code-block pre { line-height:1.45; }
+    .chat-body .block { margin:10px 0; }
+    .chat-body pre { max-height:none; white-space:pre-wrap; word-break:break-word; }
+    .chat-tail { display:flex; justify-content:space-between; gap:10px; color:var(--muted); font-size:12px; margin:0 44px; }
+    .event.command, .event.result, .event.feedback, .event.system, .event.error, .event.parse_error { border:1px solid var(--border); border-radius:10px; padding:10px 12px; background:white; }
+    .event.command { border-left:4px solid #c2410c; }
+    .event.result { border-left:4px solid #067647; }
+    .event.feedback { border-left:4px solid #7c3aed; }
+    .event.system { border-left:4px solid #64748b; }
+    .event.error, .event.parse_error { border-left:4px solid var(--bad); }
+    .event-head { display:flex; justify-content:space-between; gap:10px; color:var(--muted); font-size:13px; margin-bottom:6px; }
     .kind { font-weight:800; color:var(--accent); text-transform:uppercase; }
-    pre { margin:0; white-space:pre-wrap; word-break:break-word; max-height:280px; overflow:auto; background:#111827; color:#f9fafb; border-radius:6px; padding:12px; font-size:13px; }
+    .event-title { font-weight:800; margin-bottom:6px; }
+    .event-preview { color:var(--muted); font-size:14px; line-height:1.4; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .event-body { box-sizing:border-box; width:100%; min-width:0; white-space:pre-wrap; line-height:1.45; max-height:220px; overflow:auto; background:#f8fafc; border:1px solid var(--border); border-radius:6px; padding:12px; margin-top:10px; }
+    .event-body.structured { white-space:normal; }
+    .event.expanded .event-body { max-height:none; }
+    .event.collapsed .event-body, .event.collapsed details { display:none; }
+    .block { min-width:0; overflow:hidden; border:1px solid var(--border); border-radius:6px; background:white; padding:10px; margin:8px 0; }
+    .block-title { font-weight:800; margin-bottom:6px; color:var(--text); }
+    .block pre { background:#f8fafc; color:var(--text); border:1px solid var(--border); max-height:180px; }
+    .code-block { box-sizing:border-box; width:100%; max-width:100%; background:#111827; color:#f9fafb; border-radius:6px; padding:12px; overflow:auto; max-height:340px; font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; font-size:13px; white-space:pre; position:relative; }
+    .chat-body .code-block.collapsible { max-height:calc(1.45em * 5 + 24px); overflow:hidden; white-space:pre-wrap; word-break:break-word; }
+    .chat-body .code-block.collapsible.is-expanded { max-height:none; overflow:auto; }
+    .code-toggle { position:absolute; top:6px; right:6px; width:18px; height:18px; border:1px solid rgba(148,163,184,0.5); border-radius:4px; background:rgba(15,23,42,0.6); padding:0; cursor:pointer; }
+    .code-toggle::before { content:""; position:absolute; right:4px; top:4px; width:8px; height:8px; border-top:2px solid #9ca3af; border-right:2px solid #9ca3af; transform:rotate(0deg); }
+    .code-block.is-expanded .code-toggle::before { transform:rotate(180deg); }
+    .code-toggle:hover { border-color:rgba(148,163,184,0.9); }
+    .code-toggle:focus-visible { outline:2px solid #93c5fd; outline-offset:2px; }
     .message { border-radius:8px; padding:12px; background:#eef3f8; color:var(--muted); margin-top:12px; }
     .error { color:var(--bad); background:#fef3f2; border:1px solid #fecdca; }
     @media (max-width:900px){ header,.layout{display:block}.row,.cards{grid-template-columns:1fr} }
@@ -848,8 +1086,10 @@ __MODEL_OPTIONS__
         <div class="field">
           <label for="mode">Mode</label>
           <select id="mode">
-            <option value="multi-shot">multi-shot</option>
+            <option value="flexible" selected>flexible</option>
             <option value="single-shot">single-shot</option>
+            <option value="repeated">repeated</option>
+            <option value="fixed-transitions">fixed-transitions</option>
           </select>
         </div>
         <div class="row">
@@ -894,7 +1134,428 @@ const stop = document.getElementById('stop');
 const message = document.getElementById('message');
 const statusEl = document.getElementById('status');
 const eventsEl = document.getElementById('events');
+function truncateText(value, limit=180){
+  const text = cleanText(value).replace(/\\s+/g, ' ');
+  return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
+}
 function esc(v){return String(v).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');}
+function cleanText(value){return String(value ?? '').trim();}
+function isLikelyJsonChunk(text){
+  const trimmed = cleanText(text);
+  if(!trimmed) return false;
+  if(!((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']')))) return false;
+  try {
+    JSON.parse(trimmed);
+    return true;
+  } catch {
+    return false;
+  }
+}
+function isLikelyCommandLine(text){
+  const trimmed = cleanText(text);
+  return /^(?:list_files|read_file|write_file|edit_file|load_dataset|show_dataset_info|show_sample_rows|run_python|get_budget_status|get_remaining_time|get_trajectory|get_hints|submit)\s*\(/.test(trimmed);
+}
+function stripContentFromText(text){
+  text = cleanText(text);
+  if(!text) return '';
+  const hasCommandLine = (value) => value.split('\n').some(line => isLikelyCommandLine(line.trim()));
+  const hasJsonLine = (value) => value.split('\n').some(line => isLikelyJsonChunk(line.trim()));
+  const countParenDelta = (value) => {
+    let delta = 0;
+    let inSingle = false;
+    let inDouble = false;
+    let escaped = false;
+    for(const ch of value){
+      if(escaped){
+        escaped = false;
+        continue;
+      }
+      if(ch === '\\'){
+        escaped = true;
+        continue;
+      }
+      if(inSingle){
+        if(ch === "'") inSingle = false;
+        continue;
+      }
+      if(inDouble){
+        if(ch === '"') inDouble = false;
+        continue;
+      }
+      if(ch === "'"){
+        inSingle = true;
+        continue;
+      }
+      if(ch === '"'){
+        inDouble = true;
+        continue;
+      }
+      if(ch === '(') delta += 1;
+      if(ch === ')') delta -= 1;
+    }
+    return delta;
+  };
+  text = text.replace(/```(?:json|tool|command)\s*[\s\S]*?```/gi, '');
+  text = text.replace(/```[\s\S]*?```/g, block => {
+    const inner = block.replace(/^```[^\n]*\n?/, '').replace(/```$/, '');
+    return isLikelyJsonChunk(inner) || hasJsonLine(inner) || hasCommandLine(inner) ? '' : block;
+  });
+
+  const lines = text.split('\n');
+  const kept = [];
+  for(let i = 0; i < lines.length; i++){
+    const line = lines[i];
+    const trimmed = line.trim();
+    if(!trimmed) {
+      kept.push('');
+      continue;
+    }
+    if(isLikelyCommandLine(trimmed)) {
+      let balance = countParenDelta(line);
+      while(i + 1 < lines.length && balance > 0) {
+        i++;
+        balance += countParenDelta(lines[i]);
+      }
+      continue;
+    }
+    if(trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      let buffer = trimmed;
+      let j = i;
+      let parsed = false;
+      while(true) {
+        if(isLikelyJsonChunk(buffer)) {
+          parsed = true;
+          break;
+        }
+        if(j + 1 >= lines.length) {
+          break;
+        }
+        if(lines[j + 1].trim() === '' && buffer.length > 0) {
+          break;
+        }
+        if(j - i > 40) {
+          break;
+        }
+        j++;
+        buffer += `\n${lines[j].trim()}`;
+      }
+      if(parsed) {
+        i = j;
+        continue;
+      }
+    }
+    kept.push(line);
+  }
+  const cleaned = kept.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  return cleaned;
+}
+function renderInlineMarkup(text){
+  const parts = String(text).split(/(`[^`]*`)/g);
+  return parts.map(part => {
+    if(part.startsWith('`') && part.endsWith('`') && part.length >= 2) {
+      return `<span class="inline-code">${esc(part.slice(1, -1))}</span>`;
+    }
+    return esc(part);
+  }).join('');
+}
+function renderMarkdownLine(line){
+  const trimmed = line.trim();
+  if(!trimmed) return '';
+  if(trimmed === '***' || trimmed === '---') return '<hr class="md-rule">';
+  if(trimmed.startsWith('### ')) return `<div class="md-heading">${renderInlineMarkup(trimmed.slice(4))}</div>`;
+  if(trimmed.startsWith('## ')) return `<div class="md-heading">${renderInlineMarkup(trimmed.slice(3))}</div>`;
+  if(trimmed.startsWith('# ')) return `<div class="md-heading">${renderInlineMarkup(trimmed.slice(2))}</div>`;
+  if(/^(?:- |\* |• )/.test(trimmed)) {
+    return `<div class="md-list-item">• ${renderInlineMarkup(trimmed.replace(/^(?:- |\* |• )/, ''))}</div>`;
+  }
+  if(/^\d+\.\s+/.test(trimmed)) {
+    return `<div class="md-list-item">${renderInlineMarkup(trimmed)}</div>`;
+  }
+  return `<div class="md-paragraph">${renderInlineMarkup(trimmed)}</div>`;
+}
+function renderMarkdownish(text){
+  text = stripContentFromText(text);
+  if(!text) return '<div class="md-paragraph">Empty message.</div>';
+  const parts = [];
+  const fence = /```(?:([a-zA-Z0-9_-]+)\n)?([\s\S]*?)```/g;
+  let last = 0;
+  for(const match of text.matchAll(fence)){
+    const before = text.slice(last, match.index);
+    parts.push(before.split('\n').map(renderMarkdownLine).join(''));
+    const lang = match[1] ? `<div class="code-lang">${esc(match[1])}</div>` : '';
+    parts.push(`<div class="code-block collapsible">${lang}<button type="button" class="code-toggle" aria-label="Expand code"></button><pre>${esc(match[2].replace(/\n$/, ''))}</pre></div>`);
+    last = match.index + match[0].length;
+  }
+  parts.push(text.slice(last).split('\n').map(renderMarkdownLine).join(''));
+  return parts.join('');
+}
+function setupCodeToggles(){
+  document.addEventListener('click', (event) => {
+    const button = event.target.closest('.code-toggle');
+    if(!button) return;
+    const block = button.closest('.code-block');
+    if(!block) return;
+    block.classList.toggle('is-expanded');
+    button.setAttribute('aria-label', block.classList.contains('is-expanded') ? 'Collapse code' : 'Expand code');
+  });
+}
+function renderJsonScalar(value){
+  if(value === null || value === undefined) return '<span class="json-muted">-</span>';
+  if(typeof value === 'boolean' || typeof value === 'number') return `<span class="json-pill">${esc(String(value))}</span>`;
+  if(typeof value === 'string') {
+    const text = cleanText(value);
+    if(!text) return '<span class="json-muted">-</span>';
+    if(isProbablyCode(text) || text.includes('\\n')) return `<div class="code-block">${esc(text)}</div>`;
+    return `<span class="json-pill">${esc(shortText(text, 240))}</span>`;
+  }
+  return `<span class="json-pill">${esc(shortText(JSON.stringify(value), 240))}</span>`;
+}
+function renderJsonList(value, depth=0){
+  const items = value.slice(0, depth === 0 ? 3 : 2);
+  return `
+    <div class="json-array">
+      <div class="json-array-head">${esc(value.length)} item${value.length === 1 ? '' : 's'}</div>
+      ${items.length ? items.map(item => `<div class="json-item">${renderJsonSummary(item, depth + 1)}</div>`).join('') : '<div class="json-muted">Empty list.</div>'}
+      ${value.length > items.length ? `<div class="json-more">+${value.length - items.length} more</div>` : ''}
+    </div>`;
+}
+function renderJsonObject(value, depth=0){
+  const preferredOrder = [
+    'status', 'command', 'error', 'message', 'metric', 'value', 'rows_checked',
+    'returncode', 'used_steps', 'max_steps', 'remaining_steps', 'requests',
+    'total_tokens', 'token_limit', 'stage', 'title', 'task_id', 'model', 'file',
+    'path', 'stdout', 'stderr'
+  ];
+  const entries = Object.entries(value);
+  const selected = preferredOrder
+    .filter(key => Object.prototype.hasOwnProperty.call(value, key))
+    .map(key => [key, value[key]]);
+  const extras = entries.filter(([key]) => !preferredOrder.includes(key));
+  const shownExtras = depth === 0 ? extras.slice(0, 3) : extras.slice(0, 2);
+  const rows = [...selected, ...shownExtras];
+  const hidden = Math.max(0, entries.length - rows.length);
+  return `
+    <div class="json-view">
+      ${rows.length ? `<div class="json-grid">${rows.map(([key, item]) => `
+        <div class="kv">
+          <span>${esc(key)}</span>
+          <span>${renderJsonSummary(item, depth + 1)}</span>
+        </div>
+      `).join('')}</div>` : '<div class="json-muted">Empty object.</div>'}
+      ${hidden > 0 ? `<div class="json-more">+${hidden} more field${hidden === 1 ? '' : 's'}</div>` : ''}
+    </div>`;
+}
+function renderJsonSummary(value, depth=0){
+  if(value === null || value === undefined) return '<span class="json-muted">-</span>';
+  if(Array.isArray(value)) return renderJsonList(value, depth);
+  if(isPlainObject(value)) return renderJsonObject(value, depth);
+  return renderJsonScalar(value);
+}
+function renderValue(value){
+  if(isProbablyCode(value)) return `<div class="code-block">${esc(cleanText(value))}</div>`;
+  return renderJsonSummary(value);
+}
+function renderCommandCall(name, args){
+  const argValues = Object.entries(args || {}).map(([key, value]) => {
+    if(typeof value === 'string') {
+      const cleaned = cleanText(value);
+      if(isProbablyCode(cleaned)) return `${key}=<code block>`;
+      return JSON.stringify(cleaned);
+    }
+    return `${key}=${JSON.stringify(value)}`;
+  });
+  return `${name}(${argValues.join(', ')})`;
+}
+function tryParseFollowupPrompt(text){
+  const marker = '\\n\\n';
+  const index = text.indexOf(marker);
+  if(index === -1) return null;
+  const intro = text.slice(0, index).trim();
+  const rest = text.slice(index + marker.length).trim();
+  if(!rest.startsWith('{')) return null;
+  try {
+    return {intro, payload: JSON.parse(rest)};
+  } catch {
+    return null;
+  }
+}
+function commandResultSummary(result){
+  const payload = result.result || {};
+  if(result.command === 'run_python') {
+    return `
+      <div class="block">
+        <div class="block-title">run_python finished with code ${esc(payload.returncode ?? 'unknown')}</div>
+        ${payload.stdout ? `<div class="block-title">stdout</div><pre>${esc(payload.stdout)}</pre>` : ''}
+        ${payload.stderr ? `<div class="block-title">stderr</div><pre>${esc(payload.stderr)}</pre>` : ''}
+      </div>`;
+  }
+  if(result.command === 'submit') {
+    return `
+      <div class="block">
+        <div class="block-title">submit result</div>
+        <div class="kv">
+          <span>Status</span><span>${esc(result.status)}</span>
+          <span>Metric</span><span>${esc(payload.metric || '-')}</span>
+          <span>Value</span><span>${esc(payload.value ?? '-')}</span>
+          <span>Rows checked</span><span>${esc(payload.rows_checked ?? '-')}</span>
+        </div>
+      </div>`;
+  }
+  return `
+    <div class="block">
+      <div class="block-title">${esc(result.command || 'command')} result</div>
+      ${renderJsonSummary(payload || result)}
+    </div>`;
+}
+function renderCommandHtml(event){
+  const args = event.data?.args || {};
+  const entries = Object.entries(args);
+  return `
+    <div class="event-body structured">
+      <div class="command-name">${esc(cleanText(event.title))}</div>
+      <div class="command-call"><span class="inline-code">${esc(renderCommandCall(cleanText(event.title), args))}</span></div>
+      <div class="arg-list">
+        ${entries.length ? entries.map(([name, value]) => `
+          <div class="arg-row">
+            <span class="arg-name">${esc(name)}</span>
+            ${renderValue(value)}
+          </div>
+        `).join('') : '<div>No arguments.</div>'}
+      </div>
+    </div>`;
+}
+function renderFeedbackHtml(data){
+  const hints = data.hints || [];
+  return `
+    <div class="event-body structured">
+      <div class="block">
+        <div class="block-title">Feedback hints</div>
+        ${hints.length ? `<ul class="hint-list">${hints.map(h => `<li><strong>${esc(h.stage)}</strong>: ${esc(h.message)}</li>`).join('')}</ul>` : '<div>No hints.</div>'}
+      </div>
+    </div>`;
+}
+function renderSubmissionHtml(submission){
+  const payload = submission.result || {};
+  return `
+    <strong>${submission.status === 'ok' ? 'Submitted.' : 'Submission attempted.'}</strong>
+    <div class="kv" style="margin-top:10px">
+      <span>Status</span><span>${esc(submission.status || '-')}</span>
+      <span>Metric</span><span>${esc(payload.metric || '-')}</span>
+      <span>Value</span><span>${esc(payload.value ?? '-')}</span>
+      <span>Rows checked</span><span>${esc(payload.rows_checked ?? '-')}</span>
+    </div>
+    <details>
+      <summary>Details</summary>
+      <div class="kv">
+        <span>Command</span><span>${esc(submission.command || 'submit')}</span>
+        <span>Elapsed ms</span><span>${esc(submission.elapsed_ms ?? '-')}</span>
+        <span>Result status</span><span>${esc(payload.status || submission.status || '-')}</span>
+        ${payload.error ? `<span>Error</span><span>${esc(payload.error)}</span>` : ''}
+      </div>
+    </details>`;
+}
+function renderPromptHtml(text){
+  const parsed = tryParseFollowupPrompt(text);
+  return `<div class="chat-body structured">${renderMarkdownish(parsed ? parsed.intro : text)}</div>`;
+}
+function renderCommandNote(event){
+  const name = cleanText(event.title || event.data?.command || '');
+  const args = event.data?.args || {};
+  const code = cleanText(args.code_or_file || '');
+  const path = cleanText(args.path || args.file || '');
+  const content = cleanText(args.content || args.diff || '');
+  const isCode = name === 'run_python';
+  const fileOps = new Set(['read_file', 'write_file', 'edit_file', 'load_dataset', 'list_files', 'show_dataset_info', 'show_sample_rows']);
+  if(!isCode && !fileOps.has(name)) return '';
+  const summary = isCode ? 'Выполняю код' : 'Открываю файл';
+  const details = [];
+  if(isCode) {
+    if(code) details.push(`<div class="note-meta">Код</div><pre>${esc(code)}</pre>`);
+    else details.push('<div class="note-meta">Код не передан.</div>');
+  } else {
+    if(path) details.push(`<div class="note-meta">Путь: <span class="inline-code">${esc(path)}</span></div>`);
+    if(content) details.push(`<div class="note-meta">Содержимое</div><pre>${esc(content)}</pre>`);
+    if(!path && !content) details.push('<div class="note-meta">Без дополнительных данных.</div>');
+  }
+  return `
+    <div class="command-note">
+      <details>
+        <summary>${esc(summary)}</summary>
+        <div class="note-body">${details.join('')}</div>
+      </details>
+    </div>`;
+}
+function eventMainText(event){
+  const data = event.data || {};
+  if(event.kind === 'prompt') return cleanText(data.content || '');
+  if(event.kind === 'llm') return cleanText(data.content || '');
+  if(event.kind === 'command') return renderCommandCall(cleanText(event.title), data.args || {});
+  if(event.kind === 'result') {
+    const status = data.status || 'unknown';
+    const result = data.result ? JSON.stringify(data.result, null, 2) : (data.error || '');
+    return `${event.title}\nstatus: ${status}\n${result}`;
+  }
+  if(event.kind === 'feedback') {
+    const hints = (data.hints || []).map(h => `- ${h.stage}: ${h.message}`).join(String.fromCharCode(10));
+    return hints || JSON.stringify(data, null, 2);
+  }
+  if(event.kind === 'error' || event.kind === 'parse_error') return data.error || JSON.stringify(data, null, 2);
+  return JSON.stringify(data, null, 2);
+}
+function eventBodyHtml(event){
+  const data = event.data || {};
+  if(event.kind === 'prompt') return renderPromptHtml(data.content || '');
+  if(event.kind === 'llm') return `<div class="chat-body structured">${renderMarkdownish(data.content || '')}</div>`;
+  if(event.kind === 'result') {
+    if(data.command === 'submit') return renderSubmissionHtml(data);
+    return '';
+  }
+  return '';
+}
+function renderChatEvent(kind, title, bodyHtml, time, side){
+  const avatar = kind === 'prompt' ? 'You' : 'LLM';
+  return `
+    <div class="event chat-event ${esc(kind)} ${esc(side)}">
+      <div class="chat-row ${esc(side)}">
+        <div class="chat-avatar">${esc(avatar)}</div>
+        <div class="bubble">
+          <div class="chat-title">${esc(title)}</div>
+          ${bodyHtml}
+        </div>
+      </div>
+      <div class="chat-tail">
+        <span>${esc(kind === 'prompt' ? 'Your message' : 'LLM response')}</span>
+        <span>${esc(time)}</span>
+      </div>
+    </div>`;
+}
+function renderTechEvent(event, index){
+  const data = event.data || {};
+  const summary = cleanText(data.error || data.message || data.status || event.title || event.kind);
+  return `
+    <div class="event ${esc(event.kind)}" data-event-index="${index}">
+      <div class="event-head"><span class="kind">${esc(eventLabel(event.kind))}</span><span>${esc(new Date(event.time).toLocaleTimeString())}</span></div>
+      <div class="event-title">${esc(event.title)}</div>
+      ${summary ? `<div class="event-preview">${esc(summary)}</div>` : ''}
+    </div>`;
+}
+function eventPreviewHtml(event){
+  const text = truncateText(eventMainText(event));
+  return text ? `<div class="event-preview">${esc(text)}</div>` : '';
+}
+function eventLabel(kind){
+  const labels = {
+    prompt: 'Prompt to LLM',
+    llm: 'LLM answer',
+    command: 'Command',
+    result: 'Result',
+    feedback: 'Hints',
+    system: 'System',
+    error: 'Error',
+    parse_error: 'Parse error'
+  };
+  return labels[kind] || kind;
+}
 async function loadTasks(){
   const res = await fetch('/api/tasks');
   const data = await res.json();
@@ -939,8 +1600,7 @@ function render(run){
   message.textContent = `Mode: ${run.mode}. Task: ${run.task_id}.`;
   if(run.submission_result){
     document.getElementById('submission').className = 'message';
-    const title = run.submission_result.status === 'ok' ? 'Submitted.' : 'Submission attempted.';
-    document.getElementById('submission').innerHTML = `<strong>${title}</strong><pre>${esc(JSON.stringify(run.submission_result, null, 2))}</pre>`;
+    document.getElementById('submission').innerHTML = renderSubmissionHtml(run.submission_result);
   } else if(run.error){
     document.getElementById('submission').className = 'message error';
     document.getElementById('submission').textContent = run.error;
@@ -956,15 +1616,70 @@ function render(run){
     document.getElementById('submission').className = 'message';
     document.getElementById('submission').textContent = 'No submission yet.';
   }
-  eventsEl.innerHTML = run.events.length ? run.events.slice().reverse().map(e => `
-    <div class="event">
-      <div class="event-head"><span class="kind">${esc(e.kind)}</span><span>${esc(new Date(e.time).toLocaleTimeString())}</span></div>
-      <strong>${esc(e.title)}</strong>
-      <pre>${esc(JSON.stringify(e.data, null, 2))}</pre>
-    </div>`).join('') : '<div class="message">No events yet.</div>';
+  const turns = [];
+  let currentTurn = null;
+  for(const event of run.events) {
+    if(event.kind === 'prompt') {
+      currentTurn = { prompt: event, llm: null, hints: [], notes: [] };
+      turns.push(currentTurn);
+      continue;
+    }
+    if(event.kind === 'llm') {
+      if(!currentTurn) {
+        currentTurn = { prompt: null, llm: event, hints: [], notes: [] };
+        turns.push(currentTurn);
+      } else {
+        currentTurn.llm = event;
+      }
+      continue;
+    }
+    if(event.kind === 'feedback') {
+      if(currentTurn) currentTurn.hints = Array.isArray(event.data?.hints) ? event.data.hints : [];
+      continue;
+    }
+    if(event.kind === 'command') {
+      if(currentTurn) {
+        const note = renderCommandNote(event);
+        if(note) currentTurn.notes.push(note);
+      }
+      continue;
+    }
+    if(event.kind === 'result' && event.data?.command === 'submit') {
+      continue;
+    }
+    if(event.kind === 'error' || event.kind === 'parse_error' || event.kind === 'system') {
+      if(currentTurn) currentTurn.notes.push(renderTechEvent(event, turns.length));
+    }
+  }
+  eventsEl.innerHTML = turns.length ? turns.map((turn, index) => {
+    const prompt = turn.prompt ? renderChatEvent(
+      'prompt',
+      'You',
+      `${renderPromptHtml(turn.prompt.data?.content || '')}${turn.hints.length ? `<div class="turn-hint-label">Подсказки к вашему сообщению</div><ul class="turn-hints">${turn.hints.map(h => `<li><strong>${esc(h.stage)}</strong>: ${esc(h.message)}</li>`).join('')}</ul>` : ''}`,
+      new Date(turn.prompt.time).toLocaleTimeString(),
+      'user'
+    ) : '';
+    const llm = turn.llm ? `
+      <div class="event chat-event llm assistant">
+        <div class="chat-row assistant">
+          <div class="chat-avatar">LLM</div>
+          <div class="bubble">
+            <div class="chat-title">LLM</div>
+            <div class="chat-body structured">${renderMarkdownish(turn.llm.data?.content || '')}</div>
+            ${turn.notes.length ? `<div class="command-notes">${turn.notes.join('')}</div>` : ''}
+          </div>
+        </div>
+        <div class="chat-tail">
+          <span>LLM response</span>
+          <span>${esc(new Date(turn.llm.time).toLocaleTimeString())}</span>
+        </div>
+      </div>` : '';
+    return `<div class="turn" data-turn-index="${index}">${prompt}${llm}</div>`;
+  }).join('') : '<div class="message">No events yet.</div>';
 }
 start.addEventListener('click', startRun);
 stop.addEventListener('click', stopRun);
+setupCodeToggles();
 loadTasks();
 </script>
 </body>
