@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import cgi
 import csv
+import html
 import json
 import mimetypes
 import shutil
@@ -119,6 +120,25 @@ def make_handler(
 ) -> type[BaseHTTPRequestHandler]:
     class CheckerRequestHandler(BaseHTTPRequestHandler):
         server_version = "MetricCheckerHTTP/0.1"
+
+        def do_HEAD(self) -> None:
+            parsed = urlparse(self.path)
+            if parsed.path == "/":
+                body = render_index_page(tasks).encode("utf-8")
+                self.send_response(HTTPStatus.OK.value)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                return
+            if parsed.path == "/health":
+                body = json.dumps({"status": "ok", "tasks_count": len(tasks)}).encode("utf-8")
+                self.send_response(HTTPStatus.OK.value)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                return
+            self.send_response(HTTPStatus.NOT_FOUND.value)
+            self.end_headers()
 
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
@@ -328,69 +348,285 @@ def load_submission_history(
 
 
 def render_index_page(tasks: dict[str, TaskConfig]) -> str:
+    task_list = list(tasks.values())
     options = "\n".join(
-        f'<option value="{task.task_id}">{task.name} ({task.metric})</option>'
-        for task in tasks.values()
+        f'<option value="{html.escape(task.task_id)}">{html.escape(task.name)} ({html.escape(task.metric)})</option>'
+        for task in task_list
     )
-    task_links = "\n".join(
-        "<li>"
-        f"<strong>{task.name}</strong>: "
-        + ", ".join(
-            f'<a href="/tasks/{task.task_id}/files/{filename}">{filename}</a>'
-            for filename in task.public_files
-        )
-        + "</li>"
-        for task in tasks.values()
-        if task.public_files
-    )
+    tasks_json = json.dumps([task.public_dict() for task in task_list], ensure_ascii=False)
     return f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Solution Checker</title>
+  <title>ML Benchmark Checker</title>
   <style>
+    :root {{
+      color-scheme: light;
+      --bg: #f5f7fa;
+      --surface: #ffffff;
+      --surface-2: #eef3f8;
+      --text: #17202c;
+      --muted: #5d6b7a;
+      --border: #d7dee8;
+      --accent: #0f766e;
+      --accent-dark: #115e59;
+      --danger: #b42318;
+      --success: #067647;
+      --focus: #2563eb;
+    }}
     body {{
       margin: 0;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: #f6f7f9;
-      color: #1d2430;
+      background: var(--bg);
+      color: var(--text);
     }}
     main {{
-      max-width: 760px;
-      margin: 48px auto;
-      padding: 0 20px;
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 28px 20px 40px;
+    }}
+    header {{
+      display: flex;
+      justify-content: space-between;
+      gap: 20px;
+      align-items: flex-start;
+      margin-bottom: 22px;
     }}
     h1 {{
-      font-size: 32px;
-      margin: 0 0 20px;
+      font-size: 30px;
+      line-height: 1.15;
+      margin: 0 0 8px;
     }}
-    form, section {{
-      background: #ffffff;
-      border: 1px solid #dfe3e8;
+    h2 {{
+      font-size: 18px;
+      margin: 0 0 14px;
+    }}
+    p {{
+      margin: 0;
+      color: var(--muted);
+    }}
+    .status {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 32px;
+      padding: 0 12px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: var(--surface);
+      color: var(--muted);
+      font-size: 14px;
+      white-space: nowrap;
+    }}
+    .status-dot {{
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--success);
+    }}
+    .layout {{
+      display: grid;
+      grid-template-columns: minmax(280px, 360px) minmax(0, 1fr);
+      gap: 18px;
+      align-items: start;
+    }}
+    section {{
+      background: var(--surface);
+      border: 1px solid var(--border);
       border-radius: 8px;
-      padding: 20px;
-      margin-bottom: 16px;
+      padding: 18px;
+      margin-bottom: 18px;
+    }}
+    .task-list {{
+      display: grid;
+      gap: 10px;
+    }}
+    .task-button {{
+      width: 100%;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--surface);
+      color: var(--text);
+      padding: 12px;
+      text-align: left;
+      cursor: pointer;
+      min-height: 74px;
+    }}
+    .task-button:hover,
+    .task-button[aria-selected="true"] {{
+      border-color: var(--accent);
+      background: #ecfdf5;
+    }}
+    .task-name {{
+      display: block;
+      font-weight: 700;
+      margin-bottom: 6px;
+    }}
+    .task-meta {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }}
+    .badge {{
+      display: inline-flex;
+      align-items: center;
+      min-height: 22px;
+      padding: 0 8px;
+      border-radius: 999px;
+      background: var(--surface-2);
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+    }}
+    .grid {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }}
+    .field {{
+      margin-bottom: 14px;
     }}
     label {{
       display: block;
       font-weight: 600;
-      margin: 0 0 8px;
+      margin: 0 0 7px;
     }}
     select, input, button {{
       box-sizing: border-box;
       width: 100%;
       min-height: 40px;
-      margin-bottom: 16px;
       font: inherit;
     }}
-    button {{
+    select, input[type="file"] {{
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--surface);
+      padding: 8px;
+    }}
+    select:focus, input:focus, button:focus-visible, a:focus-visible {{
+      outline: 3px solid color-mix(in srgb, var(--focus) 26%, transparent);
+      outline-offset: 2px;
+    }}
+    .drop-zone {{
+      border: 1px dashed #9aa8b8;
+      border-radius: 8px;
+      padding: 18px;
+      background: #f8fafc;
+    }}
+    .drop-zone.dragging {{
+      border-color: var(--accent);
+      background: #ecfdf5;
+    }}
+    .button-row {{
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }}
+    .primary-button, .secondary-button {{
+      width: auto;
+      min-width: 140px;
+      padding: 0 16px;
       border: 0;
       border-radius: 6px;
-      background: #1864ab;
+      background: var(--accent);
       color: white;
       font-weight: 700;
       cursor: pointer;
+    }}
+    .primary-button:hover {{
+      background: var(--accent-dark);
+    }}
+    .primary-button:disabled {{
+      opacity: 0.58;
+      cursor: not-allowed;
+    }}
+    .secondary-button {{
+      background: var(--surface-2);
+      color: var(--text);
+      border: 1px solid var(--border);
+    }}
+    .file-links {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 8px;
+    }}
+    .file-links a {{
+      display: inline-flex;
+      align-items: center;
+      min-height: 32px;
+      padding: 0 10px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--surface);
+      color: var(--accent-dark);
+      font-weight: 600;
+      text-decoration: none;
+    }}
+    .metric-panel {{
+      display: grid;
+      grid-template-columns: minmax(120px, 160px) minmax(0, 1fr);
+      gap: 14px;
+      align-items: center;
+      min-height: 96px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: #f8fafc;
+      padding: 14px;
+    }}
+    .metric-value {{
+      font-size: 34px;
+      line-height: 1;
+      font-weight: 800;
+      color: var(--accent-dark);
+      word-break: break-word;
+    }}
+    .result-list {{
+      display: grid;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 14px;
+    }}
+    .result-list strong {{
+      color: var(--text);
+    }}
+    .message {{
+      border-radius: 8px;
+      padding: 12px;
+      margin-top: 12px;
+      background: var(--surface-2);
+      color: var(--muted);
+    }}
+    .message.error {{
+      background: #fef3f2;
+      color: var(--danger);
+      border: 1px solid #fecdca;
+    }}
+    .message.success {{
+      background: #ecfdf3;
+      color: var(--success);
+      border: 1px solid #abefc6;
+    }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+    }}
+    th, td {{
+      border-bottom: 1px solid var(--border);
+      padding: 10px 8px;
+      text-align: left;
+      vertical-align: top;
+    }}
+    th {{
+      color: var(--muted);
+      font-weight: 700;
+      background: #f8fafc;
+    }}
+    .empty {{
+      color: var(--muted);
+      padding: 18px 0 4px;
     }}
     pre {{
       white-space: pre-wrap;
@@ -400,51 +636,289 @@ def render_index_page(tasks: dict[str, TaskConfig]) -> str:
       border-radius: 6px;
       padding: 14px;
       min-height: 48px;
+      max-height: 260px;
+      overflow: auto;
     }}
-    li {{
-      margin-bottom: 8px;
+    .sr-only {{
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
     }}
-    a {{
-      color: #1864ab;
+    @media (max-width: 820px) {{
+      header, .layout {{
+        display: block;
+      }}
+      .status {{
+        margin-top: 14px;
+      }}
+      .grid, .metric-panel {{
+        grid-template-columns: 1fr;
+      }}
+      .primary-button, .secondary-button {{
+        width: 100%;
+      }}
     }}
   </style>
 </head>
 <body>
   <main>
-    <h1>Solution Checker</h1>
-    <form id="check-form">
-      <label for="task_id">Task</label>
-      <select id="task_id" name="task_id" required>
-        {options}
-      </select>
-      <label for="file">Submission file</label>
-      <input id="file" name="file" type="file" required>
-      <button type="submit">Check solution</button>
-    </form>
-    <section>
-      <label>Result</label>
-      <pre id="result">Waiting for submission...</pre>
-    </section>
-    <section>
-      <label>Task files</label>
-      <ul>
-        {task_links or "<li>No public files configured.</li>"}
-      </ul>
-    </section>
+    <header>
+      <div>
+        <h1>ML Benchmark Checker</h1>
+        <p>Upload submissions, inspect task files, and review recent scores.</p>
+      </div>
+      <div class="status" aria-live="polite"><span class="status-dot"></span><span id="server-status">Server online</span></div>
+    </header>
+    <div class="layout">
+      <aside>
+        <section aria-labelledby="tasks-title">
+          <h2 id="tasks-title">Tasks</h2>
+          <div id="task-list" class="task-list" role="listbox" aria-label="Available tasks"></div>
+        </section>
+      </aside>
+      <div>
+        <section aria-labelledby="details-title">
+          <h2 id="details-title">Task Details</h2>
+          <div class="grid">
+            <div>
+              <div class="field">
+                <label for="task_id">Selected task</label>
+                <select id="task_id" name="task_id" form="check-form" required>
+                  {options}
+                </select>
+              </div>
+              <div class="result-list" id="task-summary"></div>
+            </div>
+            <div>
+              <label>Public files</label>
+              <div class="file-links" id="file-links"></div>
+            </div>
+          </div>
+        </section>
+        <section aria-labelledby="submit-title">
+          <h2 id="submit-title">Submit Solution</h2>
+          <form id="check-form">
+            <div class="drop-zone" id="drop-zone">
+              <label for="file">Submission file</label>
+              <input id="file" name="file" type="file" accept=".csv,.txt,.tsv,.json" required>
+              <p id="file-help">Expected format depends on the selected task. For salary prediction: id,salary.</p>
+            </div>
+            <div class="button-row" style="margin-top: 14px;">
+              <button class="primary-button" id="submit-button" type="submit">Check Submission</button>
+              <button class="secondary-button" id="refresh-history" type="button">Refresh History</button>
+            </div>
+          </form>
+          <div id="form-message" class="message" role="status" aria-live="polite">Choose a task and upload a submission file.</div>
+        </section>
+        <section aria-labelledby="result-title">
+          <h2 id="result-title">Latest Result</h2>
+          <div id="result-panel" class="metric-panel">
+            <div class="metric-value" id="metric-value">-</div>
+            <div class="result-list" id="result-details">
+              <div>No submission checked yet.</div>
+            </div>
+          </div>
+          <details style="margin-top: 14px;">
+            <summary>Raw response</summary>
+            <pre id="raw-result">{{}}</pre>
+          </details>
+        </section>
+        <section aria-labelledby="history-title">
+          <h2 id="history-title">Submission History</h2>
+          <div id="history"></div>
+        </section>
+      </div>
+    </div>
   </main>
   <script>
+    const tasks = {tasks_json};
     const form = document.getElementById('check-form');
-    const result = document.getElementById('result');
+    const taskSelect = document.getElementById('task_id');
+    const taskList = document.getElementById('task-list');
+    const taskSummary = document.getElementById('task-summary');
+    const fileLinks = document.getElementById('file-links');
+    const fileInput = document.getElementById('file');
+    const formMessage = document.getElementById('form-message');
+    const submitButton = document.getElementById('submit-button');
+    const refreshHistory = document.getElementById('refresh-history');
+    const metricValue = document.getElementById('metric-value');
+    const resultDetails = document.getElementById('result-details');
+    const rawResult = document.getElementById('raw-result');
+    const history = document.getElementById('history');
+    const dropZone = document.getElementById('drop-zone');
+
+    function currentTask() {{
+      return tasks.find((task) => task.id === taskSelect.value) || tasks[0];
+    }}
+
+    function escapeHtml(value) {{
+      return String(value)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#039;');
+    }}
+
+    function renderTaskButtons() {{
+      taskList.innerHTML = tasks.map((task) => `
+        <button class="task-button" type="button" role="option" data-task-id="${{escapeHtml(task.id)}}" aria-selected="${{task.id === taskSelect.value}}">
+          <span class="task-name">${{escapeHtml(task.name)}}</span>
+          <span class="task-meta">
+            <span class="badge">${{escapeHtml(task.metric)}}</span>
+            ${{task.id_column ? `<span class="badge">id: ${{escapeHtml(task.id_column)}}</span>` : ''}}
+            ${{task.column ? `<span class="badge">target: ${{escapeHtml(task.column)}}</span>` : ''}}
+          </span>
+        </button>
+      `).join('');
+      taskList.querySelectorAll('button').forEach((button) => {{
+        button.addEventListener('click', () => {{
+          taskSelect.value = button.dataset.taskId;
+          renderSelectedTask();
+          loadHistory();
+        }});
+      }});
+    }}
+
+    function renderSelectedTask() {{
+      const task = currentTask();
+      if (!task) return;
+      taskSummary.innerHTML = `
+        <div><strong>ID:</strong> ${{escapeHtml(task.id)}}</div>
+        <div><strong>Metric:</strong> ${{escapeHtml(task.metric)}}</div>
+        <div><strong>Target column:</strong> ${{escapeHtml(task.column || task.pred_column || 'not specified')}}</div>
+        <div><strong>ID column:</strong> ${{escapeHtml(task.id_column || 'row order')}}</div>
+      `;
+      if (task.public_files.length) {{
+        fileLinks.innerHTML = task.public_files.map((filename) =>
+          `<a href="/tasks/${{encodeURIComponent(task.id)}}/files/${{encodeURIComponent(filename)}}">${{escapeHtml(filename)}}</a>`
+        ).join('');
+      }} else {{
+        fileLinks.innerHTML = '<span class="empty">No public files for this task.</span>';
+      }}
+      renderTaskButtons();
+    }}
+
+    function setMessage(text, kind = '') {{
+      formMessage.className = `message ${{kind}}`;
+      formMessage.textContent = text;
+    }}
+
+    function renderResult(payload) {{
+      rawResult.textContent = JSON.stringify(payload, null, 2);
+      if (payload.status !== 'ok') {{
+        metricValue.textContent = '-';
+        resultDetails.innerHTML = `<div><strong>Error:</strong> ${{escapeHtml(payload.error || 'Unknown error')}}</div>`;
+        setMessage(payload.error || 'Submission failed.', 'error');
+        return;
+      }}
+      metricValue.textContent = Number(payload.value).toLocaleString(undefined, {{ maximumFractionDigits: 8 }});
+      resultDetails.innerHTML = `
+        <div><strong>Task:</strong> ${{escapeHtml(payload.task_id)}}</div>
+        <div><strong>Metric:</strong> ${{escapeHtml(payload.metric)}}</div>
+        <div><strong>Rows checked:</strong> ${{escapeHtml(payload.rows_checked)}}</div>
+        <div><strong>Submission:</strong> ${{escapeHtml(payload.submission_id)}}</div>
+        <div><strong>Elapsed:</strong> ${{escapeHtml(payload.elapsed_ms)}} ms</div>
+      `;
+      setMessage('Submission checked successfully.', 'success');
+    }}
+
+    async function loadHistory() {{
+      const task = currentTask();
+      history.innerHTML = '<div class="empty">Loading history...</div>';
+      const response = await fetch(`/submissions?task_id=${{encodeURIComponent(task.id)}}`);
+      const payload = await response.json();
+      const rows = payload.submissions || [];
+      if (!rows.length) {{
+        history.innerHTML = '<div class="empty">No submissions for this task yet.</div>';
+        return;
+      }}
+      history.innerHTML = `
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>File</th>
+              <th>Metric</th>
+              <th>Value</th>
+              <th>Rows</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${{rows.map((row) => `
+              <tr>
+                <td>${{escapeHtml(new Date(row.created_at).toLocaleString())}}</td>
+                <td>${{escapeHtml(row.filename)}}</td>
+                <td>${{escapeHtml(row.metric)}}</td>
+                <td><strong>${{escapeHtml(Number(row.value).toLocaleString(undefined, {{ maximumFractionDigits: 8 }}))}}</strong></td>
+                <td>${{escapeHtml(row.rows_checked)}}</td>
+              </tr>
+            `).join('')}}
+          </tbody>
+        </table>
+      `;
+    }}
+
     form.addEventListener('submit', async (event) => {{
       event.preventDefault();
-      result.textContent = 'Checking...';
-      const response = await fetch('/check', {{
-        method: 'POST',
-        body: new FormData(form)
-      }});
-      const payload = await response.json();
-      result.textContent = JSON.stringify(payload, null, 2);
+      if (!fileInput.files.length) {{
+        setMessage('Choose a submission file first.', 'error');
+        return;
+      }}
+      submitButton.disabled = true;
+      setMessage('Checking submission...');
+      try {{
+        const response = await fetch('/check', {{
+          method: 'POST',
+          body: new FormData(form)
+        }});
+        const payload = await response.json();
+        renderResult(payload);
+        await loadHistory();
+      }} catch (error) {{
+        renderResult({{ status: 'error', error: error.message }});
+      }} finally {{
+        submitButton.disabled = false;
+      }}
     }});
+
+    taskSelect.addEventListener('change', () => {{
+      renderSelectedTask();
+      loadHistory();
+    }});
+    refreshHistory.addEventListener('click', loadHistory);
+    ['dragenter', 'dragover'].forEach((eventName) => {{
+      dropZone.addEventListener(eventName, (event) => {{
+        event.preventDefault();
+        dropZone.classList.add('dragging');
+      }});
+    }});
+    ['dragleave', 'drop'].forEach((eventName) => {{
+      dropZone.addEventListener(eventName, (event) => {{
+        event.preventDefault();
+        dropZone.classList.remove('dragging');
+      }});
+    }});
+    dropZone.addEventListener('drop', (event) => {{
+      if (event.dataTransfer.files.length) {{
+        fileInput.files = event.dataTransfer.files;
+        setMessage(`Selected file: ${{event.dataTransfer.files[0].name}}`);
+      }}
+    }});
+    fileInput.addEventListener('change', () => {{
+      if (fileInput.files.length) {{
+        setMessage(`Selected file: ${{fileInput.files[0].name}}`);
+      }}
+    }});
+
+    renderSelectedTask();
+    loadHistory();
   </script>
 </body>
 </html>"""

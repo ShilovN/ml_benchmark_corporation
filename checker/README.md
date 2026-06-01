@@ -43,6 +43,16 @@ Run:
 python3 checker/server.py --host 127.0.0.1 --port 8000
 ```
 
+Browser UI:
+
+```text
+http://127.0.0.1:8000/
+```
+
+The page supports task selection, public file downloads, drag-and-drop
+submission upload, latest result display, raw JSON output, and submission
+history.
+
 Endpoints:
 
 - `GET /` - browser upload form;

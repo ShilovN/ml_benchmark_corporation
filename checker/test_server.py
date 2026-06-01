@@ -5,7 +5,7 @@ import unittest
 from email.message import Message
 from pathlib import Path
 
-from server import append_submission_history, load_submission_history, load_tasks, make_handler
+from server import append_submission_history, load_submission_history, load_tasks, make_handler, render_index_page
 
 
 class FakeRequest:
@@ -56,6 +56,35 @@ class ServerTest(unittest.TestCase):
 
         self.assertEqual(records[0]["submission_id"], "abc")
         self.assertEqual(records[0]["value"], 0.5)
+
+    def test_render_index_page_contains_main_ui_regions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task_dir = Path(tmp_dir) / "task"
+            task_dir.mkdir()
+            answer_path = task_dir / "answers.csv"
+            answer_path.write_text("id,value\n1,2\n", encoding="utf-8")
+            (task_dir / "train.csv").write_text("id,value\n1,2\n", encoding="utf-8")
+            task = load_tasks(Path(tmp_dir))
+            (task_dir / "task.json").write_text(
+                json.dumps(
+                    {
+                        "id": "numbers",
+                        "name": "Numbers",
+                        "metric": "mae",
+                        "answer_file": "answers.csv",
+                        "public_files": ["train.csv"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            task = load_tasks(Path(tmp_dir))
+
+            html = render_index_page(task)
+
+        self.assertIn("ML Benchmark Checker", html)
+        self.assertIn("task-list", html)
+        self.assertIn("Submission History", html)
+        self.assertIn("train.csv", html)
 
     def test_multipart_form_parsing(self) -> None:
         handler_class = make_handler({})
