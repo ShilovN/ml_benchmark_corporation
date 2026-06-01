@@ -47,6 +47,39 @@ DEFAULT_RUN_ROOT = Path("benchmark_runs")
 TEXT_EXTENSIONS = {".csv", ".json", ".md", ".py", ".txt", ".tsv", ".yaml", ".yml"}
 MAX_CONTEXT_CHARS = 28000
 MAX_FILE_PREVIEW_CHARS = 2500
+ALLOWED_MODES = {"single-shot", "repeated", "fixed-transitions", "flexible"}
+DEFAULT_MODE = "flexible"
+REPEATED_MAX_ATTEMPTS = 5
+FIXED_TRANSITION_STAGES = ["EDA", "FEATURES", "TRAIN"]
+FIXED_STAGE_ALLOWED_COMMANDS = {
+    "EDA": {
+        "list_files",
+        "read_file",
+        "load_dataset",
+        "show_dataset_info",
+        "show_sample_rows",
+        "run_python",
+        "get_budget_status",
+        "get_remaining_time",
+        "get_trajectory",
+        "get_hints",
+    },
+    "FEATURES": {
+        "list_files",
+        "read_file",
+        "write_file",
+        "edit_file",
+        "load_dataset",
+        "show_dataset_info",
+        "show_sample_rows",
+        "run_python",
+        "get_budget_status",
+        "get_remaining_time",
+        "get_trajectory",
+        "get_hints",
+    },
+    "TRAIN": set(COMMAND_NAMES),
+}
 
 
 @dataclass
@@ -54,7 +87,7 @@ class RunConfig:
     task_id: str
     model: str = MODEL
     llm_url: str | None = None
-    mode: str = "multi-shot"
+    mode: str = DEFAULT_MODE
     max_steps: int = 40
     token_limit: int = 120000
     temperature: float = DEFAULT_TEMPERATURE
@@ -79,6 +112,7 @@ class RunState:
     error: str | None = None
     thread: threading.Thread | None = None
     stop_requested: bool = False
+    fixed_stage_index: int = 0
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -162,7 +196,7 @@ class AgentRunManager:
         return True
 
     def _run_loop(self, state: RunState) -> None:
-        user_message = build_initial_prompt(state.workspace, state.config.task_id)
+        user_message = apply_mode_instruction(state, build_initial_prompt(state.workspace, state.config.task_id))
         history: list[dict[str, str]] = []
         add_event(state, "system", "Run started", {"task_id": state.config.task_id, "mode": state.config.mode})
 
@@ -205,20 +239,28 @@ class AgentRunManager:
                     if state.config.mode == "single-shot":
                         state.stop_reason = "single_shot_parse_error"
                         break
-                    user_message = (
+                    if state.config.mode == "repeated" and state.requests >= REPEATED_MAX_ATTEMPTS:
+                        state.stop_reason = "repeated_attempt_limit"
+                        break
+                    user_message = apply_mode_instruction(
+                        state,
                         "Твой ответ не удалось распарсить как команду.\n"
                         f"Ошибка: {exc}\n"
-                        "Верни только валидную команду или несколько команд, по одной на строку."
+                        "Верни только валидную команду или несколько команд, по одной на строку.",
                     )
                     continue
 
                 results: list[dict[str, Any]] = []
                 for command in commands:
                     add_event(state, "command", command.name, {"args": command.args})
-                    result = state.executor.execute(command)
+                    validation_error = validate_mode_command(state, command)
+                    if validation_error:
+                        result = validation_error
+                    else:
+                        result = state.executor.execute(command)
                     results.append(result)
                     add_event(state, "result", f"{command.name}: {result['status']}", result)
-                    if command.name == "submit":
+                    if command.name == "submit" and result["status"] == "ok":
                         state.submitted = True
                         state.submission_result = result
                         state.stop_reason = "submitted"
@@ -227,13 +269,14 @@ class AgentRunManager:
                 if state.submitted:
                     break
 
-                if state.config.mode == "single-shot":
-                    state.stop_reason = "single_shot_finished"
+                mode_stop_reason = apply_mode_after_results(state, results)
+                if mode_stop_reason:
+                    state.stop_reason = mode_stop_reason
                     break
 
                 feedback = state.executor.build_feedback()
                 add_event(state, "feedback", "Feedback hints", feedback)
-                user_message = build_followup_prompt(results, feedback, state)
+                user_message = apply_mode_instruction(state, build_followup_prompt(results, feedback, state))
 
             if state.stop_requested:
                 state.status = "stopped"
@@ -335,6 +378,16 @@ def make_handler(manager: AgentRunManager) -> type[BaseHTTPRequestHandler]:
             parsed = urlparse(self.path)
             if parsed.path == "/api/runs":
                 payload = self._read_json()
+                mode = str(payload.get("mode") or DEFAULT_MODE)
+                if mode not in ALLOWED_MODES:
+                    self._send_json(
+                        {
+                            "status": "error",
+                            "error": f"Unknown mode: {mode}. Allowed modes: {sorted(ALLOWED_MODES)}",
+                        },
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                    return
                 config = RunConfig(
                     task_id=str(payload.get("task_id") or "salary_prediction"),
                     model=str(payload.get("model") or MODEL),
@@ -343,7 +396,7 @@ def make_handler(manager: AgentRunManager) -> type[BaseHTTPRequestHandler]:
                         if payload.get("llm_url")
                         else None
                     ),
-                    mode=str(payload.get("mode") or "multi-shot"),
+                    mode=mode,
                     max_steps=int(payload["max_steps"]) if "max_steps" in payload else 40,
                     token_limit=int(payload["token_limit"]) if "token_limit" in payload else 120000,
                     temperature=float(payload["temperature"]) if "temperature" in payload else DEFAULT_TEMPERATURE,
@@ -481,6 +534,85 @@ def build_initial_prompt(workspace: Path, task_id: str) -> str:
         "Файлы workspace:\n"
         f"{collect_file_previews(workspace)}"
     )
+
+
+def apply_mode_instruction(state: RunState, prompt: str) -> str:
+    instruction = mode_instruction(state)
+    if not instruction:
+        return prompt
+    return f"{prompt}\n\n{instruction}"
+
+
+def mode_instruction(state: RunState) -> str:
+    mode = state.config.mode
+    if mode == "single-shot":
+        return (
+            "Режим single-shot: это единственный ответ модели. "
+            "Сразу создай/проверь submission.csv и вызови submit(\"submission.csv\")."
+        )
+    if mode == "repeated":
+        attempt = min(state.requests + 1, REPEATED_MAX_ATTEMPTS)
+        return (
+            f"Режим repeated: попытка {attempt}/{REPEATED_MAX_ATTEMPTS}. "
+            "Каждая попытка должна улучшать или проверять решение; при готовности вызывай submit."
+        )
+    if mode == "fixed-transitions":
+        stage = current_fixed_stage(state)
+        if stage == "EDA":
+            detail = "изучи файлы и данные; не вызывай submit на этом этапе"
+        elif stage == "FEATURES":
+            detail = "подготовь признаки, скрипты или промежуточные файлы; submit пока запрещен"
+        else:
+            detail = "обучи модель, создай submission.csv, проверь формат и вызови submit"
+        return f"Режим fixed-transitions: текущий обязательный этап {stage}. Задача этапа: {detail}."
+    if mode == "flexible":
+        return "Режим flexible: можно свободно выбирать следующие агентские команды до submit или лимитов."
+    return ""
+
+
+def current_fixed_stage(state: RunState) -> str:
+    index = min(state.fixed_stage_index, len(FIXED_TRANSITION_STAGES) - 1)
+    return FIXED_TRANSITION_STAGES[index]
+
+
+def validate_mode_command(state: RunState, command: ParsedCommand) -> dict[str, Any] | None:
+    if state.config.mode != "fixed-transitions":
+        return None
+    stage = current_fixed_stage(state)
+    allowed = FIXED_STAGE_ALLOWED_COMMANDS[stage]
+    if command.name in allowed:
+        return None
+    return {
+        "status": "error",
+        "command": command.name,
+        "error": (
+            f"Pipeline violation: command {command.name} is not allowed during {stage}. "
+            f"Allowed commands: {', '.join(sorted(allowed))}."
+        ),
+    }
+
+
+def apply_mode_after_results(state: RunState, results: list[dict[str, Any]]) -> str | None:
+    if state.config.mode == "single-shot":
+        return "single_shot_finished"
+
+    if state.config.mode == "repeated" and state.requests >= REPEATED_MAX_ATTEMPTS:
+        return "repeated_attempt_limit"
+
+    if state.config.mode != "fixed-transitions":
+        return None
+
+    if any(result.get("status") == "error" for result in results):
+        return None
+
+    stage = current_fixed_stage(state)
+    add_event(state, "stage", f"{stage} completed", {"stage": stage})
+    if stage == "TRAIN":
+        return "fixed_transitions_finished"
+    state.fixed_stage_index += 1
+    next_stage = current_fixed_stage(state)
+    add_event(state, "stage", f"Next stage: {next_stage}", {"stage": next_stage})
+    return None
 
 
 def build_followup_prompt(results: list[dict[str, Any]], feedback: dict[str, Any], state: RunState) -> str:
@@ -812,8 +944,10 @@ __MODEL_OPTIONS__
         <div class="field">
           <label for="mode">Mode</label>
           <select id="mode">
-            <option value="multi-shot">multi-shot</option>
+            <option value="flexible" selected>flexible</option>
             <option value="single-shot">single-shot</option>
+            <option value="repeated">repeated</option>
+            <option value="fixed-transitions">fixed-transitions</option>
           </select>
         </div>
         <div class="row">

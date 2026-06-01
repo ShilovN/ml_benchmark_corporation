@@ -46,7 +46,7 @@ From the page you can:
 - choose a model; Letovo models and ChatGPT models switch endpoints automatically;
 - use Letovo models: `deepseek-v4-flash`, `gemma-4-26b`;
 - use ChatGPT models: `gpt-5-mini`, `gpt-4.1-mini`, `gpt-4o-mini`, `gpt-4.1-nano`;
-- choose a run mode: `single-shot` or `multi-shot`;
+- choose a run mode: `single-shot`, `repeated`, `fixed-transitions`, or `flexible`;
 - start or stop a benchmark run;
 - watch the live trajectory of prompts, model responses, commands, results, and hints;
 - see the final `submit(file)` result.
@@ -55,12 +55,19 @@ Each run gets an isolated workspace under `benchmark_runs/`. Public task files
 such as `train.csv`, `test.csv`, and public `task.json` are copied there. Hidden
 answer files stay in `checker/tasks/...` and are only used by `submit(file)`.
 
-In `single-shot` mode, the model gets one response. If it does not call
-`submit(file)`, the runner performs a forced final submit. In `multi-shot` mode,
-the model can iterate until it submits or hits the configured limits. If limits
-are reached before submit, the runner still performs a forced final submit:
-existing `submission.csv` is used when present, otherwise a simple baseline
-`submission.csv` is generated.
+Run modes control how the web runner drives the command loop:
+
+- `single-shot`: the model gets one response; if it does not call `submit(file)`,
+  the runner performs a forced final submit.
+- `repeated`: the model can make up to five attempts before forced final submit.
+- `fixed-transitions`: the run advances through `EDA`, `FEATURES`, and `TRAIN`;
+  early `submit(file)` calls are blocked until `TRAIN`.
+- `flexible`: the model can iterate freely until it submits or hits configured
+  limits.
+
+If limits are reached before submit, the runner still performs a forced final
+submit: existing `submission.csv` is used when present, otherwise a simple
+baseline `submission.csv` is generated.
 
 ## Checker
 
