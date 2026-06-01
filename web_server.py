@@ -605,7 +605,7 @@ def _first_query_value(query: str, name: str) -> str | None:
 
 
 def render_agent_page() -> str:
-    return """<!doctype html>
+    return r"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -634,41 +634,50 @@ def render_agent_page() -> str:
     .cards { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; }
     .card { border:1px solid var(--border); border-radius:8px; padding:12px; background:#f8fafc; }
     .card strong { display:block; font-size:22px; margin-top:4px; }
-    .events { display:grid; gap:10px; min-width:0; }
-    .event { min-width:0; max-width:100%; overflow:hidden; border:1px solid var(--border); border-radius:8px; padding:12px; background:white; }
-    .event.prompt { border-left:4px solid #155eef; }
-    .event.llm { border-left:4px solid #7c3aed; }
+    .events { display:grid; gap:12px; min-width:0; max-height:72vh; overflow:auto; padding-right:4px; }
+    .event { min-width:0; max-width:100%; overflow:hidden; }
+    .chat-event { display:grid; gap:6px; }
+    .chat-row { display:flex; gap:10px; align-items:flex-start; }
+    .chat-row.user { flex-direction:row-reverse; }
+    .chat-avatar { flex:0 0 auto; width:34px; height:34px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-weight:800; font-size:12px; color:#fff; background:var(--accent); }
+    .chat-row.user .chat-avatar { background:#0f766e; }
+    .chat-meta { display:flex; justify-content:space-between; gap:12px; color:var(--muted); font-size:12px; margin:0 4px; }
+    .chat-row.user .chat-meta { flex-direction:row-reverse; }
+    .bubble { min-width:0; max-width:min(100%, 920px); border:1px solid var(--border); border-radius:14px; padding:12px 14px; background:#f8fafc; }
+    .chat-row.user .bubble { background:#effdf7; border-color:#c8e7da; }
+    .chat-title { font-weight:800; margin-bottom:8px; color:var(--text); }
+    .chat-body { width:100%; min-width:0; white-space:pre-wrap; line-height:1.5; background:transparent; border:0; padding:0; margin:0; max-height:none; overflow:visible; }
+    .chat-body.structured { white-space:normal; }
+    .chat-body .code-block { max-height:calc(1.45em * 5 + 24px); overflow:hidden; white-space:pre-wrap; word-break:break-word; }
+    .chat-body .code-block pre { line-height:1.45; }
+    .chat-body .block { margin:10px 0; }
+    .chat-body pre { max-height:none; white-space:pre-wrap; word-break:break-word; }
+    .chat-tail { display:flex; justify-content:space-between; gap:10px; color:var(--muted); font-size:12px; margin:0 44px; }
+    .event.command, .event.result, .event.feedback, .event.system, .event.error, .event.parse_error { border:1px solid var(--border); border-radius:10px; padding:10px 12px; background:white; }
     .event.command { border-left:4px solid #c2410c; }
     .event.result { border-left:4px solid #067647; }
+    .event.feedback { border-left:4px solid #7c3aed; }
+    .event.system { border-left:4px solid #64748b; }
     .event.error, .event.parse_error { border-left:4px solid var(--bad); }
-    .event-head { display:flex; justify-content:space-between; gap:10px; color:var(--muted); font-size:13px; margin-bottom:8px; }
+    .event-head { display:flex; justify-content:space-between; gap:10px; color:var(--muted); font-size:13px; margin-bottom:6px; }
     .kind { font-weight:800; color:var(--accent); text-transform:uppercase; }
+    .event-title { font-weight:800; margin-bottom:6px; }
+    .event-preview { color:var(--muted); font-size:14px; line-height:1.4; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
     .event-body { box-sizing:border-box; width:100%; min-width:0; white-space:pre-wrap; line-height:1.45; max-height:220px; overflow:auto; background:#f8fafc; border:1px solid var(--border); border-radius:6px; padding:12px; margin-top:10px; }
     .event-body.structured { white-space:normal; }
     .event.expanded .event-body { max-height:none; }
+    .event.collapsed .event-body, .event.collapsed details { display:none; }
     .block { min-width:0; overflow:hidden; border:1px solid var(--border); border-radius:6px; background:white; padding:10px; margin:8px 0; }
     .block-title { font-weight:800; margin-bottom:6px; color:var(--text); }
     .block pre { background:#f8fafc; color:var(--text); border:1px solid var(--border); max-height:180px; }
-    .code-block { box-sizing:border-box; width:100%; max-width:100%; background:#111827; color:#f9fafb; border-radius:6px; padding:12px; overflow:auto; max-height:340px; font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; font-size:13px; white-space:pre; }
-    .inline-code { display:inline-block; box-sizing:border-box; max-width:100%; overflow:hidden; text-overflow:ellipsis; vertical-align:bottom; font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; background:#eef3f8; border:1px solid var(--border); border-radius:4px; padding:1px 4px; }
-    .md-heading { font-weight:800; margin:10px 0 6px; }
-    .md-paragraph { margin:4px 0; }
-    .md-rule { border:0; border-top:1px solid var(--border); margin:10px 0; }
-    .command-name { font-size:16px; font-weight:900; color:var(--text); }
-    .command-call { max-width:100%; margin-top:8px; overflow:hidden; }
-    .arg-list { display:grid; gap:8px; margin-top:8px; }
-    .arg-row { min-width:0; overflow:hidden; border:1px solid var(--border); border-radius:6px; padding:10px; background:#fff; }
-    .arg-name { display:block; color:var(--muted); font-weight:800; margin-bottom:6px; }
-    .hint-list { margin:6px 0 0; padding-left:20px; }
-    .hint-list li { margin-bottom:6px; }
-    .kv { display:grid; grid-template-columns:180px minmax(0,1fr); gap:6px 12px; font-size:14px; }
-    .kv span { min-width:0; overflow-wrap:anywhere; }
-    .kv span:nth-child(odd) { color:var(--muted); font-weight:700; }
-    .event-actions { display:flex; gap:8px; margin-top:10px; flex-wrap:wrap; }
-    .small-button { width:auto; min-height:32px; padding:0 10px; font-size:13px; background:#eef3f8; color:var(--text); border:1px solid var(--border); }
-    details { margin-top:10px; }
-    summary { cursor:pointer; color:var(--muted); font-weight:700; }
-    pre { box-sizing:border-box; width:100%; max-width:100%; margin:0; white-space:pre-wrap; word-break:break-word; max-height:280px; overflow:auto; background:#111827; color:#f9fafb; border-radius:6px; padding:12px; font-size:13px; }
+    .code-block { box-sizing:border-box; width:100%; max-width:100%; background:#111827; color:#f9fafb; border-radius:6px; padding:12px; overflow:auto; max-height:340px; font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; font-size:13px; white-space:pre; position:relative; }
+    .chat-body .code-block.collapsible { max-height:calc(1.45em * 5 + 24px); overflow:hidden; white-space:pre-wrap; word-break:break-word; }
+    .chat-body .code-block.collapsible.is-expanded { max-height:none; overflow:auto; }
+    .code-toggle { position:absolute; top:6px; right:6px; width:18px; height:18px; border:1px solid rgba(148,163,184,0.5); border-radius:4px; background:rgba(15,23,42,0.6); padding:0; cursor:pointer; }
+    .code-toggle::before { content:""; position:absolute; right:4px; top:4px; width:8px; height:8px; border-top:2px solid #9ca3af; border-right:2px solid #9ca3af; transform:rotate(0deg); }
+    .code-block.is-expanded .code-toggle::before { transform:rotate(180deg); }
+    .code-toggle:hover { border-color:rgba(148,163,184,0.9); }
+    .code-toggle:focus-visible { outline:2px solid #93c5fd; outline-offset:2px; }
     .message { border-radius:8px; padding:12px; background:#eef3f8; color:var(--muted); margin-top:12px; }
     .error { color:var(--bad); background:#fef3f2; border:1px solid #fecdca; }
     @media (max-width:900px){ header,.layout{display:block}.row,.cards{grid-template-columns:1fr} }
@@ -746,51 +755,226 @@ const stop = document.getElementById('stop');
 const message = document.getElementById('message');
 const statusEl = document.getElementById('status');
 const eventsEl = document.getElementById('events');
+function truncateText(value, limit=180){
+  const text = cleanText(value).replace(/\\s+/g, ' ');
+  return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
+}
 function esc(v){return String(v).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');}
 function cleanText(value){return String(value ?? '').trim();}
-function renderMarkdownish(text){
-  text = cleanText(text);
-  if(!text) return '<div class="md-paragraph">Empty message.</div>';
-  const parts = [];
-  const fence = /```(\w+)?\\n([\s\S]*?)```/g;
-  let last = 0;
-  for(const match of text.matchAll(fence)){
-    parts.push(renderPlainText(text.slice(last, match.index)));
-    parts.push(`<div class="code-block">${esc(match[2].trim())}</div>`);
-    last = match.index + match[0].length;
+function isLikelyJsonChunk(text){
+  const trimmed = cleanText(text);
+  if(!trimmed) return false;
+  if(!((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']')))) return false;
+  try {
+    JSON.parse(trimmed);
+    return true;
+  } catch {
+    return false;
   }
-  parts.push(renderPlainText(text.slice(last)));
-  return parts.join('');
 }
-function renderPlainText(text){
+function isLikelyCommandLine(text){
+  const trimmed = cleanText(text);
+  return /^(?:list_files|read_file|write_file|edit_file|load_dataset|show_dataset_info|show_sample_rows|run_python|get_budget_status|get_remaining_time|get_trajectory|get_hints|submit)\s*\(/.test(trimmed);
+}
+function stripContentFromText(text){
   text = cleanText(text);
   if(!text) return '';
-  return text
-    .split('\\n')
-    .map(line => {
-      const trimmed = line.trim();
-      if(!trimmed) return '';
-      if(trimmed === '***' || trimmed === '---') return '<hr class="md-rule">';
-      if(trimmed.startsWith('### ')) return `<div class="md-heading">${esc(trimmed.slice(4))}</div>`;
-      if(trimmed.startsWith('## ')) return `<div class="md-heading">${esc(trimmed.slice(3))}</div>`;
-      if(trimmed.startsWith('# ')) return `<div class="md-heading">${esc(trimmed.slice(2))}</div>`;
-      return `<div class="md-paragraph">${esc(trimmed)}</div>`;
-    })
-    .join('');
+  const hasCommandLine = (value) => value.split('\n').some(line => isLikelyCommandLine(line.trim()));
+  const hasJsonLine = (value) => value.split('\n').some(line => isLikelyJsonChunk(line.trim()));
+  const countParenDelta = (value) => {
+    let delta = 0;
+    let inSingle = false;
+    let inDouble = false;
+    let escaped = false;
+    for(const ch of value){
+      if(escaped){
+        escaped = false;
+        continue;
+      }
+      if(ch === '\\'){
+        escaped = true;
+        continue;
+      }
+      if(inSingle){
+        if(ch === "'") inSingle = false;
+        continue;
+      }
+      if(inDouble){
+        if(ch === '"') inDouble = false;
+        continue;
+      }
+      if(ch === "'"){
+        inSingle = true;
+        continue;
+      }
+      if(ch === '"'){
+        inDouble = true;
+        continue;
+      }
+      if(ch === '(') delta += 1;
+      if(ch === ')') delta -= 1;
+    }
+    return delta;
+  };
+  text = text.replace(/```(?:json|tool|command)\s*[\s\S]*?```/gi, '');
+  text = text.replace(/```[\s\S]*?```/g, block => {
+    const inner = block.replace(/^```[^\n]*\n?/, '').replace(/```$/, '');
+    return isLikelyJsonChunk(inner) || hasJsonLine(inner) || hasCommandLine(inner) ? '' : block;
+  });
+
+  const lines = text.split('\n');
+  const kept = [];
+  for(let i = 0; i < lines.length; i++){
+    const line = lines[i];
+    const trimmed = line.trim();
+    if(!trimmed) {
+      kept.push('');
+      continue;
+    }
+    if(isLikelyCommandLine(trimmed)) {
+      let balance = countParenDelta(line);
+      while(i + 1 < lines.length && balance > 0) {
+        i++;
+        balance += countParenDelta(lines[i]);
+      }
+      continue;
+    }
+    if(trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      let buffer = trimmed;
+      let j = i;
+      let parsed = false;
+      while(true) {
+        if(isLikelyJsonChunk(buffer)) {
+          parsed = true;
+          break;
+        }
+        if(j + 1 >= lines.length) {
+          break;
+        }
+        if(lines[j + 1].trim() === '' && buffer.length > 0) {
+          break;
+        }
+        if(j - i > 40) {
+          break;
+        }
+        j++;
+        buffer += `\n${lines[j].trim()}`;
+      }
+      if(parsed) {
+        i = j;
+        continue;
+      }
+    }
+    kept.push(line);
+  }
+  const cleaned = kept.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  return cleaned;
 }
-function isProbablyCode(value){
-  return typeof value === 'string' && (
-    value.includes('\\n') ||
-    value.includes('import ') ||
-    value.includes('def ') ||
-    value.includes('pd.read_csv') ||
-    value.includes('print(')
-  );
+function renderInlineMarkup(text){
+  const parts = String(text).split(/(`[^`]*`)/g);
+  return parts.map(part => {
+    if(part.startsWith('`') && part.endsWith('`') && part.length >= 2) {
+      return `<span class="inline-code">${esc(part.slice(1, -1))}</span>`;
+    }
+    return esc(part);
+  }).join('');
+}
+function renderMarkdownLine(line){
+  const trimmed = line.trim();
+  if(!trimmed) return '';
+  if(trimmed === '***' || trimmed === '---') return '<hr class="md-rule">';
+  if(trimmed.startsWith('### ')) return `<div class="md-heading">${renderInlineMarkup(trimmed.slice(4))}</div>`;
+  if(trimmed.startsWith('## ')) return `<div class="md-heading">${renderInlineMarkup(trimmed.slice(3))}</div>`;
+  if(trimmed.startsWith('# ')) return `<div class="md-heading">${renderInlineMarkup(trimmed.slice(2))}</div>`;
+  if(/^(?:- |\* |• )/.test(trimmed)) {
+    return `<div class="md-list-item">• ${renderInlineMarkup(trimmed.replace(/^(?:- |\* |• )/, ''))}</div>`;
+  }
+  if(/^\d+\.\s+/.test(trimmed)) {
+    return `<div class="md-list-item">${renderInlineMarkup(trimmed)}</div>`;
+  }
+  return `<div class="md-paragraph">${renderInlineMarkup(trimmed)}</div>`;
+}
+function renderMarkdownish(text){
+  text = stripContentFromText(text);
+  if(!text) return '<div class="md-paragraph">Empty message.</div>';
+  const parts = [];
+  const fence = /```(?:([a-zA-Z0-9_-]+)\n)?([\s\S]*?)```/g;
+  let last = 0;
+  for(const match of text.matchAll(fence)){
+    const before = text.slice(last, match.index);
+    parts.push(before.split('\n').map(renderMarkdownLine).join(''));
+    const lang = match[1] ? `<div class="code-lang">${esc(match[1])}</div>` : '';
+    parts.push(`<div class="code-block collapsible">${lang}<button type="button" class="code-toggle" aria-label="Expand code"></button><pre>${esc(match[2].replace(/\n$/, ''))}</pre></div>`);
+    last = match.index + match[0].length;
+  }
+  parts.push(text.slice(last).split('\n').map(renderMarkdownLine).join(''));
+  return parts.join('');
+}
+function setupCodeToggles(){
+  document.addEventListener('click', (event) => {
+    const button = event.target.closest('.code-toggle');
+    if(!button) return;
+    const block = button.closest('.code-block');
+    if(!block) return;
+    block.classList.toggle('is-expanded');
+    button.setAttribute('aria-label', block.classList.contains('is-expanded') ? 'Collapse code' : 'Expand code');
+  });
+}
+function renderJsonScalar(value){
+  if(value === null || value === undefined) return '<span class="json-muted">-</span>';
+  if(typeof value === 'boolean' || typeof value === 'number') return `<span class="json-pill">${esc(String(value))}</span>`;
+  if(typeof value === 'string') {
+    const text = cleanText(value);
+    if(!text) return '<span class="json-muted">-</span>';
+    if(isProbablyCode(text) || text.includes('\\n')) return `<div class="code-block">${esc(text)}</div>`;
+    return `<span class="json-pill">${esc(shortText(text, 240))}</span>`;
+  }
+  return `<span class="json-pill">${esc(shortText(JSON.stringify(value), 240))}</span>`;
+}
+function renderJsonList(value, depth=0){
+  const items = value.slice(0, depth === 0 ? 3 : 2);
+  return `
+    <div class="json-array">
+      <div class="json-array-head">${esc(value.length)} item${value.length === 1 ? '' : 's'}</div>
+      ${items.length ? items.map(item => `<div class="json-item">${renderJsonSummary(item, depth + 1)}</div>`).join('') : '<div class="json-muted">Empty list.</div>'}
+      ${value.length > items.length ? `<div class="json-more">+${value.length - items.length} more</div>` : ''}
+    </div>`;
+}
+function renderJsonObject(value, depth=0){
+  const preferredOrder = [
+    'status', 'command', 'error', 'message', 'metric', 'value', 'rows_checked',
+    'returncode', 'used_steps', 'max_steps', 'remaining_steps', 'requests',
+    'total_tokens', 'token_limit', 'stage', 'title', 'task_id', 'model', 'file',
+    'path', 'stdout', 'stderr'
+  ];
+  const entries = Object.entries(value);
+  const selected = preferredOrder
+    .filter(key => Object.prototype.hasOwnProperty.call(value, key))
+    .map(key => [key, value[key]]);
+  const extras = entries.filter(([key]) => !preferredOrder.includes(key));
+  const shownExtras = depth === 0 ? extras.slice(0, 3) : extras.slice(0, 2);
+  const rows = [...selected, ...shownExtras];
+  const hidden = Math.max(0, entries.length - rows.length);
+  return `
+    <div class="json-view">
+      ${rows.length ? `<div class="json-grid">${rows.map(([key, item]) => `
+        <div class="kv">
+          <span>${esc(key)}</span>
+          <span>${renderJsonSummary(item, depth + 1)}</span>
+        </div>
+      `).join('')}</div>` : '<div class="json-muted">Empty object.</div>'}
+      ${hidden > 0 ? `<div class="json-more">+${hidden} more field${hidden === 1 ? '' : 's'}</div>` : ''}
+    </div>`;
+}
+function renderJsonSummary(value, depth=0){
+  if(value === null || value === undefined) return '<span class="json-muted">-</span>';
+  if(Array.isArray(value)) return renderJsonList(value, depth);
+  if(isPlainObject(value)) return renderJsonObject(value, depth);
+  return renderJsonScalar(value);
 }
 function renderValue(value){
   if(isProbablyCode(value)) return `<div class="code-block">${esc(cleanText(value))}</div>`;
-  if(typeof value === 'string') return `<span class="inline-code">${esc(cleanText(value))}</span>`;
-  return `<pre>${esc(JSON.stringify(value, null, 2))}</pre>`;
+  return renderJsonSummary(value);
 }
 function renderCommandCall(name, args){
   const argValues = Object.entries(args || {}).map(([key, value]) => {
@@ -841,7 +1025,7 @@ function commandResultSummary(result){
   return `
     <div class="block">
       <div class="block-title">${esc(result.command || 'command')} result</div>
-      <pre>${esc(JSON.stringify(payload || result, null, 2))}</pre>
+      ${renderJsonSummary(payload || result)}
     </div>`;
 }
 function renderCommandHtml(event){
@@ -882,40 +1066,44 @@ function renderSubmissionHtml(submission){
       <span>Rows checked</span><span>${esc(payload.rows_checked ?? '-')}</span>
     </div>
     <details>
-      <summary>Secondary data</summary>
-      <pre>${esc(JSON.stringify(submission, null, 2))}</pre>
+      <summary>Details</summary>
+      <div class="kv">
+        <span>Command</span><span>${esc(submission.command || 'submit')}</span>
+        <span>Elapsed ms</span><span>${esc(submission.elapsed_ms ?? '-')}</span>
+        <span>Result status</span><span>${esc(payload.status || submission.status || '-')}</span>
+        ${payload.error ? `<span>Error</span><span>${esc(payload.error)}</span>` : ''}
+      </div>
     </details>`;
 }
 function renderPromptHtml(text){
   const parsed = tryParseFollowupPrompt(text);
-  if(!parsed) return `<div class="event-body structured">${renderMarkdownish(text)}</div>`;
-  const payload = parsed.payload;
-  const results = payload.command_results || [];
-  const hints = payload.feedback?.hints || [];
-  const budget = payload.budget || {};
+  return `<div class="chat-body structured">${renderMarkdownish(parsed ? parsed.intro : text)}</div>`;
+}
+function renderCommandNote(event){
+  const name = cleanText(event.title || event.data?.command || '');
+  const args = event.data?.args || {};
+  const code = cleanText(args.code_or_file || '');
+  const path = cleanText(args.path || args.file || '');
+  const content = cleanText(args.content || args.diff || '');
+  const isCode = name === 'run_python';
+  const fileOps = new Set(['read_file', 'write_file', 'edit_file', 'load_dataset', 'list_files', 'show_dataset_info', 'show_sample_rows']);
+  if(!isCode && !fileOps.has(name)) return '';
+  const summary = isCode ? 'Выполняю код' : 'Открываю файл';
+  const details = [];
+  if(isCode) {
+    if(code) details.push(`<div class="note-meta">Код</div><pre>${esc(code)}</pre>`);
+    else details.push('<div class="note-meta">Код не передан.</div>');
+  } else {
+    if(path) details.push(`<div class="note-meta">Путь: <span class="inline-code">${esc(path)}</span></div>`);
+    if(content) details.push(`<div class="note-meta">Содержимое</div><pre>${esc(content)}</pre>`);
+    if(!path && !content) details.push('<div class="note-meta">Без дополнительных данных.</div>');
+  }
   return `
-    <div class="event-body structured">
-      <div class="block">
-        <div class="block-title">Instruction to LLM</div>
-        <div>${esc(parsed.intro)}</div>
-      </div>
-      <div class="block">
-        <div class="block-title">Command results sent back</div>
-        ${results.length ? results.map(commandResultSummary).join('') : '<div>No command results.</div>'}
-      </div>
-      <div class="block">
-        <div class="block-title">Feedback hints</div>
-        ${hints.length ? `<ul class="hint-list">${hints.map(h => `<li><strong>${esc(h.stage)}</strong>: ${esc(h.message)}</li>`).join('')}</ul>` : '<div>No hints.</div>'}
-      </div>
-      <div class="block">
-        <div class="block-title">Budget</div>
-        <div class="kv">
-          <span>Steps</span><span>${esc(budget.used_steps ?? 0)} / ${esc(budget.max_steps ?? '-')}</span>
-          <span>Remaining steps</span><span>${esc(budget.remaining_steps ?? '-')}</span>
-          <span>Requests</span><span>${esc(budget.requests ?? '-')}</span>
-          <span>Tokens</span><span>${esc(budget.total_tokens ?? 0)} / ${esc(budget.token_limit ?? '-')}</span>
-        </div>
-      </div>
+    <div class="command-note">
+      <details>
+        <summary>${esc(summary)}</summary>
+        <div class="note-body">${details.join('')}</div>
+      </details>
     </div>`;
 }
 function eventMainText(event){
@@ -938,18 +1126,50 @@ function eventMainText(event){
 function eventBodyHtml(event){
   const data = event.data || {};
   if(event.kind === 'prompt') return renderPromptHtml(data.content || '');
-  if(event.kind === 'llm') return `<div class="event-body structured">${renderMarkdownish(data.content || '')}</div>`;
-  if(event.kind === 'command') return renderCommandHtml(event);
-  if(event.kind === 'result') return `<div class="event-body structured">${commandResultSummary(data)}</div>`;
-  if(event.kind === 'feedback') return renderFeedbackHtml(data);
-  return `<div class="event-body">${esc(eventMainText(event))}</div>`;
+  if(event.kind === 'llm') return `<div class="chat-body structured">${renderMarkdownish(data.content || '')}</div>`;
+  if(event.kind === 'result') {
+    if(data.command === 'submit') return renderSubmissionHtml(data);
+    return '';
+  }
+  return '';
+}
+function renderChatEvent(kind, title, bodyHtml, time, side){
+  const avatar = kind === 'prompt' ? 'You' : 'LLM';
+  return `
+    <div class="event chat-event ${esc(kind)} ${esc(side)}">
+      <div class="chat-row ${esc(side)}">
+        <div class="chat-avatar">${esc(avatar)}</div>
+        <div class="bubble">
+          <div class="chat-title">${esc(title)}</div>
+          ${bodyHtml}
+        </div>
+      </div>
+      <div class="chat-tail">
+        <span>${esc(kind === 'prompt' ? 'Your message' : 'LLM response')}</span>
+        <span>${esc(time)}</span>
+      </div>
+    </div>`;
+}
+function renderTechEvent(event, index){
+  const data = event.data || {};
+  const summary = cleanText(data.error || data.message || data.status || event.title || event.kind);
+  return `
+    <div class="event ${esc(event.kind)}" data-event-index="${index}">
+      <div class="event-head"><span class="kind">${esc(eventLabel(event.kind))}</span><span>${esc(new Date(event.time).toLocaleTimeString())}</span></div>
+      <div class="event-title">${esc(event.title)}</div>
+      ${summary ? `<div class="event-preview">${esc(summary)}</div>` : ''}
+    </div>`;
+}
+function eventPreviewHtml(event){
+  const text = truncateText(eventMainText(event));
+  return text ? `<div class="event-preview">${esc(text)}</div>` : '';
 }
 function eventLabel(kind){
   const labels = {
     prompt: 'Prompt to LLM',
     llm: 'LLM answer',
     command: 'Command',
-    result: 'Command result',
+    result: 'Result',
     feedback: 'Hints',
     system: 'System',
     error: 'Error',
@@ -1018,32 +1238,70 @@ function render(run){
     document.getElementById('submission').className = 'message';
     document.getElementById('submission').textContent = 'No submission yet.';
   }
-  eventsEl.innerHTML = run.events.length ? run.events.slice().reverse().map((e, index) => {
-    const details = JSON.stringify(e.data, null, 2);
-    return `
-      <div class="event ${esc(e.kind)}" data-event-index="${index}">
-        <div class="event-head"><span class="kind">${esc(eventLabel(e.kind))}</span><span>${esc(new Date(e.time).toLocaleTimeString())}</span></div>
-        <strong>${esc(e.title)}</strong>
-        ${eventBodyHtml(e)}
-        <div class="event-actions">
-          <button class="small-button" type="button" data-action="expand">Expand</button>
+  const turns = [];
+  let currentTurn = null;
+  for(const event of run.events) {
+    if(event.kind === 'prompt') {
+      currentTurn = { prompt: event, llm: null, hints: [], notes: [] };
+      turns.push(currentTurn);
+      continue;
+    }
+    if(event.kind === 'llm') {
+      if(!currentTurn) {
+        currentTurn = { prompt: null, llm: event, hints: [], notes: [] };
+        turns.push(currentTurn);
+      } else {
+        currentTurn.llm = event;
+      }
+      continue;
+    }
+    if(event.kind === 'feedback') {
+      if(currentTurn) currentTurn.hints = Array.isArray(event.data?.hints) ? event.data.hints : [];
+      continue;
+    }
+    if(event.kind === 'command') {
+      if(currentTurn) {
+        const note = renderCommandNote(event);
+        if(note) currentTurn.notes.push(note);
+      }
+      continue;
+    }
+    if(event.kind === 'result' && event.data?.command === 'submit') {
+      continue;
+    }
+    if(event.kind === 'error' || event.kind === 'parse_error' || event.kind === 'system') {
+      if(currentTurn) currentTurn.notes.push(renderTechEvent(event, turns.length));
+    }
+  }
+  eventsEl.innerHTML = turns.length ? turns.map((turn, index) => {
+    const prompt = turn.prompt ? renderChatEvent(
+      'prompt',
+      'You',
+      `${renderPromptHtml(turn.prompt.data?.content || '')}${turn.hints.length ? `<div class="turn-hint-label">Подсказки к вашему сообщению</div><ul class="turn-hints">${turn.hints.map(h => `<li><strong>${esc(h.stage)}</strong>: ${esc(h.message)}</li>`).join('')}</ul>` : ''}`,
+      new Date(turn.prompt.time).toLocaleTimeString(),
+      'user'
+    ) : '';
+    const llm = turn.llm ? `
+      <div class="event chat-event llm assistant">
+        <div class="chat-row assistant">
+          <div class="chat-avatar">LLM</div>
+          <div class="bubble">
+            <div class="chat-title">LLM</div>
+            <div class="chat-body structured">${renderMarkdownish(turn.llm.data?.content || '')}</div>
+            ${turn.notes.length ? `<div class="command-notes">${turn.notes.join('')}</div>` : ''}
+          </div>
         </div>
-        <details>
-          <summary>Secondary data</summary>
-          <pre>${esc(details)}</pre>
-        </details>
-      </div>`;
+        <div class="chat-tail">
+          <span>LLM response</span>
+          <span>${esc(new Date(turn.llm.time).toLocaleTimeString())}</span>
+        </div>
+      </div>` : '';
+    return `<div class="turn" data-turn-index="${index}">${prompt}${llm}</div>`;
   }).join('') : '<div class="message">No events yet.</div>';
-  eventsEl.querySelectorAll('[data-action="expand"]').forEach(button => {
-    button.addEventListener('click', () => {
-      const event = button.closest('.event');
-      event.classList.toggle('expanded');
-      button.textContent = event.classList.contains('expanded') ? 'Collapse' : 'Expand';
-    });
-  });
 }
 start.addEventListener('click', startRun);
 stop.addEventListener('click', stopRun);
+setupCodeToggles();
 loadTasks();
 </script>
 </body>
