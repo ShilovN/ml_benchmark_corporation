@@ -15,6 +15,7 @@ Examples:
 ```bash
 python3 checker/metric_checker.py y_true.txt y_pred.txt accuracy
 python3 checker/metric_checker.py y_true.csv y_pred.csv f1 --column label
+python3 checker/metric_checker.py y_true.csv y_score.csv roc_auc --true-column label --pred-column score
 python3 checker/metric_checker.py y_true.csv y_pred.csv accuracy --id-column id --column label
 python3 checker/metric_checker.py y_true.json y_pred.json rmse
 ```
@@ -30,10 +31,11 @@ missing, extra, or duplicated ids.
 
 Supported metrics:
 
-- classification: `accuracy`, `precision`, `recall`, `f1`;
+- classification: `accuracy`, `precision`, `recall`, `f1`, `roc_auc`;
 - regression: `mae`, `mse`, `rmse`, `r2`.
 
 `precision`, `recall`, and `f1` are macro-averaged for multiclass labels.
+`roc_auc` expects binary true labels and numeric prediction scores.
 
 ## Server
 

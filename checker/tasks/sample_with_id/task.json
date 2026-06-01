@@ -1,8 +1,0 @@
-{
-  "id": "sample_with_id",
-  "name": "Sample classification task with ids",
-  "metric": "accuracy",
-  "answer_file": "answers.csv",
-  "id_column": "id",
-  "column": "label"
-}

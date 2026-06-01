@@ -21,6 +21,8 @@ CLASSIFICATION_METRICS = {
     "recall",
     "f1",
     "f1_score",
+    "roc_auc",
+    "roc_auc_score",
 }
 
 REGRESSION_METRICS = {
@@ -224,6 +226,55 @@ def f1(y_true: Sequence[Value], y_pred: Sequence[Value]) -> float:
     return _macro_classification_metric(y_true, y_pred, "f1")
 
 
+def roc_auc(y_true: Sequence[Value], y_pred: Sequence[Value]) -> float:
+    labels = _binary_labels(y_true)
+    positive_label = labels[-1]
+    scores = numeric_values(y_pred, "Second file")
+    if any(not math.isfinite(score) for score in scores):
+        raise ValueError("Second file contains a non-finite score")
+
+    n_positive = sum(label == positive_label for label in y_true)
+    n_negative = len(y_true) - n_positive
+    if n_positive == 0 or n_negative == 0:
+        raise ValueError("ROC AUC is undefined when only one class is present")
+
+    ranked_scores = sorted(enumerate(scores), key=lambda item: item[1])
+    ranks = [0.0] * len(scores)
+    index = 0
+    while index < len(ranked_scores):
+        end = index + 1
+        while (
+            end < len(ranked_scores)
+            and ranked_scores[end][1] == ranked_scores[index][1]
+        ):
+            end += 1
+
+        average_rank = (index + 1 + end) / 2
+        for original_index, _score in ranked_scores[index:end]:
+            ranks[original_index] = average_rank
+        index = end
+
+    positive_rank_sum = sum(
+        rank for rank, label in zip(ranks, y_true) if label == positive_label
+    )
+    return (positive_rank_sum - n_positive * (n_positive + 1) / 2) / (
+        n_positive * n_negative
+    )
+
+
+def _binary_labels(y_true: Sequence[Value]) -> list[Value]:
+    labels = sorted(set(y_true), key=_label_sort_key)
+    if len(labels) != 2:
+        raise ValueError("ROC AUC requires exactly two classes in true values")
+    return labels
+
+
+def _label_sort_key(value: Value) -> tuple[int, Union[float, str]]:
+    if isinstance(value, (int, float)):
+        return (0, float(value))
+    return (1, str(value))
+
+
 def _macro_classification_metric(
     y_true: Sequence[Value], y_pred: Sequence[Value], metric: str
 ) -> float:
@@ -286,6 +337,8 @@ def metric_registry() -> dict[str, Callable[[Sequence[Value], Sequence[Value]], 
         "recall": recall,
         "f1": f1,
         "f1_score": f1,
+        "roc_auc": roc_auc,
+        "roc_auc_score": roc_auc,
         "mae": mae,
         "mean_absolute_error": mae,
         "mse": mse,

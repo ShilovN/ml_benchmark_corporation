@@ -1,6 +1,0 @@
-{
-  "id": "sample_accuracy",
-  "name": "Sample classification task",
-  "metric": "accuracy",
-  "answer_file": "answers.txt"
-}

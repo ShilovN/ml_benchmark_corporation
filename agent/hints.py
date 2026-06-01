@@ -103,7 +103,15 @@ class HintEngine:
         hints: list[Hint] = []
         if metric in {"mae", "mse", "rmse", "r2", "r2_score"}:
             expected_task_type = "регрессию"
-        elif metric in {"accuracy", "precision", "recall", "f1", "f1_score"}:
+        elif metric in {
+            "accuracy",
+            "precision",
+            "recall",
+            "f1",
+            "f1_score",
+            "roc_auc",
+            "roc_auc_score",
+        }:
             expected_task_type = "классификацию"
         else:
             expected_task_type = "тип ML-задачи"

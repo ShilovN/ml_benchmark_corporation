@@ -68,7 +68,7 @@ from answer files and submission files. It supports:
 - text, CSV, TSV, and JSON inputs;
 - row alignment by `id`;
 - validation for missing, extra, and duplicated ids;
-- classification metrics: `accuracy`, `precision`, `recall`, `f1`;
+- classification metrics: `accuracy`, `precision`, `recall`, `f1`, `roc_auc`;
 - regression metrics: `mae`, `mse`, `rmse`, `r2`;
 - an HTTP server for uploads and task files.
 
