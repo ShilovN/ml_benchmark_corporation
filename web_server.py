@@ -277,7 +277,7 @@ class AgentRunManager:
                         state,
                         "Твой ответ не удалось распарсить как команду.\n"
                         f"Ошибка: {exc}\n"
-                        "Верни только валидную команду или несколько команд, по одной на строку.",
+                        "Верни короткую строку `Мысль: ...`, затем валидную команду или несколько команд, по одной на строку.",
                     )
                     continue
 
@@ -560,7 +560,7 @@ def baseline_prediction(rows: list[dict[str, str]], target_column: str, metric: 
 def build_initial_prompt(workspace: Path, task_id: str) -> str:
     return (
         "Ты решаешь ML benchmark task через агентские команды.\n"
-        "В одном ответе можно вернуть одну или несколько команд, по одной на строку.\n"
+        "В одном ответе сначала напиши короткую строку `Мысль: ...`, затем одну или несколько команд, по одной на строку.\n"
         "Работай как в обычной ML-задаче: осмотри данные, сделай признаки, обучи и проверь модель. "
         "Перед submit проверь, что submission.csv существует, имеет нужные колонки, правильное число строк "
         "и не содержит пустых предсказаний. Когда всё готово, вызови submit(\"submission.csv\").\n\n"
@@ -654,7 +654,7 @@ def build_followup_prompt(results: list[dict[str, Any]], feedback: dict[str, Any
     max_steps = state.config.max_steps
     remaining_steps = max(0, max_steps - used_steps)
     lines = [
-        "Продолжай решение. Верни только следующую команду или команды.",
+        "Продолжай решение. Верни короткую строку `Мысль: ...`, затем следующую команду или команды.",
         "",
         "Статус benchmark:",
         (
@@ -669,9 +669,10 @@ def build_followup_prompt(results: list[dict[str, Any]], feedback: dict[str, Any
             lines.extend(format_web_command_result(index, result))
     else:
         lines.append("- команд не было")
-    if feedback and state.requests > 1:
+    feedback_lines = format_web_feedback(feedback) if feedback and state.requests > 1 else []
+    if feedback_lines:
         lines.extend(["", "Подсказки:"])
-        lines.extend(format_web_feedback(feedback))
+        lines.extend(feedback_lines)
     return "\n".join(lines)
 
 
@@ -679,9 +680,12 @@ def format_web_command_result(index: int, result: dict[str, Any]) -> list[str]:
     command = str(result.get("command", "unknown"))
     status = str(result.get("status", "unknown"))
     if status != "ok":
-        return [f"{index}. {command}: error", f"   {short_web_text(str(result.get('error', 'unknown error')), 1200)}"]
+        lines = [f"{index}. {command}: error"]
+        lines.extend(f"   {line}" for line in fenced_web_text_block(str(result.get("error", "unknown error")), 1200))
+        return lines
     lines = [f"{index}. {command}: ok"]
-    lines.extend(f"   {line}" for line in format_web_result_payload(command, result.get("result")))
+    detail = "\n".join(format_web_result_payload(command, result.get("result")))
+    lines.extend(f"   {line}" for line in fenced_web_text_block(detail, 4000))
     return lines
 
 
@@ -726,13 +730,19 @@ def format_web_result_payload(command: str, payload: Any) -> list[str]:
 def format_web_feedback(feedback: dict[str, Any]) -> list[str]:
     hints = feedback.get("hints")
     if not isinstance(hints, list) or not hints:
-        return [f"- {short_web_json(feedback, 1500)}"]
+        return []
     lines: list[str] = []
     for hint in hints[:8]:
         if isinstance(hint, dict):
-            lines.append(f"- {hint.get('stage', 'hint')}: {hint.get('message', '')}")
+            message = str(hint.get("message") or "").strip()
+            if not message:
+                continue
+            stage = str(hint.get("stage") or "hint").strip()
+            lines.append(f"- {stage}: {message}")
         else:
-            lines.append(f"- {hint}")
+            text = str(hint).strip()
+            if text:
+                lines.append(f"- {text}")
     if len(hints) > 8:
         lines.append(f"- ... (+{len(hints) - 8} more hints)")
     return lines
@@ -740,6 +750,10 @@ def format_web_feedback(feedback: dict[str, Any]) -> list[str]:
 
 def short_web_json(value: Any, limit: int) -> str:
     return short_web_text(json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str), limit)
+
+
+def fenced_web_text_block(value: str, limit: int) -> list[str]:
+    return ["```text", *short_web_text(value, limit).splitlines(), "```"]
 
 
 def short_web_text(value: str, limit: int) -> str:
@@ -771,7 +785,7 @@ def build_emergency_submit_prompt(state: RunState) -> str:
         instruction = (
             "FINAL SUBMIT NOW.\n"
             "В workspace уже есть submission.csv. Не улучшай решение и не запускай EDA.\n"
-            "Верни только одну команду:\n"
+            "Верни короткую строку `Мысль: отправляю готовый файл`, затем одну команду:\n"
             "submit(\"submission.csv\")\n\n"
         )
     else:
@@ -779,7 +793,7 @@ def build_emergency_submit_prompt(state: RunState) -> str:
             "FINAL SUBMIT NOW.\n"
             "Нужно дать последнее лучшее решение. Не делай EDA и долгие улучшения.\n"
             "Создай submission.csv самым надежным быстрым способом и в этом же ответе вызови submit(\"submission.csv\").\n"
-            "Верни только команды.\n\n"
+            "Верни короткую строку `Мысль: завершаю решение`, затем команды.\n\n"
         )
     payload = {
         "task": task_config,
@@ -1005,13 +1019,13 @@ def render_agent_page() -> str:
   <style>
     :root { --bg:#f5f7fa; --surface:#fff; --border:#d8e0ea; --text:#152033; --muted:#667085; --accent:#155eef; --ok:#067647; --bad:#b42318; }
     body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:var(--bg); color:var(--text); }
-    main { max-width:1240px; margin:0 auto; padding:28px 20px 44px; overflow-x:hidden; }
+    main { max-width:1480px; margin:0 auto; padding:28px 20px 44px; overflow-x:hidden; }
     header { display:flex; justify-content:space-between; gap:18px; align-items:flex-start; margin-bottom:20px; }
     h1 { margin:0 0 8px; font-size:30px; line-height:1.15; }
     h2 { margin:0 0 14px; font-size:18px; }
     p { margin:0; color:var(--muted); }
     section { min-width:0; background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:18px; margin-bottom:16px; }
-    .layout { display:grid; grid-template-columns:360px minmax(0,1fr); gap:18px; align-items:start; }
+    .layout { display:grid; grid-template-columns:320px minmax(0,1fr); gap:18px; align-items:start; }
     .layout > * { min-width:0; }
     label { display:block; margin:0 0 7px; font-weight:700; }
     input, select, button { box-sizing:border-box; width:100%; min-height:40px; font:inherit; }
@@ -1025,25 +1039,26 @@ def render_agent_page() -> str:
     .cards { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; }
     .card { border:1px solid var(--border); border-radius:8px; padding:12px; background:#f8fafc; }
     .card strong { display:block; font-size:22px; margin-top:4px; }
-    .events { display:grid; gap:12px; min-width:0; max-height:72vh; overflow:auto; padding-right:4px; }
+    .events { display:grid; gap:12px; min-width:0; max-width:100%; max-height:72vh; overflow-y:auto; overflow-x:hidden; padding-right:4px; }
     .event { min-width:0; max-width:100%; overflow:hidden; }
-    .chat-event { display:grid; gap:6px; }
-    .chat-row { display:flex; gap:10px; align-items:flex-start; }
+    .turn { min-width:0; max-width:100%; overflow:hidden; }
+    .chat-event { display:grid; gap:6px; min-width:0; max-width:100%; overflow:hidden; }
+    .chat-row { display:flex; gap:10px; align-items:flex-start; min-width:0; max-width:100%; }
     .chat-row.user { flex-direction:row-reverse; }
     .chat-avatar { flex:0 0 auto; width:34px; height:34px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-weight:800; font-size:12px; color:#fff; background:var(--accent); }
     .chat-row.user .chat-avatar { background:#0f766e; }
     .chat-meta { display:flex; justify-content:space-between; gap:12px; color:var(--muted); font-size:12px; margin:0 4px; }
     .chat-row.user .chat-meta { flex-direction:row-reverse; }
-    .bubble { min-width:0; max-width:min(100%, 920px); border:1px solid var(--border); border-radius:14px; padding:12px 14px; background:#f8fafc; }
+    .bubble { box-sizing:border-box; flex:0 1 auto; width:fit-content; min-width:0; max-width:min(100%, 980px); overflow:hidden; border:1px solid var(--border); border-radius:14px; padding:12px 14px; background:#f8fafc; }
     .chat-row.user .bubble { background:#effdf7; border-color:#c8e7da; }
     .chat-title { font-weight:800; margin-bottom:8px; color:var(--text); }
-    .chat-body { width:100%; min-width:0; white-space:pre-wrap; line-height:1.5; background:transparent; border:0; padding:0; margin:0; max-height:none; overflow:visible; }
+    .chat-body { box-sizing:border-box; width:100%; max-width:100%; min-width:0; white-space:pre-wrap; line-height:1.5; background:transparent; border:0; padding:0; margin:0; max-height:none; overflow:visible; }
     .chat-body.structured { white-space:normal; }
     .chat-body .code-block { max-height:calc(1.45em * 5 + 24px); overflow:hidden; white-space:pre-wrap; word-break:break-word; }
     .chat-body .code-block pre { line-height:1.45; }
     .chat-body .block { margin:10px 0; }
     .chat-body pre { max-height:none; white-space:pre-wrap; word-break:break-word; }
-    .chat-tail { display:flex; justify-content:space-between; gap:10px; color:var(--muted); font-size:12px; margin:0 44px; }
+    .chat-tail { box-sizing:border-box; display:flex; justify-content:space-between; gap:10px; min-width:0; max-width:100%; color:var(--muted); font-size:12px; padding:0 44px; }
     .event.command, .event.result, .event.feedback, .event.system, .event.error, .event.parse_error { border:1px solid var(--border); border-radius:10px; padding:10px 12px; background:white; }
     .event.command { border-left:4px solid #c2410c; }
     .event.result { border-left:4px solid #067647; }
@@ -1070,6 +1085,14 @@ def render_agent_page() -> str:
     .code-toggle:hover { border-color:rgba(148,163,184,0.9); }
     .code-toggle:focus-visible { outline:2px solid #93c5fd; outline-offset:2px; }
     .submit-card { display:grid; gap:12px; min-width:0; max-width:100%; }
+    .csv-table-wrap { box-sizing:border-box; width:100%; max-width:100%; max-height:360px; overflow:auto; border:1px solid var(--border); border-radius:8px; background:white; margin:8px 0; }
+    .csv-table-inner { width:max-content; min-width:100%; }
+    .csv-table { width:max-content; min-width:100%; border-collapse:collapse; font-size:13px; }
+    .csv-table th, .csv-table td { max-width:240px; padding:7px 9px; border-bottom:1px solid var(--border); border-right:1px solid var(--border); text-align:left; vertical-align:top; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .csv-table th { position:sticky; top:0; background:#eef3f8; color:var(--text); font-weight:900; z-index:1; }
+    .csv-table td { color:#344054; }
+    .csv-table tr:last-child td { border-bottom:0; }
+    .csv-caption { display:flex; justify-content:space-between; gap:12px; padding:8px 10px; color:var(--muted); font-size:12px; font-weight:700; background:#f8fafc; border-top:1px solid var(--border); }
     .submit-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; flex-wrap:wrap; }
     .submit-title { font-weight:900; color:var(--text); }
     .submit-subtitle { margin-top:3px; color:var(--muted); font-size:13px; }
@@ -1150,6 +1173,9 @@ __MODEL_OPTIONS__
 <script>
 let currentRun = null;
 let timer = null;
+const csvScrollPositions = new Map();
+const expandedCodeBlocks = new Set();
+const openDetails = new Set();
 const task = document.getElementById('task');
 const model = document.getElementById('model');
 const mode = document.getElementById('mode');
@@ -1165,7 +1191,12 @@ function truncateText(value, limit=180){
   return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
 }
 function esc(v){return String(v).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');}
+function escAttr(v){return esc(v).replaceAll('"','&quot;').replaceAll("'","&#39;");}
 function cleanText(value){return String(value ?? '').trim();}
+function isPlainObject(value){return value !== null && typeof value === 'object' && !Array.isArray(value);}
+function safeTextBlock(value){
+  return `<div class="chat-body structured"><pre>${esc(cleanText(value) || 'Empty message.')}</pre></div>`;
+}
 function isLikelyJsonChunk(text){
   const trimmed = cleanText(text);
   if(!trimmed) return false;
@@ -1299,8 +1330,10 @@ function renderMarkdownLine(line){
   }
   return `<div class="md-paragraph">${renderInlineMarkup(trimmed)}</div>`;
 }
-function renderMarkdownish(text){
-  text = stripContentFromText(text);
+function renderMarkdownish(text, options = {}){
+  const shouldStrip = options.strip !== false;
+  const allowCsv = options.csv === true;
+  text = shouldStrip ? stripContentFromText(text) : cleanText(text);
   if(!text) return '<div class="md-paragraph">Empty message.</div>';
   const parts = [];
   const fence = /```(?:([a-zA-Z0-9_-]+)\n)?([\s\S]*?)```/g;
@@ -1308,12 +1341,79 @@ function renderMarkdownish(text){
   for(const match of text.matchAll(fence)){
     const before = text.slice(last, match.index);
     parts.push(before.split('\n').map(renderMarkdownLine).join(''));
-    const lang = match[1] ? `<div class="code-lang">${esc(match[1])}</div>` : '';
-    parts.push(`<div class="code-block collapsible">${lang}<button type="button" class="code-toggle" aria-label="Expand code"></button><pre>${esc(match[2].replace(/\n$/, ''))}</pre></div>`);
+    const langName = cleanText(match[1] || '');
+    const blockText = match[2].replace(/\n$/, '');
+    if(allowCsv && (langName.toLowerCase() === 'csv' || isLikelyCsv(blockText))) {
+      parts.push(renderCsvTable(blockText));
+    } else {
+      const lang = langName ? `<div class="code-lang">${esc(langName)}</div>` : '';
+      parts.push(`<div class="code-block collapsible">${lang}<button type="button" class="code-toggle" aria-label="Expand code"></button><pre>${esc(blockText)}</pre></div>`);
+    }
     last = match.index + match[0].length;
   }
   parts.push(text.slice(last).split('\n').map(renderMarkdownLine).join(''));
   return parts.join('');
+}
+function parseCsvLine(line){
+  const cells = [];
+  let current = '';
+  let quoted = false;
+  for(let i = 0; i < line.length; i++){
+    const ch = line[i];
+    const next = line[i + 1];
+    if(ch === '"'){
+      if(quoted && next === '"'){
+        current += '"';
+        i++;
+      } else {
+        quoted = !quoted;
+      }
+      continue;
+    }
+    if(ch === ',' && !quoted){
+      cells.push(current);
+      current = '';
+      continue;
+    }
+    current += ch;
+  }
+  cells.push(current);
+  return cells.map(cell => cell.trim());
+}
+function isLikelyCsv(text){
+  text = cleanText(text);
+  if(!text || !text.includes(',')) return false;
+  const lines = text.split('\n').map(line => line.trim()).filter(Boolean);
+  if(lines.length < 2 || lines.length > 300) return false;
+  const first = parseCsvLine(lines[0]);
+  if(first.length < 2 || first.length > 40) return false;
+  const comparable = lines.slice(1, Math.min(lines.length, 6)).map(parseCsvLine);
+  const matching = comparable.filter(row => Math.abs(row.length - first.length) <= 1).length;
+  return matching >= Math.min(2, comparable.length);
+}
+function renderCsvTable(text){
+  const lines = cleanText(text).split('\n').filter(line => line.trim());
+  if(lines.length < 2) return `<div class="code-block">${esc(cleanText(text))}</div>`;
+  const header = parseCsvLine(lines[0]);
+  const rows = lines.slice(1, 13).map(parseCsvLine);
+  const totalRows = Math.max(0, lines.length - 1);
+  const shownCols = header.slice(0, 12);
+  const hiddenCols = Math.max(0, header.length - shownCols.length);
+  return `
+    <div class="csv-table-wrap">
+      <div class="csv-table-inner">
+        <table class="csv-table">
+          <thead><tr>${shownCols.map(cell => `<th>${esc(cell || '-')}</th>`).join('')}${hiddenCols ? '<th>...</th>' : ''}</tr></thead>
+          <tbody>
+            ${rows.map(row => `<tr>${shownCols.map((_, index) => `<td title="${escAttr(row[index] ?? '')}">${esc(row[index] ?? '')}</td>`).join('')}${hiddenCols ? `<td>+${hiddenCols} cols</td>` : ''}</tr>`).join('')}
+          </tbody>
+        </table>
+        <div class="csv-caption">
+          <span>${esc(totalRows)} row${totalRows === 1 ? '' : 's'}</span>
+          <span>${esc(header.length)} column${header.length === 1 ? '' : 's'}${totalRows > rows.length ? `, showing ${rows.length}` : ''}</span>
+        </div>
+      </div>
+    </div>`;
 }
 function setupCodeToggles(){
   document.addEventListener('click', (event) => {
@@ -1322,8 +1422,18 @@ function setupCodeToggles(){
     const block = button.closest('.code-block');
     if(!block) return;
     block.classList.toggle('is-expanded');
+    if(block.dataset.uiKey) {
+      if(block.classList.contains('is-expanded')) expandedCodeBlocks.add(block.dataset.uiKey);
+      else expandedCodeBlocks.delete(block.dataset.uiKey);
+    }
     button.setAttribute('aria-label', block.classList.contains('is-expanded') ? 'Collapse code' : 'Expand code');
   });
+  document.addEventListener('toggle', (event) => {
+    const details = event.target.closest('details');
+    if(!details || !details.dataset.uiKey) return;
+    if(details.open) openDetails.add(details.dataset.uiKey);
+    else openDetails.delete(details.dataset.uiKey);
+  }, true);
 }
 function renderJsonScalar(value){
   if(value === null || value === undefined) return '<span class="json-muted">-</span>';
@@ -1381,6 +1491,11 @@ function renderValue(value){
   if(isProbablyCode(value)) return `<div class="code-block">${esc(cleanText(value))}</div>`;
   return renderJsonSummary(value);
 }
+function renderTextPreview(value){
+  const text = cleanText(value);
+  if(!text) return '<span class="json-muted">-</span>';
+  return `<pre>${esc(text)}</pre>`;
+}
 function renderCommandCall(name, args){
   const argValues = Object.entries(args || {}).map(([key, value]) => {
     if(typeof value === 'string') {
@@ -1411,8 +1526,8 @@ function commandResultSummary(result){
     return `
       <div class="block">
         <div class="block-title">run_python finished with code ${esc(payload.returncode ?? 'unknown')}</div>
-        ${payload.stdout ? `<div class="block-title">stdout</div><pre>${esc(payload.stdout)}</pre>` : ''}
-        ${payload.stderr ? `<div class="block-title">stderr</div><pre>${esc(payload.stderr)}</pre>` : ''}
+        ${payload.stdout ? `<div class="block-title">stdout</div>${renderTextPreview(payload.stdout)}` : ''}
+        ${payload.stderr ? `<div class="block-title">stderr</div>${renderTextPreview(payload.stderr)}` : ''}
       </div>`;
   }
   if(result.command === 'submit') {
@@ -1489,9 +1604,17 @@ function renderSubmissionHtml(submission){
         </details>` : ''}
     </div>`;
 }
-function renderPromptHtml(text){
-  const parsed = tryParseFollowupPrompt(text);
-  return `<div class="chat-body structured">${renderMarkdownish(parsed ? parsed.intro : text)}</div>`;
+function renderPromptHtml(text, allowCsv=false){
+  const fullText = cleanText(text);
+  try {
+    return `<div class="chat-body structured">${renderMarkdownish(fullText, {strip:false, csv:allowCsv})}</div>`;
+  } catch {
+    return safeTextBlock(fullText);
+  }
+}
+function validHints(hints){
+  if(!Array.isArray(hints)) return [];
+  return hints.filter(h => h && typeof h === 'object' && cleanText(h.message));
 }
 function renderCommandNote(event){
   const name = cleanText(event.title || event.data?.command || '');
@@ -1509,7 +1632,7 @@ function renderCommandNote(event){
     else details.push('<div class="note-meta">Код не передан.</div>');
   } else {
     if(path) details.push(`<div class="note-meta">Путь: <span class="inline-code">${esc(path)}</span></div>`);
-    if(content) details.push(`<div class="note-meta">Содержимое</div><pre>${esc(content)}</pre>`);
+    if(content) details.push(`<div class="note-meta">Содержимое</div>${renderTextPreview(content)}`);
     if(!path && !content) details.push('<div class="note-meta">Без дополнительных данных.</div>');
   }
   return `
@@ -1539,7 +1662,7 @@ function eventMainText(event){
 }
 function eventBodyHtml(event){
   const data = event.data || {};
-  if(event.kind === 'prompt') return renderPromptHtml(data.content || '');
+  if(event.kind === 'prompt') return renderPromptHtml(data.content || '', false);
   if(event.kind === 'llm') return `<div class="chat-body structured">${renderMarkdownish(data.content || '')}</div>`;
   if(event.kind === 'result') {
     if(data.command === 'submit') return renderSubmissionHtml(data);
@@ -1573,6 +1696,79 @@ function renderTechEvent(event, index){
       <div class="event-title">${esc(event.title)}</div>
       ${summary ? `<div class="event-preview">${esc(summary)}</div>` : ''}
     </div>`;
+}
+function renderTurn(turn, index){
+  try {
+    const promptText = turn.prompt?.data?.content || '';
+    const llmText = turn.llm?.data?.content || '';
+    const prompt = turn.prompt ? renderChatEvent(
+      'prompt',
+      'You',
+      `${renderPromptHtml(promptText, index === 0)}${validHints(turn.hints).length ? `<div class="turn-hint-label">Подсказки к вашему сообщению</div><ul class="turn-hints">${validHints(turn.hints).map(h => `<li><strong>${esc(h.stage || 'hint')}</strong>: ${esc(h.message)}</li>`).join('')}</ul>` : ''}`,
+      new Date(turn.prompt.time).toLocaleTimeString(),
+      'user'
+    ) : '';
+    const llm = turn.llm ? `
+      <div class="event chat-event llm assistant">
+        <div class="chat-row assistant">
+          <div class="chat-avatar">LLM</div>
+          <div class="bubble">
+            <div class="chat-title">LLM</div>
+            <div class="chat-body structured">${renderMarkdownish(llmText)}</div>
+            ${turn.notes.length ? `<div class="command-notes">${turn.notes.join('')}</div>` : ''}
+          </div>
+        </div>
+        <div class="chat-tail">
+          <span>LLM response</span>
+          <span>${esc(new Date(turn.llm.time).toLocaleTimeString())}</span>
+        </div>
+      </div>` : '';
+    return `<div class="turn" data-turn-index="${index}">${prompt}${llm}</div>`;
+  } catch (error) {
+    const promptText = turn.prompt?.data?.content || '';
+    const llmText = turn.llm?.data?.content || '';
+    return `
+      <div class="turn" data-turn-index="${index}">
+        ${turn.prompt ? renderChatEvent('prompt', 'You', safeTextBlock(promptText), new Date(turn.prompt.time).toLocaleTimeString(), 'user') : ''}
+        ${turn.llm ? renderChatEvent('llm', 'LLM', safeTextBlock(llmText), new Date(turn.llm.time).toLocaleTimeString(), 'assistant') : ''}
+        <div class="event error"><div class="event-title">Render fallback</div><div class="event-preview">${esc(error.message || String(error))}</div></div>
+      </div>`;
+  }
+}
+function saveCsvScrollPositions(){
+  eventsEl.querySelectorAll('.turn').forEach((turn, turnIndex) => {
+    turn.querySelectorAll('.csv-table-wrap').forEach((table, index) => {
+      const key = table.dataset.uiKey || `turn-${turnIndex}-csv-${index}`;
+      csvScrollPositions.set(key, {left: table.scrollLeft, top: table.scrollTop});
+    });
+  });
+}
+function applyTrajectoryUiState(){
+  eventsEl.querySelectorAll('.turn').forEach((turn, turnIndex) => {
+    turn.querySelectorAll('.code-block').forEach((block, index) => {
+      const key = `turn-${turnIndex}-code-${index}`;
+      block.dataset.uiKey = key;
+      if(expandedCodeBlocks.has(key)) {
+        block.classList.add('is-expanded');
+        const button = block.querySelector('.code-toggle');
+        if(button) button.setAttribute('aria-label', 'Collapse code');
+      }
+    });
+    turn.querySelectorAll('.csv-table-wrap').forEach((table, index) => {
+      const key = `turn-${turnIndex}-csv-${index}`;
+      table.dataset.uiKey = key;
+      const position = csvScrollPositions.get(key);
+      if(position) {
+        table.scrollLeft = position.left;
+        table.scrollTop = position.top;
+      }
+    });
+    turn.querySelectorAll('details').forEach((details, index) => {
+      const key = `turn-${turnIndex}-details-${index}`;
+      details.dataset.uiKey = key;
+      if(openDetails.has(key)) details.open = true;
+    });
+  });
 }
 function eventPreviewHtml(event){
   const text = truncateText(eventMainText(event));
@@ -1627,6 +1823,7 @@ async function poll(){
   }
 }
 function render(run){
+  saveCsvScrollPositions();
   statusEl.textContent = run.status + ' / ' + run.stop_reason;
   document.getElementById('s-status').textContent = run.status;
   document.getElementById('s-requests').textContent = run.requests;
@@ -1669,7 +1866,7 @@ function render(run){
       continue;
     }
     if(event.kind === 'feedback') {
-      if(currentTurn) currentTurn.hints = Array.isArray(event.data?.hints) ? event.data.hints : [];
+      if(currentTurn) currentTurn.hints = validHints(event.data?.hints);
       continue;
     }
     if(event.kind === 'command') {
@@ -1686,31 +1883,8 @@ function render(run){
       if(currentTurn) currentTurn.notes.push(renderTechEvent(event, turns.length));
     }
   }
-  eventsEl.innerHTML = turns.length ? turns.map((turn, index) => {
-    const prompt = turn.prompt ? renderChatEvent(
-      'prompt',
-      'You',
-      `${renderPromptHtml(turn.prompt.data?.content || '')}${turn.hints.length ? `<div class="turn-hint-label">Подсказки к вашему сообщению</div><ul class="turn-hints">${turn.hints.map(h => `<li><strong>${esc(h.stage)}</strong>: ${esc(h.message)}</li>`).join('')}</ul>` : ''}`,
-      new Date(turn.prompt.time).toLocaleTimeString(),
-      'user'
-    ) : '';
-    const llm = turn.llm ? `
-      <div class="event chat-event llm assistant">
-        <div class="chat-row assistant">
-          <div class="chat-avatar">LLM</div>
-          <div class="bubble">
-            <div class="chat-title">LLM</div>
-            <div class="chat-body structured">${renderMarkdownish(turn.llm.data?.content || '')}</div>
-            ${turn.notes.length ? `<div class="command-notes">${turn.notes.join('')}</div>` : ''}
-          </div>
-        </div>
-        <div class="chat-tail">
-          <span>LLM response</span>
-          <span>${esc(new Date(turn.llm.time).toLocaleTimeString())}</span>
-        </div>
-      </div>` : '';
-    return `<div class="turn" data-turn-index="${index}">${prompt}${llm}</div>`;
-  }).join('') : '<div class="message">No events yet.</div>';
+  eventsEl.innerHTML = turns.length ? turns.map(renderTurn).join('') : '<div class="message">No events yet.</div>';
+applyTrajectoryUiState();
 }
 start.addEventListener('click', startRun);
 stop.addEventListener('click', stopRun);

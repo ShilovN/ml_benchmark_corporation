@@ -76,6 +76,15 @@ load_dataset("train.csv")
 
         self.assertEqual(extract_command_text(text), 'read_file("checker/README.md")')
 
+    def test_extract_command_after_short_thought(self) -> None:
+        text = """Мысль: Посмотрю, какие файлы есть в проекте.
+list_files(".")"""
+
+        command = parse_model_response(text)
+
+        self.assertEqual(command.name, "list_files")
+        self.assertEqual(command.args, {"path": "."})
+
     def test_multiple_commands_raise_error(self) -> None:
         text = """read_file("a.txt")
 read_file("b.txt")"""
@@ -175,6 +184,64 @@ class ExecutorTest(unittest.TestCase):
         self.assertIn("remaining_steps=6", prompt)
         self.assertIn("- команд не было", prompt)
         self.assertNotIn('"benchmark_status"', prompt)
+
+    def test_followup_prompt_wraps_python_output_in_code_blocks(self) -> None:
+        args = argparse.Namespace(token_limit=None, max_steps=10, time_limit_seconds=3600)
+        command_results = [
+            {
+                "status": "ok",
+                "command": "run_python",
+                "result": {
+                    "returncode": 1,
+                    "stdout": "printed value\nsecond line",
+                    "stderr": "Traceback line",
+                },
+            }
+        ]
+
+        prompt = build_followup_prompt(command_results, BenchmarkStats(), args)
+
+        self.assertIn("1. run_python: ok", prompt)
+        self.assertIn("   ```text\n   returncode=1\n   stdout:\n     printed value\n     second line\n   stderr:\n     Traceback line\n   ```", prompt)
+
+    def test_followup_prompt_wraps_all_command_results_in_code_blocks(self) -> None:
+        args = argparse.Namespace(token_limit=None, max_steps=20, time_limit_seconds=3600)
+        command_results = [
+            {"status": "ok", "command": "list_files", "result": ["a.py", "data/"]},
+            {"status": "ok", "command": "read_file", "result": {"path": "a.py", "content": "print(1)", "truncated": False}},
+            {"status": "ok", "command": "write_file", "result": {"path": "a.py", "bytes_written": 8}},
+            {"status": "ok", "command": "edit_file", "result": {"path": "a.py", "replacements": 1}},
+            {"status": "ok", "command": "load_dataset", "result": {"path": "train.csv", "rows": 2, "columns": ["id", "target"]}},
+            {"status": "ok", "command": "show_dataset_info", "result": {"path": "train.csv", "rows": 2, "columns": ["id"], "missing_by_column": {"id": 0}}},
+            {"status": "ok", "command": "show_sample_rows", "result": [{"id": "1"}]},
+            {"status": "ok", "command": "run_python", "result": {"returncode": 0, "stdout": "ok", "stderr": ""}},
+            {"status": "ok", "command": "get_budget_status", "result": {"remaining_steps": 5}},
+            {"status": "ok", "command": "get_remaining_time", "result": {"remaining_seconds": 10.0}},
+            {"status": "ok", "command": "get_hints", "result": {"hints": []}},
+            {"status": "ok", "command": "get_trajectory", "result": [{"command": "read_file"}]},
+            {"status": "ok", "command": "submit", "result": {"metric": "mae", "value": 0.0}},
+        ]
+
+        prompt = build_followup_prompt(command_results, BenchmarkStats(), args)
+
+        for index, result in enumerate(command_results, start=1):
+            self.assertIn(f"{index}. {result['command']}: ok\n   ```text", prompt)
+        self.assertGreaterEqual(prompt.count("   ```"), len(command_results) * 2)
+
+    def test_followup_prompt_wraps_command_errors_in_code_blocks(self) -> None:
+        args = argparse.Namespace(token_limit=None, max_steps=10, time_limit_seconds=3600)
+        command_results = [
+            {
+                "status": "error",
+                "command": "read_file",
+                "error": "File does not exist:\nmissing.csv",
+            }
+        ]
+
+        prompt = build_followup_prompt(command_results, BenchmarkStats(), args)
+
+        self.assertIn("1. read_file: error", prompt)
+        self.assertIn("   ```text\n   File does not exist:\n   missing.csv\n   ```", prompt)
 
     def test_followup_prompt_warns_when_token_budget_is_low(self) -> None:
         args = argparse.Namespace(token_limit=1000, max_steps=10, time_limit_seconds=3600)

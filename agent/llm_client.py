@@ -97,7 +97,12 @@ def _is_letovo_url(url: str) -> bool:
     return url.rstrip("/").lower().startswith(LETOVO_URL.lower())
 
 
-SYSTEM_MESSAGE = """Решай ML benchmark только агентскими командами. Любой ответ без команд считается ошибкой.
+SYSTEM_MESSAGE = """Решай ML benchmark агентскими командами. Любой ответ без команд считается ошибкой.
+
+Формат ответа:
+- Сначала напиши одну короткую строку намерения: Мысль: <что собираешься сделать>.
+- Затем напиши одну или несколько агентских команд, каждую на отдельной строке.
+- Не пиши длинные рассуждения, планы или Markdown.
 
 Команды:
 list_files(path), read_file(path), write_file(path, content), edit_file(path, diff)

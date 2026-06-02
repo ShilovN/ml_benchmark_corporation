@@ -743,9 +743,10 @@ def build_initial_prompt(
     budget_line = format_budget_line(stats, args)
     return (
         f"{budget_line}\n\n"
-        "ML benchmark. Отвечай только агентскими командами, по одной на строку. "
+        "ML benchmark. В каждом ответе сначала напиши короткую строку намерения "
+        "в формате `Мысль: ...`, затем агентские команды, по одной на строку. "
         "Сначала проверь данные, затем быстро готовь submission.csv и вызови submit(\"submission.csv\"). "
-        "Не трать токены на объяснения.\n\n"
+        "Не пиши длинные рассуждения.\n\n"
         f"task_id: {task_id}\n"
         "Компактный обзор workspace. Для деталей используй read_file/load_dataset/show_sample_rows.\n\n"
         f"{file_previews}"
@@ -865,7 +866,7 @@ def build_parse_error_prompt(
         f"{format_budget_line(stats, args)}\n\n"
         "Твой прошлый ответ не распарсился как команда.\n"
         f"Ошибка парсинга: {exc}\n\n"
-        "Верни только валидные команды, по одной на строку. Без объяснений.\n\n"
+        "Верни короткую строку `Мысль: ...`, затем валидные команды, по одной на строку. Без длинных объяснений.\n\n"
         f"Прошлый ответ:\n{truncate_middle(assistant_text, 1200)}"
     )
 
@@ -878,7 +879,7 @@ def build_followup_prompt(
 ) -> str:
     prefix = (
         f"{format_budget_line(stats, args)} "
-        "Дальше верни только команды.\n\n"
+        "Дальше верни короткую строку `Мысль: ...`, затем команды.\n\n"
     )
     body = format_followup_body(command_results, stats, args, feedback)
     return prefix + truncate_middle(body, MAX_FOLLOWUP_PROMPT_CHARS - len(prefix))
@@ -918,12 +919,12 @@ def format_command_result_for_prompt(index: int, result: dict[str, Any]) -> list
     command = str(result.get("command", "unknown"))
     status = str(result.get("status", "unknown"))
     if status != "ok":
-        return [
-            f"{index}. {command}: error",
-            f"   {truncate_middle(str(result.get('error', 'unknown error')), 1200)}",
-        ]
+        lines = [f"{index}. {command}: error"]
+        lines.extend(f"   {line}" for line in fenced_text_block(str(result.get("error", "unknown error")), 1200))
+        return lines
     lines = [f"{index}. {command}: ok"]
-    lines.extend(f"   {line}" for line in format_result_payload(command, result.get("result")))
+    detail = "\n".join(format_result_payload(command, result.get("result")))
+    lines.extend(f"   {line}" for line in fenced_text_block(detail, 4000))
     return lines
 
 
@@ -995,6 +996,10 @@ def format_short_value(value: Any, limit: int) -> str:
     if isinstance(value, str):
         return truncate_middle(value, limit)
     return truncate_middle(json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str), limit)
+
+
+def fenced_text_block(value: str, limit: int) -> list[str]:
+    return ["```text", *truncate_middle(value, limit).splitlines(), "```"]
 
 
 def indent_block(text: str, prefix: str) -> list[str]:
