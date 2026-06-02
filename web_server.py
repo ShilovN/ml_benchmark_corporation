@@ -397,10 +397,35 @@ def make_handler(manager: AgentRunManager) -> type[BaseHTTPRequestHandler]:
                 self._send_json({"status": "ok", "run": run.public_dict() if run else None})
                 return
             if parsed.path.startswith("/api/runs/"):
-                run_id = parsed.path.rsplit("/", 1)[-1]
+                parts = parsed.path.strip("/").split("/")
+                run_id = parts[2] if len(parts) >= 3 else ""
                 run = manager.get_run(run_id)
                 if not run:
                     self._send_json({"status": "error", "error": "Run not found"}, HTTPStatus.NOT_FOUND)
+                    return
+                if len(parts) == 4 and parts[3] == "files":
+                    self._send_json({"status": "ok", "files": list_workspace_files(run.workspace)})
+                    return
+                if len(parts) == 5 and parts[3] == "files" and parts[4] == "view":
+                    file_path = _first_query_value(parsed.query, "path") or ""
+                    try:
+                        payload = workspace_file_preview(run.workspace, file_path)
+                    except ValueError as exc:
+                        self._send_json({"status": "error", "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                        return
+                    self._send_json({"status": "ok", "file": payload})
+                    return
+                if len(parts) == 5 and parts[3] == "files" and parts[4] == "download":
+                    file_path = _first_query_value(parsed.query, "path") or ""
+                    try:
+                        path = resolve_workspace_file(run.workspace, file_path)
+                    except ValueError as exc:
+                        self._send_json({"status": "error", "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                        return
+                    self._send_file_download(path)
+                    return
+                if len(parts) != 3:
+                    self._send_json({"status": "error", "error": "Not found"}, HTTPStatus.NOT_FOUND)
                     return
                 self._send_json({"status": "ok", "run": run.public_dict()})
                 return
@@ -465,6 +490,16 @@ def make_handler(manager: AgentRunManager) -> type[BaseHTTPRequestHandler]:
             body = html.encode("utf-8")
             self.send_response(HTTPStatus.OK.value)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _send_file_download(self, path: Path) -> None:
+            body = path.read_bytes()
+            filename = path.name.replace('"', "")
+            self.send_response(HTTPStatus.OK.value)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -901,6 +936,54 @@ def collect_file_previews(workspace: Path) -> str:
     return "\n".join(chunks) if chunks else "(no readable files)"
 
 
+def list_workspace_files(workspace: Path) -> list[dict[str, Any]]:
+    files: list[dict[str, Any]] = []
+    workspace = workspace.resolve()
+    for path in sorted(workspace.rglob("*")):
+        if not path.is_file():
+            continue
+        relative = path.resolve().relative_to(workspace)
+        stat = path.stat()
+        files.append(
+            {
+                "path": str(relative),
+                "name": path.name,
+                "size": stat.st_size,
+                "modified": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+                "previewable": path.suffix.lower() in TEXT_EXTENSIONS,
+            }
+        )
+    return files
+
+
+def workspace_file_preview(workspace: Path, file_path: str) -> dict[str, Any]:
+    path = resolve_workspace_file(workspace, file_path)
+    if path.suffix.lower() not in TEXT_EXTENSIONS:
+        raise ValueError("Preview is available only for text-like files")
+    content = path.read_text(encoding="utf-8", errors="ignore")
+    return {
+        "path": str(path.resolve().relative_to(workspace.resolve())),
+        "content": content[:MAX_FILE_PREVIEW_CHARS],
+        "truncated": len(content) > MAX_FILE_PREVIEW_CHARS,
+        "size": path.stat().st_size,
+    }
+
+
+def resolve_workspace_file(workspace: Path, file_path: str) -> Path:
+    if not file_path:
+        raise ValueError("File path is required")
+    raw_path = Path(file_path)
+    if raw_path.is_absolute():
+        raise ValueError("Absolute paths are not allowed")
+    workspace = workspace.resolve()
+    path = (workspace / raw_path).resolve()
+    if path != workspace and workspace not in path.parents:
+        raise ValueError("File path is outside workspace")
+    if not path.exists() or not path.is_file():
+        raise ValueError("File not found")
+    return path
+
+
 def extract_assistant_text(response: dict[str, Any]) -> str:
     return str(response["choices"][0]["message"]["content"])
 
@@ -1108,6 +1191,20 @@ def render_agent_page() -> str:
     .submission-source summary { cursor:pointer; font-weight:800; color:var(--text); overflow-wrap:anywhere; }
     .submission-source pre { box-sizing:border-box; width:100%; max-width:100%; min-width:0; margin:10px 0 0; background:#111827; color:#f9fafb; border-radius:6px; padding:12px; max-height:360px; overflow:auto; font-size:13px; line-height:1.45; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; }
     .message { border-radius:8px; padding:12px; background:#eef3f8; color:var(--muted); margin-top:12px; }
+    .file-panel { display:grid; gap:10px; }
+    .file-list { display:grid; gap:6px; max-height:240px; overflow:auto; padding-right:2px; }
+    .file-row { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px; align-items:center; border:1px solid var(--border); border-radius:6px; background:#f8fafc; padding:8px; }
+    .file-main { min-width:0; }
+    .file-name { color:var(--text); font-weight:800; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .file-meta { margin-top:2px; color:var(--muted); font-size:12px; }
+    .file-actions { display:flex; gap:6px; }
+    .file-actions button, .file-actions a { display:inline-flex; align-items:center; justify-content:center; min-height:28px; width:auto; padding:0 8px; border-radius:6px; font-size:12px; font-weight:800; text-decoration:none; border:1px solid var(--border); }
+    .file-actions button { color:var(--accent); background:#fff; }
+    .file-actions button:disabled { color:var(--muted); cursor:not-allowed; background:#eef3f8; }
+    .file-actions a { color:white; background:var(--accent); border-color:var(--accent); }
+    .file-preview { min-width:0; border:1px solid var(--border); border-radius:6px; background:#fff; overflow:hidden; }
+    .file-preview-head { display:flex; justify-content:space-between; gap:8px; padding:8px 10px; color:var(--muted); font-size:12px; font-weight:800; border-bottom:1px solid var(--border); }
+    .file-preview pre { box-sizing:border-box; width:100%; max-height:260px; margin:0; padding:10px; overflow:auto; background:#111827; color:#f9fafb; font-size:12px; line-height:1.45; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; }
     .error { color:var(--bad); background:#fef3f2; border:1px solid #fecdca; }
     @media (max-width:900px){ header,.layout{display:block}.row,.cards,.submit-metrics{grid-template-columns:1fr} }
   </style>
@@ -1151,6 +1248,16 @@ __MODEL_OPTIONS__
         </div>
         <div class="message" id="message">Готово к запуску. Нужен доступ к OpenAI-compatible LLM endpoint.</div>
       </section>
+      <section>
+        <h2>Workspace Files</h2>
+        <div class="file-panel">
+          <div class="file-list" id="file-list"><div class="message">Start a run to browse files.</div></div>
+          <div class="file-preview" id="file-preview">
+            <div class="file-preview-head"><span>Preview</span><span>-</span></div>
+            <pre>Select a text file to preview it.</pre>
+          </div>
+        </div>
+      </section>
     </aside>
     <div>
       <section>
@@ -1186,6 +1293,8 @@ const stop = document.getElementById('stop');
 const message = document.getElementById('message');
 const statusEl = document.getElementById('status');
 const eventsEl = document.getElementById('events');
+const fileListEl = document.getElementById('file-list');
+const filePreviewEl = document.getElementById('file-preview');
 function truncateText(value, limit=180){
   const text = cleanText(value).replace(/\\s+/g, ' ');
   return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
@@ -1794,6 +1903,8 @@ async function loadTasks(){
 }
 async function startRun(){
   start.disabled = true; stop.disabled = false; message.textContent = 'Starting run...';
+  renderFileList([]);
+  renderFilePreview(null);
   const res = await fetch('/api/runs', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({
     task_id: task.value,
     model: model.value,
@@ -1818,9 +1929,77 @@ async function poll(){
   const data = await res.json();
   if(data.status !== 'ok') return;
   render(data.run);
+  loadRunFiles();
   if(['completed','stopped','error'].includes(data.run.status)){
     clearInterval(timer); start.disabled=false; stop.disabled=true;
   }
+}
+async function loadRunFiles(){
+  if(!currentRun) {
+    renderFileList([]);
+    return;
+  }
+  const res = await fetch(`/api/runs/${currentRun}/files`);
+  const data = await res.json();
+  if(data.status !== 'ok') {
+    fileListEl.innerHTML = `<div class="message error">${esc(data.error || 'Failed to load files')}</div>`;
+    return;
+  }
+  renderFileList(data.files || []);
+}
+function renderFileList(files){
+  if(!currentRun) {
+    fileListEl.innerHTML = '<div class="message">Start a run to browse files.</div>';
+    return;
+  }
+  if(!files.length) {
+    fileListEl.innerHTML = '<div class="message">No files in workspace yet.</div>';
+    return;
+  }
+  fileListEl.innerHTML = files.map(file => {
+    const path = cleanText(file.path);
+    const viewDisabled = file.previewable ? '' : 'disabled';
+    const downloadHref = `/api/runs/${encodeURIComponent(currentRun)}/files/download?path=${encodeURIComponent(path)}`;
+    return `
+      <div class="file-row">
+        <div class="file-main">
+          <div class="file-name" title="${escAttr(path)}">${esc(path)}</div>
+          <div class="file-meta">${esc(formatBytes(file.size || 0))}</div>
+        </div>
+        <div class="file-actions">
+          <button type="button" data-file-view="${escAttr(path)}" ${viewDisabled}>View</button>
+          <a href="${escAttr(downloadHref)}">Download</a>
+        </div>
+      </div>`;
+  }).join('');
+}
+function renderFilePreview(file){
+  if(!file) {
+    filePreviewEl.innerHTML = '<div class="file-preview-head"><span>Preview</span><span>-</span></div><pre>Select a text file to preview it.</pre>';
+    return;
+  }
+  filePreviewEl.innerHTML = `
+    <div class="file-preview-head">
+      <span>${esc(file.path)}</span>
+      <span>${file.truncated ? 'truncated' : formatBytes(file.size || 0)}</span>
+    </div>
+    <pre>${esc(file.content || '')}</pre>`;
+}
+async function viewRunFile(path){
+  if(!currentRun || !path) return;
+  const res = await fetch(`/api/runs/${encodeURIComponent(currentRun)}/files/view?path=${encodeURIComponent(path)}`);
+  const data = await res.json();
+  if(data.status !== 'ok') {
+    filePreviewEl.innerHTML = `<div class="file-preview-head"><span>Preview error</span><span>-</span></div><pre>${esc(data.error || 'Failed to preview file')}</pre>`;
+    return;
+  }
+  renderFilePreview(data.file);
+}
+function formatBytes(size){
+  const value = Number(size) || 0;
+  if(value < 1024) return `${value} B`;
+  if(value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / 1024 / 1024).toFixed(1)} MB`;
 }
 function render(run){
   saveCsvScrollPositions();
@@ -1888,6 +2067,11 @@ applyTrajectoryUiState();
 }
 start.addEventListener('click', startRun);
 stop.addEventListener('click', stopRun);
+fileListEl.addEventListener('click', (event) => {
+  const button = event.target.closest('[data-file-view]');
+  if(!button) return;
+  viewRunFile(button.dataset.fileView || '');
+});
 setupCodeToggles();
 loadTasks();
 </script>
