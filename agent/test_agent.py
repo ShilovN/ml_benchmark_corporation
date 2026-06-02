@@ -161,6 +161,40 @@ class ExecutorTest(unittest.TestCase):
         self.assertIn("- команд не было", prompt)
         self.assertNotIn('"benchmark_status"', prompt)
 
+    def test_followup_prompt_wraps_python_output_in_code_blocks(self) -> None:
+        args = argparse.Namespace(token_limit=None, max_steps=10, time_limit_seconds=3600)
+        command_results = [
+            {
+                "status": "ok",
+                "command": "run_python",
+                "result": {
+                    "returncode": 1,
+                    "stdout": "printed value\nsecond line",
+                    "stderr": "Traceback line",
+                },
+            }
+        ]
+
+        prompt = build_followup_prompt(command_results, BenchmarkStats(), args)
+
+        self.assertIn("stdout:\n   ```text\n   printed value\n   second line\n   ```", prompt)
+        self.assertIn("stderr:\n   ```text\n   Traceback line\n   ```", prompt)
+
+    def test_followup_prompt_wraps_command_errors_in_code_blocks(self) -> None:
+        args = argparse.Namespace(token_limit=None, max_steps=10, time_limit_seconds=3600)
+        command_results = [
+            {
+                "status": "error",
+                "command": "read_file",
+                "error": "File does not exist:\nmissing.csv",
+            }
+        ]
+
+        prompt = build_followup_prompt(command_results, BenchmarkStats(), args)
+
+        self.assertIn("1. read_file: error", prompt)
+        self.assertIn("   ```text\n   File does not exist:\n   missing.csv\n   ```", prompt)
+
     def test_followup_prompt_warns_when_token_budget_is_low(self) -> None:
         args = argparse.Namespace(token_limit=1000, max_steps=10, time_limit_seconds=3600)
         stats = BenchmarkStats()
