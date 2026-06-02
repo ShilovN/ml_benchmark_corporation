@@ -1058,9 +1058,21 @@ def render_agent_page() -> str:
     .code-block.is-expanded .code-toggle::before { transform:rotate(180deg); }
     .code-toggle:hover { border-color:rgba(148,163,184,0.9); }
     .code-toggle:focus-visible { outline:2px solid #93c5fd; outline-offset:2px; }
+    .submit-card { display:grid; gap:12px; }
+    .submit-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+    .submit-title { font-weight:900; color:var(--text); }
+    .submit-subtitle { margin-top:3px; color:var(--muted); font-size:13px; }
+    .submit-badge { display:inline-flex; align-items:center; min-height:26px; padding:0 10px; border-radius:999px; font-size:12px; font-weight:900; text-transform:uppercase; }
+    .submit-badge.ok { color:#067647; background:#ecfdf3; border:1px solid #abefc6; }
+    .submit-badge.error { color:#b42318; background:#fef3f2; border:1px solid #fecdca; }
+    .submit-metrics { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; }
+    .submit-metric { min-width:0; border:1px solid var(--border); border-radius:8px; background:#f8fafc; padding:10px; }
+    .submit-metric span { display:block; color:var(--muted); font-size:12px; font-weight:800; margin-bottom:4px; }
+    .submit-metric strong { display:block; color:var(--text); font-size:18px; overflow-wrap:anywhere; }
+    .submit-error { border:1px solid #fecdca; border-radius:8px; background:#fef3f2; color:#b42318; padding:10px; line-height:1.45; overflow-wrap:anywhere; }
     .message { border-radius:8px; padding:12px; background:#eef3f8; color:var(--muted); margin-top:12px; }
     .error { color:var(--bad); background:#fef3f2; border:1px solid #fecdca; }
-    @media (max-width:900px){ header,.layout{display:block}.row,.cards{grid-template-columns:1fr} }
+    @media (max-width:900px){ header,.layout{display:block}.row,.cards,.submit-metrics{grid-template-columns:1fr} }
   </style>
 </head>
 <body>
@@ -1392,13 +1404,7 @@ function commandResultSummary(result){
   if(result.command === 'submit') {
     return `
       <div class="block">
-        <div class="block-title">submit result</div>
-        <div class="kv">
-          <span>Status</span><span>${esc(result.status)}</span>
-          <span>Metric</span><span>${esc(payload.metric || '-')}</span>
-          <span>Value</span><span>${esc(payload.value ?? '-')}</span>
-          <span>Rows checked</span><span>${esc(payload.rows_checked ?? '-')}</span>
-        </div>
+        ${renderSubmissionHtml(result)}
       </div>`;
   }
   return `
@@ -1436,23 +1442,29 @@ function renderFeedbackHtml(data){
 }
 function renderSubmissionHtml(submission){
   const payload = submission.result || {};
+  const status = submission.status || 'unknown';
+  const ok = status === 'ok';
+  const error = submission.error || payload.error || '';
+  const metric = payload.metric || '-';
+  const value = payload.value ?? '-';
+  const rows = payload.rows_checked ?? '-';
+  const elapsed = submission.elapsed_ms ?? '-';
   return `
-    <strong>${submission.status === 'ok' ? 'Submitted.' : 'Submission attempted.'}</strong>
-    <div class="kv" style="margin-top:10px">
-      <span>Status</span><span>${esc(submission.status || '-')}</span>
-      <span>Metric</span><span>${esc(payload.metric || '-')}</span>
-      <span>Value</span><span>${esc(payload.value ?? '-')}</span>
-      <span>Rows checked</span><span>${esc(payload.rows_checked ?? '-')}</span>
-    </div>
-    <details>
-      <summary>Details</summary>
-      <div class="kv">
-        <span>Command</span><span>${esc(submission.command || 'submit')}</span>
-        <span>Elapsed ms</span><span>${esc(submission.elapsed_ms ?? '-')}</span>
-        <span>Result status</span><span>${esc(payload.status || submission.status || '-')}</span>
-        ${payload.error ? `<span>Error</span><span>${esc(payload.error)}</span>` : ''}
+    <div class="submit-card">
+      <div class="submit-head">
+        <div>
+          <div class="submit-title">${ok ? 'Submission accepted' : 'Submission failed'}</div>
+          <div class="submit-subtitle">${esc(submission.command || 'submit')} ${elapsed !== '-' ? `completed in ${esc(elapsed)} ms` : ''}</div>
+        </div>
+        <span class="submit-badge ${ok ? 'ok' : 'error'}">${esc(status)}</span>
       </div>
-    </details>`;
+      ${error ? `<div class="submit-error">${esc(error)}</div>` : ''}
+      <div class="submit-metrics">
+        <div class="submit-metric"><span>Metric</span><strong>${esc(metric)}</strong></div>
+        <div class="submit-metric"><span>Value</span><strong>${esc(value)}</strong></div>
+        <div class="submit-metric"><span>Rows checked</span><strong>${esc(rows)}</strong></div>
+      </div>
+    </div>`;
 }
 function renderPromptHtml(text){
   const parsed = tryParseFollowupPrompt(text);
