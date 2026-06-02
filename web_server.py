@@ -690,6 +690,16 @@ def format_web_command_result(index: int, result: dict[str, Any]) -> list[str]:
 
 
 def format_web_result_payload(command: str, payload: Any) -> list[str]:
+    if command == "submit" and isinstance(payload, dict):
+        lines = [
+            f"metric={payload.get('metric', '?')}; value={payload.get('value', '?')}; "
+            f"rows_checked={payload.get('rows_checked', '?')}"
+        ]
+        source = payload.get("submission_source")
+        if isinstance(source, dict):
+            path = source.get("path") or source.get("kind") or "inline"
+            lines.append(f"submission_source={path}; truncated={source.get('truncated', False)}")
+        return lines
     if command == "read_file" and isinstance(payload, dict):
         lines = [f"path={payload.get('path', '?')}; truncated={payload.get('truncated', False)}"]
         content = str(payload.get("content", ""))
@@ -1074,6 +1084,7 @@ def render_agent_page() -> str:
     .code-block.is-expanded .code-toggle::before { transform:rotate(180deg); }
     .code-toggle:hover { border-color:rgba(148,163,184,0.9); }
     .code-toggle:focus-visible { outline:2px solid #93c5fd; outline-offset:2px; }
+    .submit-card { display:grid; gap:12px; min-width:0; max-width:100%; }
     .csv-table-wrap { box-sizing:border-box; width:100%; max-width:100%; max-height:360px; overflow:auto; border:1px solid var(--border); border-radius:8px; background:white; margin:8px 0; }
     .csv-table-inner { width:max-content; min-width:100%; }
     .csv-table { width:max-content; min-width:100%; border-collapse:collapse; font-size:13px; }
@@ -1082,7 +1093,6 @@ def render_agent_page() -> str:
     .csv-table td { color:#344054; }
     .csv-table tr:last-child td { border-bottom:0; }
     .csv-caption { display:flex; justify-content:space-between; gap:12px; padding:8px 10px; color:var(--muted); font-size:12px; font-weight:700; background:#f8fafc; border-top:1px solid var(--border); }
-    .submit-card { display:grid; gap:12px; }
     .submit-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; flex-wrap:wrap; }
     .submit-title { font-weight:900; color:var(--text); }
     .submit-subtitle { margin-top:3px; color:var(--muted); font-size:13px; }
@@ -1094,6 +1104,9 @@ def render_agent_page() -> str:
     .submit-metric span { display:block; color:var(--muted); font-size:12px; font-weight:800; margin-bottom:4px; }
     .submit-metric strong { display:block; color:var(--text); font-size:18px; overflow-wrap:anywhere; }
     .submit-error { border:1px solid #fecdca; border-radius:8px; background:#fef3f2; color:#b42318; padding:10px; line-height:1.45; overflow-wrap:anywhere; }
+    .submission-source { box-sizing:border-box; min-width:0; max-width:100%; overflow:hidden; border:1px solid var(--border); border-radius:8px; background:#fff; padding:10px 12px; }
+    .submission-source summary { cursor:pointer; font-weight:800; color:var(--text); overflow-wrap:anywhere; }
+    .submission-source pre { box-sizing:border-box; width:100%; max-width:100%; min-width:0; margin:10px 0 0; background:#111827; color:#f9fafb; border-radius:6px; padding:12px; max-height:360px; overflow:auto; font-size:13px; line-height:1.45; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; }
     .message { border-radius:8px; padding:12px; background:#eef3f8; color:var(--muted); margin-top:12px; }
     .error { color:var(--bad); background:#fef3f2; border:1px solid #fecdca; }
     @media (max-width:900px){ header,.layout{display:block}.row,.cards,.submit-metrics{grid-template-columns:1fr} }
@@ -1565,6 +1578,9 @@ function renderSubmissionHtml(submission){
   const value = payload.value ?? '-';
   const rows = payload.rows_checked ?? '-';
   const elapsed = submission.elapsed_ms ?? '-';
+  const source = payload.submission_source || null;
+  const sourcePath = source && (source.path || source.kind || 'inline');
+  const sourceCode = source && source.content ? cleanText(source.content) : '';
   return `
     <div class="submit-card">
       <div class="submit-head">
@@ -1580,6 +1596,12 @@ function renderSubmissionHtml(submission){
         <div class="submit-metric"><span>Value</span><strong>${esc(value)}</strong></div>
         <div class="submit-metric"><span>Rows checked</span><strong>${esc(rows)}</strong></div>
       </div>
+      ${sourceCode ? `
+        <details class="submission-source">
+          <summary>Код, который сформировал submission.csv</summary>
+          <div class="note-meta">Источник: <span class="inline-code">${esc(sourcePath)}</span>${source.truncated ? ' · truncated' : ''}</div>
+          <pre>${esc(sourceCode)}</pre>
+        </details>` : ''}
     </div>`;
 }
 function renderPromptHtml(text, allowCsv=false){

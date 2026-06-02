@@ -509,6 +509,80 @@ class ExecutorTest(unittest.TestCase):
         self.assertEqual(result["result"]["metric"], "mae")
         self.assertEqual(result["result"]["value"], 0.0)
 
+    def test_submit_includes_submission_source_code(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            tasks_dir = workspace / "checker" / "tasks" / "toy"
+            tasks_dir.mkdir(parents=True)
+            (tasks_dir / "task.json").write_text(
+                json.dumps(
+                    {
+                        "id": "toy",
+                        "metric": "mae",
+                        "answer_file": "answers.csv",
+                        "id_column": "id",
+                        "column": "target",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (tasks_dir / "answers.csv").write_text("id,target\n1,10\n2,20\n", encoding="utf-8")
+            executor = CommandExecutor(
+                AgentContext(workspace=workspace, task_id="toy", tasks_dir=workspace / "checker" / "tasks")
+            )
+            code = (
+                "import csv\n"
+                "with open('submission.csv', 'w', newline='') as file:\n"
+                "    writer = csv.writer(file)\n"
+                "    writer.writerow(['id', 'target'])\n"
+                "    writer.writerow([1, 10])\n"
+                "    writer.writerow([2, 20])\n"
+            )
+
+            write_result = executor.execute_text(f'write_file("solution.py", {code!r})')
+            run_result = executor.execute_text('run_python("solution.py")')
+            submit_result = executor.execute_text('submit("submission.csv")')
+
+        source = submit_result["result"]["submission_source"]
+        self.assertEqual(write_result["status"], "ok")
+        self.assertEqual(run_result["status"], "ok")
+        self.assertEqual(submit_result["status"], "ok")
+        self.assertEqual(source["path"], "solution.py")
+        self.assertEqual(source["kind"], "python_file")
+        self.assertIn("csv.writer", source["content"])
+        self.assertIn("submission.csv", source["content"])
+
+    def test_submit_source_requires_submission_file_and_csv_writer_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            tasks_dir = workspace / "checker" / "tasks" / "toy"
+            tasks_dir.mkdir(parents=True)
+            (tasks_dir / "task.json").write_text(
+                json.dumps(
+                    {
+                        "id": "toy",
+                        "metric": "mae",
+                        "answer_file": "answers.csv",
+                        "id_column": "id",
+                        "column": "target",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (tasks_dir / "answers.csv").write_text("id,target\n1,10\n2,20\n", encoding="utf-8")
+            executor = CommandExecutor(
+                AgentContext(workspace=workspace, task_id="toy", tasks_dir=workspace / "checker" / "tasks")
+            )
+            unrelated_code = "print('submission.csv exists elsewhere')\n"
+
+            executor.execute_text(f'write_file("notes.py", {unrelated_code!r})')
+            executor.execute_text('run_python("notes.py")')
+            (workspace / "submission.csv").write_text("id,target\n1,10\n2,20\n", encoding="utf-8")
+            submit_result = executor.execute_text('submit("submission.csv")')
+
+        self.assertEqual(submit_result["status"], "ok")
+        self.assertNotIn("submission_source", submit_result["result"])
+
     def test_edit_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             workspace = Path(tmp_dir)
