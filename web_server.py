@@ -277,7 +277,7 @@ class AgentRunManager:
                         state,
                         "Твой ответ не удалось распарсить как команду.\n"
                         f"Ошибка: {exc}\n"
-                        "Верни только валидную команду или несколько команд, по одной на строку.",
+                        "Верни короткую строку `Мысль: ...`, затем валидную команду или несколько команд, по одной на строку.",
                     )
                     continue
 
@@ -559,7 +559,7 @@ def baseline_prediction(rows: list[dict[str, str]], target_column: str, metric: 
 def build_initial_prompt(workspace: Path, task_id: str) -> str:
     return (
         "Ты решаешь ML benchmark task через агентские команды.\n"
-        "В одном ответе можно вернуть одну или несколько команд, по одной на строку.\n"
+        "В одном ответе сначала напиши короткую строку `Мысль: ...`, затем одну или несколько команд, по одной на строку.\n"
         "Работай как в обычной ML-задаче: осмотри данные, сделай признаки, обучи и проверь модель. "
         "Перед submit проверь, что submission.csv существует, имеет нужные колонки, правильное число строк "
         "и не содержит пустых предсказаний. Когда всё готово, вызови submit(\"submission.csv\").\n\n"
@@ -653,7 +653,7 @@ def build_followup_prompt(results: list[dict[str, Any]], feedback: dict[str, Any
     max_steps = state.config.max_steps
     remaining_steps = max(0, max_steps - used_steps)
     lines = [
-        "Продолжай решение. Верни только следующую команду или команды.",
+        "Продолжай решение. Верни короткую строку `Мысль: ...`, затем следующую команду или команды.",
         "",
         "Статус benchmark:",
         (
@@ -682,7 +682,8 @@ def format_web_command_result(index: int, result: dict[str, Any]) -> list[str]:
         lines.extend(f"   {line}" for line in fenced_web_text_block(str(result.get("error", "unknown error")), 1200))
         return lines
     lines = [f"{index}. {command}: ok"]
-    lines.extend(f"   {line}" for line in format_web_result_payload(command, result.get("result")))
+    detail = "\n".join(format_web_result_payload(command, result.get("result")))
+    lines.extend(f"   {line}" for line in fenced_web_text_block(detail, 4000))
     return lines
 
 
@@ -700,10 +701,10 @@ def format_web_result_payload(command: str, payload: Any) -> list[str]:
         stderr = str(payload.get("stderr", ""))
         if stdout:
             lines.append("stdout:")
-            lines.extend(fenced_web_text_block(stdout, 1800))
+            lines.extend(indent_web_block(short_web_text(stdout, 1800), "  "))
         if stderr:
             lines.append("stderr:")
-            lines.extend(fenced_web_text_block(stderr, 1800))
+            lines.extend(indent_web_block(short_web_text(stderr, 1800), "  "))
         return lines
     if command == "list_files" and isinstance(payload, list):
         shown = [str(item) for item in payload[:30]]
@@ -766,7 +767,7 @@ def build_emergency_submit_prompt(state: RunState) -> str:
         instruction = (
             "FINAL SUBMIT NOW.\n"
             "В workspace уже есть submission.csv. Не улучшай решение и не запускай EDA.\n"
-            "Верни только одну команду:\n"
+            "Верни короткую строку `Мысль: отправляю готовый файл`, затем одну команду:\n"
             "submit(\"submission.csv\")\n\n"
         )
     else:
@@ -774,7 +775,7 @@ def build_emergency_submit_prompt(state: RunState) -> str:
             "FINAL SUBMIT NOW.\n"
             "Нужно дать последнее лучшее решение. Не делай EDA и долгие улучшения.\n"
             "Создай submission.csv самым надежным быстрым способом и в этом же ответе вызови submit(\"submission.csv\").\n"
-            "Верни только команды.\n\n"
+            "Верни короткую строку `Мысль: завершаю решение`, затем команды.\n\n"
         )
     payload = {
         "task": task_config,
