@@ -133,8 +133,10 @@ class ExecutorTest(unittest.TestCase):
             {"status": "ok", "command": "read_file", "result": {"content": "hello"}},
         ]
         feedback = {"hints": [{"stage": "EDA", "message": "hint"}]}
+        stats = BenchmarkStats()
+        stats.requests = 2
 
-        prompt = build_followup_prompt(command_results, BenchmarkStats(), args, feedback)
+        prompt = build_followup_prompt(command_results, stats, args, feedback)
 
         self.assertIn("Результаты команд:", prompt)
         self.assertIn("1. write_file: ok", prompt)
@@ -143,6 +145,19 @@ class ExecutorTest(unittest.TestCase):
         self.assertIn("- EDA: hint", prompt)
         self.assertNotIn('"command_results"', prompt)
         self.assertNotIn('"feedback"', prompt)
+
+    def test_followup_prompt_skips_feedback_in_first_message(self) -> None:
+        args = argparse.Namespace(token_limit=None, max_steps=100, time_limit_seconds=3600)
+        command_results = [{"status": "ok", "command": "read_file", "result": {"content": "hello"}}]
+        feedback = {"hints": [{"stage": "EDA", "message": "hint"}]}
+        stats = BenchmarkStats()
+        stats.requests = 1
+
+        prompt = build_followup_prompt(command_results, stats, args, feedback)
+
+        self.assertIn("1. read_file: ok", prompt)
+        self.assertNotIn("Подсказки:", prompt)
+        self.assertNotIn("- EDA: hint", prompt)
 
     def test_followup_prompt_contains_remaining_budget(self) -> None:
         args = argparse.Namespace(token_limit=1000, max_steps=10, time_limit_seconds=3600)
@@ -264,10 +279,79 @@ class ExecutorTest(unittest.TestCase):
             result = executor.execute_text("get_hints()")
 
         messages = [hint["message"] for hint in result["result"]["hints"]]
-        self.assertTrue(any("пропус" in message for message in messages))
         self.assertTrue(any("повтор" in message for message in messages))
-        self.assertTrue(any("модель" in message for message in messages))
-        self.assertTrue(any("отправ" in message for message in messages))
+        self.assertFalse(any("пропус" in message for message in messages))
+        self.assertFalse(any("распределение целевой" in message for message in messages))
+        self.assertEqual({hint["stage"] for hint in result["result"]["hints"]}, {"EDA"})
+
+    def test_get_hints_returns_only_first_incomplete_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            task_dir = workspace / "checker" / "tasks" / "toy"
+            task_dir.mkdir(parents=True)
+            (task_dir / "task.json").write_text(
+                json.dumps(
+                    {
+                        "id": "toy",
+                        "metric": "mae",
+                        "answer_file": "answers.csv",
+                        "column": "salary",
+                        "public_files": ["train.csv", "test.csv"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (task_dir / "train.csv").write_text(
+                "id,feature,salary\n1,10,100\n2,10,120\n",
+                encoding="utf-8",
+            )
+            (task_dir / "test.csv").write_text("id,feature,salary\n3,12,130\n", encoding="utf-8")
+            engine = HintEngine(workspace=workspace, task_id="toy", tasks_dir=Path("checker/tasks"))
+
+            feedback = engine.build_feedback()
+
+        self.assertEqual({hint["stage"] for hint in feedback["hints"]}, {"EDA"})
+        self.assertTrue(any("целевая переменная" in hint["message"] for hint in feedback["hints"]))
+
+    def test_get_hints_falls_through_to_next_stage_when_previous_is_clear(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            task_dir = workspace / "checker" / "tasks" / "toy"
+            task_dir.mkdir(parents=True)
+            (task_dir / "task.json").write_text(
+                json.dumps(
+                    {
+                        "id": "toy",
+                        "metric": "mae",
+                        "answer_file": "answers.csv",
+                        "column": "salary",
+                        "public_files": ["train.csv", "test.csv"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (task_dir / "train.csv").write_text(
+                "id,feature_a,feature_b,salary\n1,10,10,100\n2,20,20,120\n",
+                encoding="utf-8",
+            )
+            (task_dir / "test.csv").write_text("id,feature_a,feature_b\n3,12,12\n", encoding="utf-8")
+            (workspace / "agent_history.txt").write_text(
+                "\n".join(
+                    [
+                        json.dumps({"command": "read_file", "args": {"path": "train.csv"}, "status": "ok"}),
+                        json.dumps({"command": "read_file", "args": {"path": "test.csv"}, "status": "ok"}),
+                        json.dumps({"command": "show_dataset_info", "args": {}, "status": "ok"}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            engine = HintEngine(workspace=workspace, task_id="toy", tasks_dir=Path("checker/tasks"))
+
+            feedback = engine.build_feedback()
+
+        self.assertEqual({hint["stage"] for hint in feedback["hints"]}, {"Feature engineering"})
+        self.assertTrue(any("дублирующих" in hint["message"] for hint in feedback["hints"]))
 
     def test_get_trajectory_reads_history_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -486,14 +570,111 @@ class HintEngineTest(unittest.TestCase):
                 "id,x,target\n1,10,100\n2,20,200\n3,30,300\n",
                 encoding="utf-8",
             )
+            (workspace / "test.csv").write_text("id,x\n4,40\n", encoding="utf-8")
             (workspace / "leaky.csv").write_text("id,target\n1,100\n", encoding="utf-8")
             (workspace / "metrics.json").write_text('{"mae": 0.1}', encoding="utf-8")
+            (workspace / "agent_history.txt").write_text(
+                "\n".join(
+                    [
+                        json.dumps({"command": "read_file", "args": {"path": "train.csv"}, "status": "ok"}),
+                        json.dumps({"command": "read_file", "args": {"path": "test.csv"}, "status": "ok"}),
+                        json.dumps({"command": "show_dataset_info", "args": {}, "status": "ok"}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
 
             feedback = HintEngine(workspace, "toy", workspace / "tasks").build_feedback()
 
         messages = [hint["message"] for hint in feedback["hints"]]
         self.assertTrue(any("утеч" in message for message in messages))
         self.assertFalse(any("валидац" in message for message in messages))
+
+    def test_build_feedback_requires_dataset_inspection_before_feature_work(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            task_dir = workspace / "tasks" / "toy"
+            task_dir.mkdir(parents=True)
+            (task_dir / "task.json").write_text(
+                json.dumps({"id": "toy", "metric": "mae", "column": "target"}),
+                encoding="utf-8",
+            )
+            (workspace / "train.csv").write_text("id,city,target\n1,msk,10\n2,spb,20\n", encoding="utf-8")
+            (workspace / "test.csv").write_text("id,city\n3,kzn\n", encoding="utf-8")
+
+            feedback = HintEngine(workspace, "toy", workspace / "tasks").build_feedback()
+
+        self.assertEqual({hint["stage"] for hint in feedback["hints"]}, {"EDA"})
+        self.assertTrue(any("сводк" in hint["message"] for hint in feedback["hints"]))
+
+    def test_build_feedback_detects_shared_preprocessing_issue_after_eda(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            task_dir = workspace / "tasks" / "toy"
+            task_dir.mkdir(parents=True)
+            (task_dir / "task.json").write_text(
+                json.dumps({"id": "toy", "metric": "mae", "column": "target"}),
+                encoding="utf-8",
+            )
+            (workspace / "train.csv").write_text(
+                "sample_id,city,target\n1,msk,10\n2,spb,20\n3,kzn,30\n",
+                encoding="utf-8",
+            )
+            (workspace / "test.csv").write_text("sample_id,city\n4,ekb\n", encoding="utf-8")
+            (workspace / "agent_history.txt").write_text(
+                "\n".join(
+                    [
+                        json.dumps({"command": "read_file", "args": {"path": "train.csv"}, "status": "ok"}),
+                        json.dumps({"command": "read_file", "args": {"path": "test.csv"}, "status": "ok"}),
+                        json.dumps({"command": "show_dataset_info", "args": {}, "status": "ok"}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            feedback = HintEngine(workspace, "toy", workspace / "tasks").build_feedback()
+
+        self.assertEqual({hint["stage"] for hint in feedback["hints"]}, {"Feature engineering"})
+        self.assertTrue(any("предобработка" in hint["message"] for hint in feedback["hints"]))
+
+    def test_build_feedback_adds_next_stage_after_three_repeats(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            task_dir = workspace / "tasks" / "toy"
+            task_dir.mkdir(parents=True)
+            (task_dir / "task.json").write_text(
+                json.dumps({"id": "toy", "metric": "mae", "column": "target"}),
+                encoding="utf-8",
+            )
+            (workspace / "train.csv").write_text(
+                "id,feature,target\n1,foo,100\n1,foo,100\n2,bar,200\n",
+                encoding="utf-8",
+            )
+            (workspace / "test.csv").write_text("id,feature\n3,baz\n", encoding="utf-8")
+            (workspace / "agent_history.txt").write_text(
+                "\n".join(
+                    [
+                        json.dumps({"command": "read_file", "args": {"path": "train.csv"}, "status": "ok"}),
+                        json.dumps({"command": "read_file", "args": {"path": "test.csv"}, "status": "ok"}),
+                        json.dumps({"command": "show_dataset_info", "args": {}, "status": "ok"}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            engine = HintEngine(workspace, "toy", workspace / "tasks")
+
+            first = engine.build_feedback()
+            second = engine.build_feedback()
+            third = engine.build_feedback()
+
+        self.assertEqual({hint["stage"] for hint in first["hints"]}, {"EDA"})
+        self.assertEqual({hint["stage"] for hint in second["hints"]}, {"EDA"})
+        self.assertEqual({hint["stage"] for hint in third["hints"]}, {"EDA", "Feature engineering"})
+        self.assertTrue(any("повторяющихся" in hint["message"] for hint in third["hints"]))
+        self.assertTrue(any("утечки" in hint["message"] or "дублирующих" in hint["message"] for hint in third["hints"]))
 
 
 class LlmClientTest(unittest.TestCase):

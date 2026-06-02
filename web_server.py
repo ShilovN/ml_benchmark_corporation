@@ -306,7 +306,8 @@ class AgentRunManager:
                     break
 
                 feedback = state.executor.build_feedback()
-                add_event(state, "feedback", "Feedback hints", feedback)
+                if state.requests > 1:
+                    add_event(state, "feedback", "Feedback hints", feedback)
                 user_message = apply_mode_instruction(state, build_followup_prompt(results, feedback, state))
 
             if state.stop_requested:
@@ -668,7 +669,7 @@ def build_followup_prompt(results: list[dict[str, Any]], feedback: dict[str, Any
             lines.extend(format_web_command_result(index, result))
     else:
         lines.append("- команд не было")
-    if feedback:
+    if feedback and state.requests > 1:
         lines.extend(["", "Подсказки:"])
         lines.extend(format_web_feedback(feedback))
     return "\n".join(lines)
