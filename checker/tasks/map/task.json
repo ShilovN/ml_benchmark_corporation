@@ -1,7 +1,7 @@
 {
   "id": "map",
   "name": "Map",
-  "metric": "f1",
+  "metric": "f1_score",
   "answer_file": "answers.csv",
   "id_column": "ID",
   "column": "target",
