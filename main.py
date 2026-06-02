@@ -908,7 +908,7 @@ def format_followup_body(
             lines.extend(format_command_result_for_prompt(index, result))
     else:
         lines.append("- команд не было")
-    if feedback:
+    if feedback and stats.requests > 1:
         lines.extend(["", "Подсказки:"])
         lines.extend(format_feedback_for_prompt(feedback))
     return "\n".join(lines)
