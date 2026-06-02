@@ -76,8 +76,8 @@ load_dataset("train.csv")
 
         self.assertEqual(extract_command_text(text), 'read_file("checker/README.md")')
 
-    def test_extract_command_after_short_thought(self) -> None:
-        text = """Мысль: Посмотрю, какие файлы есть в проекте.
+    def test_extract_command_after_short_comment(self) -> None:
+        text = """Посмотрю, какие файлы есть в проекте.
 list_files(".")"""
 
         command = parse_model_response(text)
