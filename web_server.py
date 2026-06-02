@@ -124,20 +124,22 @@ class RunState:
 
     def public_dict(self) -> dict[str, Any]:
         return {
-            "run_id": self.run_id,
-            "task_id": self.config.task_id,
-            "created_at": self.created_at,
-            "mode": self.config.mode,
-            "status": self.status,
-            "stop_reason": self.stop_reason,
-            "requests": self.requests,
-            "total_tokens": self.total_tokens,
-            "used_steps": self.executor.context.used_steps,
-            "max_steps": self.config.max_steps,
-            "submitted": self.submitted,
-            "submission_result": self.submission_result,
-            "error": self.error,
-            "events": self.events[-200:],
+        "run_id": self.run_id,
+        "task_id": self.config.task_id,
+        "model": self.config.model,
+        "created_at": self.created_at,
+        "mode": self.config.mode,
+        "workspace": str(self.workspace),
+        "status": self.status,
+        "stop_reason": self.stop_reason,
+        "requests": self.requests,
+        "total_tokens": self.total_tokens,
+        "used_steps": self.executor.context.used_steps,
+        "max_steps": self.config.max_steps,
+        "submitted": self.submitted,
+        "submission_result": self.submission_result,
+        "error": self.error,
+        "events": self.events[-200:],
         }
 
 
@@ -148,6 +150,8 @@ class AgentRunManager:
         self.run_root = resolve_path(project_root, run_root)
         self.runs: dict[str, RunState] = {}
         self.lock = threading.Lock()
+        self.history_dir = self.run_root / "history"
+        self.history_dir.mkdir(parents=True, exist_ok=True)
 
     def list_tasks(self) -> list[dict[str, Any]]:
         tasks: list[dict[str, Any]] = []
@@ -182,6 +186,9 @@ class AgentRunManager:
         state.thread = thread
         with self.lock:
             self.runs[run_id] = state
+
+        self.save_run(state)
+        
         thread.start()
         return state
 
@@ -306,8 +313,7 @@ class AgentRunManager:
                     break
 
                 feedback = state.executor.build_feedback()
-                if state.requests > 1:
-                    add_event(state, "feedback", "Feedback hints", feedback)
+                add_event(state, "feedback", "Feedback hints", feedback)
                 user_message = apply_mode_instruction(state, build_followup_prompt(results, feedback, state))
 
             if state.stop_requested:
@@ -317,13 +323,18 @@ class AgentRunManager:
             else:
                 self._force_final_submit(state)
                 state.status = "stopped"
+
             if state.stop_reason == "not_finished":
                 state.stop_reason = "finished"
+
+            self.save_run(state)
+
         except Exception as exc:
             state.status = "error"
             state.stop_reason = "error"
             state.error = str(exc)
             add_event(state, "error", "Run failed", {"error": str(exc)})
+            self.save_run(state)
 
     def _force_final_submit(self, state: RunState) -> None:
         if state.submitted:
@@ -392,44 +403,27 @@ def make_handler(manager: AgentRunManager) -> type[BaseHTTPRequestHandler]:
                         HTTPStatus.BAD_REQUEST,
                     )
                 return
+            if parsed.path == "/api/runs":
+                self._send_json({"status": "ok", "runs": manager.list_saved_runs()})
+                return
             if parsed.path == "/api/runs/latest":
                 run = manager.latest_run()
                 self._send_json({"status": "ok", "run": run.public_dict() if run else None})
                 return
             if parsed.path.startswith("/api/runs/"):
-                parts = parsed.path.strip("/").split("/")
-                run_id = parts[2] if len(parts) >= 3 else ""
+                run_id = parsed.path.rsplit("/", 1)[-1]
                 run = manager.get_run(run_id)
-                if not run:
-                    self._send_json({"status": "error", "error": "Run not found"}, HTTPStatus.NOT_FOUND)
+                if run:
+                    self._send_json({"status": "ok", "run": run.public_dict()})
                     return
-                if len(parts) == 4 and parts[3] == "files":
-                    self._send_json({"status": "ok", "files": list_workspace_files(run.workspace)})
+
+                saved_run = manager.load_saved_run(run_id)
+                if saved_run:
+                    self._send_json({"status": "ok", "run": saved_run})
                     return
-                if len(parts) == 5 and parts[3] == "files" and parts[4] == "view":
-                    file_path = _first_query_value(parsed.query, "path") or ""
-                    try:
-                        payload = workspace_file_preview(run.workspace, file_path)
-                    except ValueError as exc:
-                        self._send_json({"status": "error", "error": str(exc)}, HTTPStatus.BAD_REQUEST)
-                        return
-                    self._send_json({"status": "ok", "file": payload})
-                    return
-                if len(parts) == 5 and parts[3] == "files" and parts[4] == "download":
-                    file_path = _first_query_value(parsed.query, "path") or ""
-                    try:
-                        path = resolve_workspace_file(run.workspace, file_path)
-                    except ValueError as exc:
-                        self._send_json({"status": "error", "error": str(exc)}, HTTPStatus.BAD_REQUEST)
-                        return
-                    self._send_file_download(path)
-                    return
-                if len(parts) != 3:
-                    self._send_json({"status": "error", "error": "Not found"}, HTTPStatus.NOT_FOUND)
-                    return
-                self._send_json({"status": "ok", "run": run.public_dict()})
+
+                self._send_json({"status": "error", "error": "Run not found"}, HTTPStatus.NOT_FOUND)
                 return
-            self._send_json({"status": "error", "error": "Not found"}, HTTPStatus.NOT_FOUND)
 
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
@@ -494,18 +488,56 @@ def make_handler(manager: AgentRunManager) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             self.wfile.write(body)
 
-        def _send_file_download(self, path: Path) -> None:
-            body = path.read_bytes()
-            filename = path.name.replace('"', "")
-            self.send_response(HTTPStatus.OK.value)
-            self.send_header("Content-Type", "application/octet-stream")
-            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
         def log_message(self, format: str, *args: Any) -> None:
             print(f"{self.address_string()} - {format % args}")
+
+        def _history_path(self, run_id: str) -> Path:
+            return self.history_dir / f"{run_id}.json"
+
+
+        def save_run(self, state: RunState) -> None:
+            payload = state.public_dict()
+            path = self._history_path(state.run_id)
+            print(f"Saving run history to {path}")
+            tmp_path = path.with_suffix(".json.tmp")
+            tmp_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+            tmp_path.replace(path)
+
+
+        def load_saved_run(self, run_id: str) -> dict[str, Any] | None:
+            path = self._history_path(run_id)
+            if not path.exists():
+                return None
+            return json.loads(path.read_text(encoding="utf-8"))
+
+
+        def list_saved_runs(self) -> list[dict[str, Any]]:
+            runs: list[dict[str, Any]] = []
+            for path in sorted(self.history_dir.glob("*.json"), reverse=True):
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError:
+                    continue
+
+                submission = data.get("submission_result") or {}
+                result = submission.get("result") if isinstance(submission, dict) else {}
+                metric = result if isinstance(result, dict) else {}
+
+                runs.append({
+                    "run_id": data.get("run_id"),
+                    "created_at": data.get("created_at"),
+                    "task_id": data.get("task_id"),
+                    "model": data.get("model"),
+                    "mode": data.get("mode"),
+                    "status": data.get("status"),
+                    "stop_reason": data.get("stop_reason"),
+                    "metric": metric.get("metric"),
+                    "value": metric.get("value"),
+                })
+            return runs
 
     return AgentWebHandler
 
@@ -704,10 +736,9 @@ def build_followup_prompt(results: list[dict[str, Any]], feedback: dict[str, Any
             lines.extend(format_web_command_result(index, result))
     else:
         lines.append("- команд не было")
-    feedback_lines = format_web_feedback(feedback) if feedback and state.requests > 1 else []
-    if feedback_lines:
+    if feedback:
         lines.extend(["", "Подсказки:"])
-        lines.extend(feedback_lines)
+        lines.extend(format_web_feedback(feedback))
     return "\n".join(lines)
 
 
@@ -715,26 +746,13 @@ def format_web_command_result(index: int, result: dict[str, Any]) -> list[str]:
     command = str(result.get("command", "unknown"))
     status = str(result.get("status", "unknown"))
     if status != "ok":
-        lines = [f"{index}. {command}: error"]
-        lines.extend(f"   {line}" for line in fenced_web_text_block(str(result.get("error", "unknown error")), 1200))
-        return lines
+        return [f"{index}. {command}: error", f"   {short_web_text(str(result.get('error', 'unknown error')), 1200)}"]
     lines = [f"{index}. {command}: ok"]
-    detail = "\n".join(format_web_result_payload(command, result.get("result")))
-    lines.extend(f"   {line}" for line in fenced_web_text_block(detail, 4000))
+    lines.extend(f"   {line}" for line in format_web_result_payload(command, result.get("result")))
     return lines
 
 
 def format_web_result_payload(command: str, payload: Any) -> list[str]:
-    if command == "submit" and isinstance(payload, dict):
-        lines = [
-            f"metric={payload.get('metric', '?')}; value={payload.get('value', '?')}; "
-            f"rows_checked={payload.get('rows_checked', '?')}"
-        ]
-        source = payload.get("submission_source")
-        if isinstance(source, dict):
-            path = source.get("path") or source.get("kind") or "inline"
-            lines.append(f"submission_source={path}; truncated={source.get('truncated', False)}")
-        return lines
     if command == "read_file" and isinstance(payload, dict):
         lines = [f"path={payload.get('path', '?')}; truncated={payload.get('truncated', False)}"]
         content = str(payload.get("content", ""))
@@ -765,19 +783,13 @@ def format_web_result_payload(command: str, payload: Any) -> list[str]:
 def format_web_feedback(feedback: dict[str, Any]) -> list[str]:
     hints = feedback.get("hints")
     if not isinstance(hints, list) or not hints:
-        return []
+        return [f"- {short_web_json(feedback, 1500)}"]
     lines: list[str] = []
     for hint in hints[:8]:
         if isinstance(hint, dict):
-            message = str(hint.get("message") or "").strip()
-            if not message:
-                continue
-            stage = str(hint.get("stage") or "hint").strip()
-            lines.append(f"- {stage}: {message}")
+            lines.append(f"- {hint.get('stage', 'hint')}: {hint.get('message', '')}")
         else:
-            text = str(hint).strip()
-            if text:
-                lines.append(f"- {text}")
+            lines.append(f"- {hint}")
     if len(hints) > 8:
         lines.append(f"- ... (+{len(hints) - 8} more hints)")
     return lines
@@ -785,10 +797,6 @@ def format_web_feedback(feedback: dict[str, Any]) -> list[str]:
 
 def short_web_json(value: Any, limit: int) -> str:
     return short_web_text(json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str), limit)
-
-
-def fenced_web_text_block(value: str, limit: int) -> list[str]:
-    return ["```text", *short_web_text(value, limit).splitlines(), "```"]
 
 
 def short_web_text(value: str, limit: int) -> str:
@@ -936,54 +944,6 @@ def collect_file_previews(workspace: Path) -> str:
     return "\n".join(chunks) if chunks else "(no readable files)"
 
 
-def list_workspace_files(workspace: Path) -> list[dict[str, Any]]:
-    files: list[dict[str, Any]] = []
-    workspace = workspace.resolve()
-    for path in sorted(workspace.rglob("*")):
-        if not path.is_file():
-            continue
-        relative = path.resolve().relative_to(workspace)
-        stat = path.stat()
-        files.append(
-            {
-                "path": str(relative),
-                "name": path.name,
-                "size": stat.st_size,
-                "modified": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
-                "previewable": path.suffix.lower() in TEXT_EXTENSIONS,
-            }
-        )
-    return files
-
-
-def workspace_file_preview(workspace: Path, file_path: str) -> dict[str, Any]:
-    path = resolve_workspace_file(workspace, file_path)
-    if path.suffix.lower() not in TEXT_EXTENSIONS:
-        raise ValueError("Preview is available only for text-like files")
-    content = path.read_text(encoding="utf-8", errors="ignore")
-    return {
-        "path": str(path.resolve().relative_to(workspace.resolve())),
-        "content": content[:MAX_FILE_PREVIEW_CHARS],
-        "truncated": len(content) > MAX_FILE_PREVIEW_CHARS,
-        "size": path.stat().st_size,
-    }
-
-
-def resolve_workspace_file(workspace: Path, file_path: str) -> Path:
-    if not file_path:
-        raise ValueError("File path is required")
-    raw_path = Path(file_path)
-    if raw_path.is_absolute():
-        raise ValueError("Absolute paths are not allowed")
-    workspace = workspace.resolve()
-    path = (workspace / raw_path).resolve()
-    if path != workspace and workspace not in path.parents:
-        raise ValueError("File path is outside workspace")
-    if not path.exists() or not path.is_file():
-        raise ValueError("File not found")
-    return path
-
-
 def extract_assistant_text(response: dict[str, Any]) -> str:
     return str(response["choices"][0]["message"]["content"])
 
@@ -1102,13 +1062,13 @@ def render_agent_page() -> str:
   <style>
     :root { --bg:#f5f7fa; --surface:#fff; --border:#d8e0ea; --text:#152033; --muted:#667085; --accent:#155eef; --ok:#067647; --bad:#b42318; }
     body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:var(--bg); color:var(--text); }
-    main { max-width:1480px; margin:0 auto; padding:28px 20px 44px; overflow-x:hidden; }
+    main { max-width:1240px; margin:0 auto; padding:28px 20px 44px; overflow-x:hidden; }
     header { display:flex; justify-content:space-between; gap:18px; align-items:flex-start; margin-bottom:20px; }
     h1 { margin:0 0 8px; font-size:30px; line-height:1.15; }
     h2 { margin:0 0 14px; font-size:18px; }
     p { margin:0; color:var(--muted); }
     section { min-width:0; background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:18px; margin-bottom:16px; }
-    .layout { display:grid; grid-template-columns:320px minmax(0,1fr); gap:18px; align-items:start; }
+    .layout { display:grid; grid-template-columns:360px minmax(0,1fr); gap:18px; align-items:start; }
     .layout > * { min-width:0; }
     label { display:block; margin:0 0 7px; font-weight:700; }
     input, select, button { box-sizing:border-box; width:100%; min-height:40px; font:inherit; }
@@ -1122,26 +1082,25 @@ def render_agent_page() -> str:
     .cards { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; }
     .card { border:1px solid var(--border); border-radius:8px; padding:12px; background:#f8fafc; }
     .card strong { display:block; font-size:22px; margin-top:4px; }
-    .events { display:grid; gap:12px; min-width:0; max-width:100%; max-height:72vh; overflow-y:auto; overflow-x:hidden; padding-right:4px; }
+    .events { display:grid; gap:12px; min-width:0; max-height:72vh; overflow:auto; padding-right:4px; }
     .event { min-width:0; max-width:100%; overflow:hidden; }
-    .turn { min-width:0; max-width:100%; overflow:hidden; }
-    .chat-event { display:grid; gap:6px; min-width:0; max-width:100%; overflow:hidden; }
-    .chat-row { display:flex; gap:10px; align-items:flex-start; min-width:0; max-width:100%; }
+    .chat-event { display:grid; gap:6px; }
+    .chat-row { display:flex; gap:10px; align-items:flex-start; }
     .chat-row.user { flex-direction:row-reverse; }
     .chat-avatar { flex:0 0 auto; width:34px; height:34px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-weight:800; font-size:12px; color:#fff; background:var(--accent); }
     .chat-row.user .chat-avatar { background:#0f766e; }
     .chat-meta { display:flex; justify-content:space-between; gap:12px; color:var(--muted); font-size:12px; margin:0 4px; }
     .chat-row.user .chat-meta { flex-direction:row-reverse; }
-    .bubble { box-sizing:border-box; flex:0 1 auto; width:fit-content; min-width:0; max-width:min(100%, 980px); overflow:hidden; border:1px solid var(--border); border-radius:14px; padding:12px 14px; background:#f8fafc; }
+    .bubble { min-width:0; max-width:min(100%, 920px); border:1px solid var(--border); border-radius:14px; padding:12px 14px; background:#f8fafc; }
     .chat-row.user .bubble { background:#effdf7; border-color:#c8e7da; }
     .chat-title { font-weight:800; margin-bottom:8px; color:var(--text); }
-    .chat-body { box-sizing:border-box; width:100%; max-width:100%; min-width:0; white-space:pre-wrap; line-height:1.5; background:transparent; border:0; padding:0; margin:0; max-height:none; overflow:visible; }
+    .chat-body { width:100%; min-width:0; white-space:pre-wrap; line-height:1.5; background:transparent; border:0; padding:0; margin:0; max-height:none; overflow:visible; }
     .chat-body.structured { white-space:normal; }
     .chat-body .code-block { max-height:calc(1.45em * 5 + 24px); overflow:hidden; white-space:pre-wrap; word-break:break-word; }
     .chat-body .code-block pre { line-height:1.45; }
     .chat-body .block { margin:10px 0; }
     .chat-body pre { max-height:none; white-space:pre-wrap; word-break:break-word; }
-    .chat-tail { box-sizing:border-box; display:flex; justify-content:space-between; gap:10px; min-width:0; max-width:100%; color:var(--muted); font-size:12px; padding:0 44px; }
+    .chat-tail { display:flex; justify-content:space-between; gap:10px; color:var(--muted); font-size:12px; margin:0 44px; }
     .event.command, .event.result, .event.feedback, .event.system, .event.error, .event.parse_error { border:1px solid var(--border); border-radius:10px; padding:10px 12px; background:white; }
     .event.command { border-left:4px solid #c2410c; }
     .event.result { border-left:4px solid #067647; }
@@ -1167,46 +1126,9 @@ def render_agent_page() -> str:
     .code-block.is-expanded .code-toggle::before { transform:rotate(180deg); }
     .code-toggle:hover { border-color:rgba(148,163,184,0.9); }
     .code-toggle:focus-visible { outline:2px solid #93c5fd; outline-offset:2px; }
-    .submit-card { display:grid; gap:12px; min-width:0; max-width:100%; }
-    .csv-table-wrap { box-sizing:border-box; width:100%; max-width:100%; max-height:360px; overflow:auto; border:1px solid var(--border); border-radius:8px; background:white; margin:8px 0; }
-    .csv-table-inner { width:max-content; min-width:100%; }
-    .csv-table { width:max-content; min-width:100%; border-collapse:collapse; font-size:13px; }
-    .csv-table th, .csv-table td { max-width:240px; padding:7px 9px; border-bottom:1px solid var(--border); border-right:1px solid var(--border); text-align:left; vertical-align:top; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .csv-table th { position:sticky; top:0; background:#eef3f8; color:var(--text); font-weight:900; z-index:1; }
-    .csv-table td { color:#344054; }
-    .csv-table tr:last-child td { border-bottom:0; }
-    .csv-caption { display:flex; justify-content:space-between; gap:12px; padding:8px 10px; color:var(--muted); font-size:12px; font-weight:700; background:#f8fafc; border-top:1px solid var(--border); }
-    .submit-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; flex-wrap:wrap; }
-    .submit-title { font-weight:900; color:var(--text); }
-    .submit-subtitle { margin-top:3px; color:var(--muted); font-size:13px; }
-    .submit-badge { display:inline-flex; align-items:center; min-height:26px; padding:0 10px; border-radius:999px; font-size:12px; font-weight:900; text-transform:uppercase; }
-    .submit-badge.ok { color:#067647; background:#ecfdf3; border:1px solid #abefc6; }
-    .submit-badge.error { color:#b42318; background:#fef3f2; border:1px solid #fecdca; }
-    .submit-metrics { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; }
-    .submit-metric { min-width:0; border:1px solid var(--border); border-radius:8px; background:#f8fafc; padding:10px; }
-    .submit-metric span { display:block; color:var(--muted); font-size:12px; font-weight:800; margin-bottom:4px; }
-    .submit-metric strong { display:block; color:var(--text); font-size:18px; overflow-wrap:anywhere; }
-    .submit-error { border:1px solid #fecdca; border-radius:8px; background:#fef3f2; color:#b42318; padding:10px; line-height:1.45; overflow-wrap:anywhere; }
-    .submission-source { box-sizing:border-box; min-width:0; max-width:100%; overflow:hidden; border:1px solid var(--border); border-radius:8px; background:#fff; padding:10px 12px; }
-    .submission-source summary { cursor:pointer; font-weight:800; color:var(--text); overflow-wrap:anywhere; }
-    .submission-source pre { box-sizing:border-box; width:100%; max-width:100%; min-width:0; margin:10px 0 0; background:#111827; color:#f9fafb; border-radius:6px; padding:12px; max-height:360px; overflow:auto; font-size:13px; line-height:1.45; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; }
     .message { border-radius:8px; padding:12px; background:#eef3f8; color:var(--muted); margin-top:12px; }
-    .file-panel { display:grid; gap:10px; }
-    .file-list { display:grid; gap:6px; max-height:240px; overflow:auto; padding-right:2px; }
-    .file-row { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px; align-items:center; border:1px solid var(--border); border-radius:6px; background:#f8fafc; padding:8px; }
-    .file-main { min-width:0; }
-    .file-name { color:var(--text); font-weight:800; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .file-meta { margin-top:2px; color:var(--muted); font-size:12px; }
-    .file-actions { display:flex; gap:6px; }
-    .file-actions button, .file-actions a { display:inline-flex; align-items:center; justify-content:center; min-height:28px; width:auto; padding:0 8px; border-radius:6px; font-size:12px; font-weight:800; text-decoration:none; border:1px solid var(--border); }
-    .file-actions button { color:var(--accent); background:#fff; }
-    .file-actions button:disabled { color:var(--muted); cursor:not-allowed; background:#eef3f8; }
-    .file-actions a { color:white; background:var(--accent); border-color:var(--accent); }
-    .file-preview { min-width:0; border:1px solid var(--border); border-radius:6px; background:#fff; overflow:hidden; }
-    .file-preview-head { display:flex; justify-content:space-between; gap:8px; padding:8px 10px; color:var(--muted); font-size:12px; font-weight:800; border-bottom:1px solid var(--border); }
-    .file-preview pre { box-sizing:border-box; width:100%; max-height:260px; margin:0; padding:10px; overflow:auto; background:#111827; color:#f9fafb; font-size:12px; line-height:1.45; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; }
     .error { color:var(--bad); background:#fef3f2; border:1px solid #fecdca; }
-    @media (max-width:900px){ header,.layout{display:block}.row,.cards,.submit-metrics{grid-template-columns:1fr} }
+    @media (max-width:900px){ header,.layout{display:block}.row,.cards{grid-template-columns:1fr} }
   </style>
 </head>
 <body>
@@ -1248,16 +1170,6 @@ __MODEL_OPTIONS__
         </div>
         <div class="message" id="message">Готово к запуску. Нужен доступ к OpenAI-compatible LLM endpoint.</div>
       </section>
-      <section>
-        <h2>Workspace Files</h2>
-        <div class="file-panel">
-          <div class="file-list" id="file-list"><div class="message">Start a run to browse files.</div></div>
-          <div class="file-preview" id="file-preview">
-            <div class="file-preview-head"><span>Preview</span><span>-</span></div>
-            <pre>Select a text file to preview it.</pre>
-          </div>
-        </div>
-      </section>
     </aside>
     <div>
       <section>
@@ -1280,9 +1192,6 @@ __MODEL_OPTIONS__
 <script>
 let currentRun = null;
 let timer = null;
-const csvScrollPositions = new Map();
-const expandedCodeBlocks = new Set();
-const openDetails = new Set();
 const task = document.getElementById('task');
 const model = document.getElementById('model');
 const mode = document.getElementById('mode');
@@ -1293,19 +1202,12 @@ const stop = document.getElementById('stop');
 const message = document.getElementById('message');
 const statusEl = document.getElementById('status');
 const eventsEl = document.getElementById('events');
-const fileListEl = document.getElementById('file-list');
-const filePreviewEl = document.getElementById('file-preview');
 function truncateText(value, limit=180){
   const text = cleanText(value).replace(/\\s+/g, ' ');
   return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
 }
 function esc(v){return String(v).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');}
-function escAttr(v){return esc(v).replaceAll('"','&quot;').replaceAll("'","&#39;");}
 function cleanText(value){return String(value ?? '').trim();}
-function isPlainObject(value){return value !== null && typeof value === 'object' && !Array.isArray(value);}
-function safeTextBlock(value){
-  return `<div class="chat-body structured"><pre>${esc(cleanText(value) || 'Empty message.')}</pre></div>`;
-}
 function isLikelyJsonChunk(text){
   const trimmed = cleanText(text);
   if(!trimmed) return false;
@@ -1439,10 +1341,8 @@ function renderMarkdownLine(line){
   }
   return `<div class="md-paragraph">${renderInlineMarkup(trimmed)}</div>`;
 }
-function renderMarkdownish(text, options = {}){
-  const shouldStrip = options.strip !== false;
-  const allowCsv = options.csv === true;
-  text = shouldStrip ? stripContentFromText(text) : cleanText(text);
+function renderMarkdownish(text){
+  text = stripContentFromText(text);
   if(!text) return '<div class="md-paragraph">Empty message.</div>';
   const parts = [];
   const fence = /```(?:([a-zA-Z0-9_-]+)\n)?([\s\S]*?)```/g;
@@ -1450,79 +1350,12 @@ function renderMarkdownish(text, options = {}){
   for(const match of text.matchAll(fence)){
     const before = text.slice(last, match.index);
     parts.push(before.split('\n').map(renderMarkdownLine).join(''));
-    const langName = cleanText(match[1] || '');
-    const blockText = match[2].replace(/\n$/, '');
-    if(allowCsv && (langName.toLowerCase() === 'csv' || isLikelyCsv(blockText))) {
-      parts.push(renderCsvTable(blockText));
-    } else {
-      const lang = langName ? `<div class="code-lang">${esc(langName)}</div>` : '';
-      parts.push(`<div class="code-block collapsible">${lang}<button type="button" class="code-toggle" aria-label="Expand code"></button><pre>${esc(blockText)}</pre></div>`);
-    }
+    const lang = match[1] ? `<div class="code-lang">${esc(match[1])}</div>` : '';
+    parts.push(`<div class="code-block collapsible">${lang}<button type="button" class="code-toggle" aria-label="Expand code"></button><pre>${esc(match[2].replace(/\n$/, ''))}</pre></div>`);
     last = match.index + match[0].length;
   }
   parts.push(text.slice(last).split('\n').map(renderMarkdownLine).join(''));
   return parts.join('');
-}
-function parseCsvLine(line){
-  const cells = [];
-  let current = '';
-  let quoted = false;
-  for(let i = 0; i < line.length; i++){
-    const ch = line[i];
-    const next = line[i + 1];
-    if(ch === '"'){
-      if(quoted && next === '"'){
-        current += '"';
-        i++;
-      } else {
-        quoted = !quoted;
-      }
-      continue;
-    }
-    if(ch === ',' && !quoted){
-      cells.push(current);
-      current = '';
-      continue;
-    }
-    current += ch;
-  }
-  cells.push(current);
-  return cells.map(cell => cell.trim());
-}
-function isLikelyCsv(text){
-  text = cleanText(text);
-  if(!text || !text.includes(',')) return false;
-  const lines = text.split('\n').map(line => line.trim()).filter(Boolean);
-  if(lines.length < 2 || lines.length > 300) return false;
-  const first = parseCsvLine(lines[0]);
-  if(first.length < 2 || first.length > 40) return false;
-  const comparable = lines.slice(1, Math.min(lines.length, 6)).map(parseCsvLine);
-  const matching = comparable.filter(row => Math.abs(row.length - first.length) <= 1).length;
-  return matching >= Math.min(2, comparable.length);
-}
-function renderCsvTable(text){
-  const lines = cleanText(text).split('\n').filter(line => line.trim());
-  if(lines.length < 2) return `<div class="code-block">${esc(cleanText(text))}</div>`;
-  const header = parseCsvLine(lines[0]);
-  const rows = lines.slice(1, 13).map(parseCsvLine);
-  const totalRows = Math.max(0, lines.length - 1);
-  const shownCols = header.slice(0, 12);
-  const hiddenCols = Math.max(0, header.length - shownCols.length);
-  return `
-    <div class="csv-table-wrap">
-      <div class="csv-table-inner">
-        <table class="csv-table">
-          <thead><tr>${shownCols.map(cell => `<th>${esc(cell || '-')}</th>`).join('')}${hiddenCols ? '<th>...</th>' : ''}</tr></thead>
-          <tbody>
-            ${rows.map(row => `<tr>${shownCols.map((_, index) => `<td title="${escAttr(row[index] ?? '')}">${esc(row[index] ?? '')}</td>`).join('')}${hiddenCols ? `<td>+${hiddenCols} cols</td>` : ''}</tr>`).join('')}
-          </tbody>
-        </table>
-        <div class="csv-caption">
-          <span>${esc(totalRows)} row${totalRows === 1 ? '' : 's'}</span>
-          <span>${esc(header.length)} column${header.length === 1 ? '' : 's'}${totalRows > rows.length ? `, showing ${rows.length}` : ''}</span>
-        </div>
-      </div>
-    </div>`;
 }
 function setupCodeToggles(){
   document.addEventListener('click', (event) => {
@@ -1531,18 +1364,8 @@ function setupCodeToggles(){
     const block = button.closest('.code-block');
     if(!block) return;
     block.classList.toggle('is-expanded');
-    if(block.dataset.uiKey) {
-      if(block.classList.contains('is-expanded')) expandedCodeBlocks.add(block.dataset.uiKey);
-      else expandedCodeBlocks.delete(block.dataset.uiKey);
-    }
     button.setAttribute('aria-label', block.classList.contains('is-expanded') ? 'Collapse code' : 'Expand code');
   });
-  document.addEventListener('toggle', (event) => {
-    const details = event.target.closest('details');
-    if(!details || !details.dataset.uiKey) return;
-    if(details.open) openDetails.add(details.dataset.uiKey);
-    else openDetails.delete(details.dataset.uiKey);
-  }, true);
 }
 function renderJsonScalar(value){
   if(value === null || value === undefined) return '<span class="json-muted">-</span>';
@@ -1600,11 +1423,6 @@ function renderValue(value){
   if(isProbablyCode(value)) return `<div class="code-block">${esc(cleanText(value))}</div>`;
   return renderJsonSummary(value);
 }
-function renderTextPreview(value){
-  const text = cleanText(value);
-  if(!text) return '<span class="json-muted">-</span>';
-  return `<pre>${esc(text)}</pre>`;
-}
 function renderCommandCall(name, args){
   const argValues = Object.entries(args || {}).map(([key, value]) => {
     if(typeof value === 'string') {
@@ -1635,14 +1453,20 @@ function commandResultSummary(result){
     return `
       <div class="block">
         <div class="block-title">run_python finished with code ${esc(payload.returncode ?? 'unknown')}</div>
-        ${payload.stdout ? `<div class="block-title">stdout</div>${renderTextPreview(payload.stdout)}` : ''}
-        ${payload.stderr ? `<div class="block-title">stderr</div>${renderTextPreview(payload.stderr)}` : ''}
+        ${payload.stdout ? `<div class="block-title">stdout</div><pre>${esc(payload.stdout)}</pre>` : ''}
+        ${payload.stderr ? `<div class="block-title">stderr</div><pre>${esc(payload.stderr)}</pre>` : ''}
       </div>`;
   }
   if(result.command === 'submit') {
     return `
       <div class="block">
-        ${renderSubmissionHtml(result)}
+        <div class="block-title">submit result</div>
+        <div class="kv">
+          <span>Status</span><span>${esc(result.status)}</span>
+          <span>Metric</span><span>${esc(payload.metric || '-')}</span>
+          <span>Value</span><span>${esc(payload.value ?? '-')}</span>
+          <span>Rows checked</span><span>${esc(payload.rows_checked ?? '-')}</span>
+        </div>
       </div>`;
   }
   return `
@@ -1680,50 +1504,27 @@ function renderFeedbackHtml(data){
 }
 function renderSubmissionHtml(submission){
   const payload = submission.result || {};
-  const status = submission.status || 'unknown';
-  const ok = status === 'ok';
-  const error = submission.error || payload.error || '';
-  const metric = payload.metric || '-';
-  const value = payload.value ?? '-';
-  const rows = payload.rows_checked ?? '-';
-  const elapsed = submission.elapsed_ms ?? '-';
-  const source = payload.submission_source || null;
-  const sourcePath = source && (source.path || source.kind || 'inline');
-  const sourceCode = source && source.content ? cleanText(source.content) : '';
   return `
-    <div class="submit-card">
-      <div class="submit-head">
-        <div>
-          <div class="submit-title">${ok ? 'Submission accepted' : 'Submission failed'}</div>
-          <div class="submit-subtitle">${esc(submission.command || 'submit')} ${elapsed !== '-' ? `completed in ${esc(elapsed)} ms` : ''}</div>
-        </div>
-        <span class="submit-badge ${ok ? 'ok' : 'error'}">${esc(status)}</span>
+    <strong>${submission.status === 'ok' ? 'Submitted.' : 'Submission attempted.'}</strong>
+    <div class="kv" style="margin-top:10px">
+      <span>Status</span><span>${esc(submission.status || '-')}</span>
+      <span>Metric</span><span>${esc(payload.metric || '-')}</span>
+      <span>Value</span><span>${esc(payload.value ?? '-')}</span>
+      <span>Rows checked</span><span>${esc(payload.rows_checked ?? '-')}</span>
+    </div>
+    <details>
+      <summary>Details</summary>
+      <div class="kv">
+        <span>Command</span><span>${esc(submission.command || 'submit')}</span>
+        <span>Elapsed ms</span><span>${esc(submission.elapsed_ms ?? '-')}</span>
+        <span>Result status</span><span>${esc(payload.status || submission.status || '-')}</span>
+        ${payload.error ? `<span>Error</span><span>${esc(payload.error)}</span>` : ''}
       </div>
-      ${error ? `<div class="submit-error">${esc(error)}</div>` : ''}
-      <div class="submit-metrics">
-        <div class="submit-metric"><span>Metric</span><strong>${esc(metric)}</strong></div>
-        <div class="submit-metric"><span>Value</span><strong>${esc(value)}</strong></div>
-        <div class="submit-metric"><span>Rows checked</span><strong>${esc(rows)}</strong></div>
-      </div>
-      ${sourceCode ? `
-        <details class="submission-source">
-          <summary>Код, который сформировал submission.csv</summary>
-          <div class="note-meta">Источник: <span class="inline-code">${esc(sourcePath)}</span>${source.truncated ? ' · truncated' : ''}</div>
-          <pre>${esc(sourceCode)}</pre>
-        </details>` : ''}
-    </div>`;
+    </details>`;
 }
-function renderPromptHtml(text, allowCsv=false){
-  const fullText = cleanText(text);
-  try {
-    return `<div class="chat-body structured">${renderMarkdownish(fullText, {strip:false, csv:allowCsv})}</div>`;
-  } catch {
-    return safeTextBlock(fullText);
-  }
-}
-function validHints(hints){
-  if(!Array.isArray(hints)) return [];
-  return hints.filter(h => h && typeof h === 'object' && cleanText(h.message));
+function renderPromptHtml(text){
+  const parsed = tryParseFollowupPrompt(text);
+  return `<div class="chat-body structured">${renderMarkdownish(parsed ? parsed.intro : text)}</div>`;
 }
 function renderCommandNote(event){
   const name = cleanText(event.title || event.data?.command || '');
@@ -1741,7 +1542,7 @@ function renderCommandNote(event){
     else details.push('<div class="note-meta">Код не передан.</div>');
   } else {
     if(path) details.push(`<div class="note-meta">Путь: <span class="inline-code">${esc(path)}</span></div>`);
-    if(content) details.push(`<div class="note-meta">Содержимое</div>${renderTextPreview(content)}`);
+    if(content) details.push(`<div class="note-meta">Содержимое</div><pre>${esc(content)}</pre>`);
     if(!path && !content) details.push('<div class="note-meta">Без дополнительных данных.</div>');
   }
   return `
@@ -1771,7 +1572,7 @@ function eventMainText(event){
 }
 function eventBodyHtml(event){
   const data = event.data || {};
-  if(event.kind === 'prompt') return renderPromptHtml(data.content || '', false);
+  if(event.kind === 'prompt') return renderPromptHtml(data.content || '');
   if(event.kind === 'llm') return `<div class="chat-body structured">${renderMarkdownish(data.content || '')}</div>`;
   if(event.kind === 'result') {
     if(data.command === 'submit') return renderSubmissionHtml(data);
@@ -1806,79 +1607,6 @@ function renderTechEvent(event, index){
       ${summary ? `<div class="event-preview">${esc(summary)}</div>` : ''}
     </div>`;
 }
-function renderTurn(turn, index){
-  try {
-    const promptText = turn.prompt?.data?.content || '';
-    const llmText = turn.llm?.data?.content || '';
-    const prompt = turn.prompt ? renderChatEvent(
-      'prompt',
-      'You',
-      `${renderPromptHtml(promptText, index === 0)}${validHints(turn.hints).length ? `<div class="turn-hint-label">Подсказки к вашему сообщению</div><ul class="turn-hints">${validHints(turn.hints).map(h => `<li><strong>${esc(h.stage || 'hint')}</strong>: ${esc(h.message)}</li>`).join('')}</ul>` : ''}`,
-      new Date(turn.prompt.time).toLocaleTimeString(),
-      'user'
-    ) : '';
-    const llm = turn.llm ? `
-      <div class="event chat-event llm assistant">
-        <div class="chat-row assistant">
-          <div class="chat-avatar">LLM</div>
-          <div class="bubble">
-            <div class="chat-title">LLM</div>
-            <div class="chat-body structured">${renderMarkdownish(llmText)}</div>
-            ${turn.notes.length ? `<div class="command-notes">${turn.notes.join('')}</div>` : ''}
-          </div>
-        </div>
-        <div class="chat-tail">
-          <span>LLM response</span>
-          <span>${esc(new Date(turn.llm.time).toLocaleTimeString())}</span>
-        </div>
-      </div>` : '';
-    return `<div class="turn" data-turn-index="${index}">${prompt}${llm}</div>`;
-  } catch (error) {
-    const promptText = turn.prompt?.data?.content || '';
-    const llmText = turn.llm?.data?.content || '';
-    return `
-      <div class="turn" data-turn-index="${index}">
-        ${turn.prompt ? renderChatEvent('prompt', 'You', safeTextBlock(promptText), new Date(turn.prompt.time).toLocaleTimeString(), 'user') : ''}
-        ${turn.llm ? renderChatEvent('llm', 'LLM', safeTextBlock(llmText), new Date(turn.llm.time).toLocaleTimeString(), 'assistant') : ''}
-        <div class="event error"><div class="event-title">Render fallback</div><div class="event-preview">${esc(error.message || String(error))}</div></div>
-      </div>`;
-  }
-}
-function saveCsvScrollPositions(){
-  eventsEl.querySelectorAll('.turn').forEach((turn, turnIndex) => {
-    turn.querySelectorAll('.csv-table-wrap').forEach((table, index) => {
-      const key = table.dataset.uiKey || `turn-${turnIndex}-csv-${index}`;
-      csvScrollPositions.set(key, {left: table.scrollLeft, top: table.scrollTop});
-    });
-  });
-}
-function applyTrajectoryUiState(){
-  eventsEl.querySelectorAll('.turn').forEach((turn, turnIndex) => {
-    turn.querySelectorAll('.code-block').forEach((block, index) => {
-      const key = `turn-${turnIndex}-code-${index}`;
-      block.dataset.uiKey = key;
-      if(expandedCodeBlocks.has(key)) {
-        block.classList.add('is-expanded');
-        const button = block.querySelector('.code-toggle');
-        if(button) button.setAttribute('aria-label', 'Collapse code');
-      }
-    });
-    turn.querySelectorAll('.csv-table-wrap').forEach((table, index) => {
-      const key = `turn-${turnIndex}-csv-${index}`;
-      table.dataset.uiKey = key;
-      const position = csvScrollPositions.get(key);
-      if(position) {
-        table.scrollLeft = position.left;
-        table.scrollTop = position.top;
-      }
-    });
-    turn.querySelectorAll('details').forEach((details, index) => {
-      const key = `turn-${turnIndex}-details-${index}`;
-      details.dataset.uiKey = key;
-      if(openDetails.has(key)) details.open = true;
-    });
-  });
-}
 function eventPreviewHtml(event){
   const text = truncateText(eventMainText(event));
   return text ? `<div class="event-preview">${esc(text)}</div>` : '';
@@ -1903,8 +1631,6 @@ async function loadTasks(){
 }
 async function startRun(){
   start.disabled = true; stop.disabled = false; message.textContent = 'Starting run...';
-  renderFileList([]);
-  renderFilePreview(null);
   const res = await fetch('/api/runs', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({
     task_id: task.value,
     model: model.value,
@@ -1929,80 +1655,11 @@ async function poll(){
   const data = await res.json();
   if(data.status !== 'ok') return;
   render(data.run);
-  loadRunFiles();
   if(['completed','stopped','error'].includes(data.run.status)){
     clearInterval(timer); start.disabled=false; stop.disabled=true;
   }
 }
-async function loadRunFiles(){
-  if(!currentRun) {
-    renderFileList([]);
-    return;
-  }
-  const res = await fetch(`/api/runs/${currentRun}/files`);
-  const data = await res.json();
-  if(data.status !== 'ok') {
-    fileListEl.innerHTML = `<div class="message error">${esc(data.error || 'Failed to load files')}</div>`;
-    return;
-  }
-  renderFileList(data.files || []);
-}
-function renderFileList(files){
-  if(!currentRun) {
-    fileListEl.innerHTML = '<div class="message">Start a run to browse files.</div>';
-    return;
-  }
-  if(!files.length) {
-    fileListEl.innerHTML = '<div class="message">No files in workspace yet.</div>';
-    return;
-  }
-  fileListEl.innerHTML = files.map(file => {
-    const path = cleanText(file.path);
-    const viewDisabled = file.previewable ? '' : 'disabled';
-    const downloadHref = `/api/runs/${encodeURIComponent(currentRun)}/files/download?path=${encodeURIComponent(path)}`;
-    return `
-      <div class="file-row">
-        <div class="file-main">
-          <div class="file-name" title="${escAttr(path)}">${esc(path)}</div>
-          <div class="file-meta">${esc(formatBytes(file.size || 0))}</div>
-        </div>
-        <div class="file-actions">
-          <button type="button" data-file-view="${escAttr(path)}" ${viewDisabled}>View</button>
-          <a href="${escAttr(downloadHref)}">Download</a>
-        </div>
-      </div>`;
-  }).join('');
-}
-function renderFilePreview(file){
-  if(!file) {
-    filePreviewEl.innerHTML = '<div class="file-preview-head"><span>Preview</span><span>-</span></div><pre>Select a text file to preview it.</pre>';
-    return;
-  }
-  filePreviewEl.innerHTML = `
-    <div class="file-preview-head">
-      <span>${esc(file.path)}</span>
-      <span>${file.truncated ? 'truncated' : formatBytes(file.size || 0)}</span>
-    </div>
-    <pre>${esc(file.content || '')}</pre>`;
-}
-async function viewRunFile(path){
-  if(!currentRun || !path) return;
-  const res = await fetch(`/api/runs/${encodeURIComponent(currentRun)}/files/view?path=${encodeURIComponent(path)}`);
-  const data = await res.json();
-  if(data.status !== 'ok') {
-    filePreviewEl.innerHTML = `<div class="file-preview-head"><span>Preview error</span><span>-</span></div><pre>${esc(data.error || 'Failed to preview file')}</pre>`;
-    return;
-  }
-  renderFilePreview(data.file);
-}
-function formatBytes(size){
-  const value = Number(size) || 0;
-  if(value < 1024) return `${value} B`;
-  if(value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
-  return `${(value / 1024 / 1024).toFixed(1)} MB`;
-}
 function render(run){
-  saveCsvScrollPositions();
   statusEl.textContent = run.status + ' / ' + run.stop_reason;
   document.getElementById('s-status').textContent = run.status;
   document.getElementById('s-requests').textContent = run.requests;
@@ -2045,7 +1702,7 @@ function render(run){
       continue;
     }
     if(event.kind === 'feedback') {
-      if(currentTurn) currentTurn.hints = validHints(event.data?.hints);
+      if(currentTurn) currentTurn.hints = Array.isArray(event.data?.hints) ? event.data.hints : [];
       continue;
     }
     if(event.kind === 'command') {
@@ -2062,16 +1719,34 @@ function render(run){
       if(currentTurn) currentTurn.notes.push(renderTechEvent(event, turns.length));
     }
   }
-  eventsEl.innerHTML = turns.length ? turns.map(renderTurn).join('') : '<div class="message">No events yet.</div>';
-applyTrajectoryUiState();
+  eventsEl.innerHTML = turns.length ? turns.map((turn, index) => {
+    const prompt = turn.prompt ? renderChatEvent(
+      'prompt',
+      'You',
+      `${renderPromptHtml(turn.prompt.data?.content || '')}${turn.hints.length ? `<div class="turn-hint-label">Подсказки к вашему сообщению</div><ul class="turn-hints">${turn.hints.map(h => `<li><strong>${esc(h.stage)}</strong>: ${esc(h.message)}</li>`).join('')}</ul>` : ''}`,
+      new Date(turn.prompt.time).toLocaleTimeString(),
+      'user'
+    ) : '';
+    const llm = turn.llm ? `
+      <div class="event chat-event llm assistant">
+        <div class="chat-row assistant">
+          <div class="chat-avatar">LLM</div>
+          <div class="bubble">
+            <div class="chat-title">LLM</div>
+            <div class="chat-body structured">${renderMarkdownish(turn.llm.data?.content || '')}</div>
+            ${turn.notes.length ? `<div class="command-notes">${turn.notes.join('')}</div>` : ''}
+          </div>
+        </div>
+        <div class="chat-tail">
+          <span>LLM response</span>
+          <span>${esc(new Date(turn.llm.time).toLocaleTimeString())}</span>
+        </div>
+      </div>` : '';
+    return `<div class="turn" data-turn-index="${index}">${prompt}${llm}</div>`;
+  }).join('') : '<div class="message">No events yet.</div>';
 }
 start.addEventListener('click', startRun);
 stop.addEventListener('click', stopRun);
-fileListEl.addEventListener('click', (event) => {
-  const button = event.target.closest('[data-file-view]');
-  if(!button) return;
-  viewRunFile(button.dataset.fileView || '');
-});
 setupCodeToggles();
 loadTasks();
 </script>
