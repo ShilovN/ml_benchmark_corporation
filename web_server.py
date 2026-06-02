@@ -277,7 +277,7 @@ class AgentRunManager:
                         state,
                         "Твой ответ не удалось распарсить как команду.\n"
                         f"Ошибка: {exc}\n"
-                        "Верни короткий комментарий, затем валидную команду или несколько команд, по одной на строку.",
+                        "Верни только валидную команду или несколько команд, по одной на строку.",
                     )
                     continue
 
@@ -595,7 +595,7 @@ def baseline_prediction(rows: list[dict[str, str]], target_column: str, metric: 
 def build_initial_prompt(workspace: Path, task_id: str) -> str:
     return (
         "Ты решаешь ML benchmark task через агентские команды.\n"
-        "В одном ответе сначала напиши короткий комментарий, затем одну или несколько команд, по одной на строку.\n"
+        "В одном ответе можно вернуть одну или несколько команд, по одной на строку.\n"
         "Работай как в обычной ML-задаче: осмотри данные, сделай признаки, обучи и проверь модель. "
         "Перед submit проверь, что submission.csv существует, имеет нужные колонки, правильное число строк "
         "и не содержит пустых предсказаний. Когда всё готово, вызови submit(\"submission.csv\").\n\n"
@@ -689,7 +689,7 @@ def build_followup_prompt(results: list[dict[str, Any]], feedback: dict[str, Any
     max_steps = state.config.max_steps
     remaining_steps = max(0, max_steps - used_steps)
     lines = [
-        "Продолжай решение.",
+        "Продолжай решение. Верни только следующую команду или команды.",
         "",
         "Статус benchmark:",
         (
@@ -820,7 +820,7 @@ def build_emergency_submit_prompt(state: RunState) -> str:
         instruction = (
             "FINAL SUBMIT NOW.\n"
             "В workspace уже есть submission.csv. Не улучшай решение и не запускай EDA.\n"
-            "Верни короткий комментарий, затем одну команду:\n"
+            "Верни только одну команду:\n"
             "submit(\"submission.csv\")\n\n"
         )
     else:
@@ -828,7 +828,7 @@ def build_emergency_submit_prompt(state: RunState) -> str:
             "FINAL SUBMIT NOW.\n"
             "Нужно дать последнее лучшее решение. Не делай EDA и долгие улучшения.\n"
             "Создай submission.csv самым надежным быстрым способом и в этом же ответе вызови submit(\"submission.csv\").\n"
-            "Верни короткий комментарий, затем команды.\n\n"
+            "Верни только команды.\n\n"
         )
     payload = {
         "task": task_config,
