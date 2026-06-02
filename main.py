@@ -928,6 +928,16 @@ def format_command_result_for_prompt(index: int, result: dict[str, Any]) -> list
 
 
 def format_result_payload(command: str, payload: Any) -> list[str]:
+    if command == "submit" and isinstance(payload, dict):
+        lines = [
+            f"metric={payload.get('metric', '?')}; value={payload.get('value', '?')}; "
+            f"rows_checked={payload.get('rows_checked', '?')}"
+        ]
+        source = payload.get("submission_source")
+        if isinstance(source, dict):
+            path = source.get("path") or source.get("kind") or "inline"
+            lines.append(f"submission_source={path}; truncated={source.get('truncated', False)}")
+        return lines
     if command == "read_file" and isinstance(payload, dict):
         lines = [f"path={payload.get('path', '?')}; truncated={payload.get('truncated', False)}"]
         content = str(payload.get("content", ""))

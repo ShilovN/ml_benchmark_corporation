@@ -20,6 +20,7 @@ from .parser import ParsedCommand, parse_command, parse_model_response
 
 MAX_RESULT_CHARS = 8000
 MAX_FILE_READ_CHARS = 20000
+MAX_SUBMISSION_SOURCE_CHARS = 20000
 DEFAULT_MAX_STEPS = 100
 DEFAULT_TIME_LIMIT_SECONDS = 3600
 DEFAULT_HISTORY_FILENAME = "agent_history.txt"
@@ -252,7 +253,7 @@ class CommandExecutor:
         submission_path = self._resolve_path(_required_str(args, "file"))
         task_config = self._load_task_config(self.context.task_id)
         answer_path = task_config["task_dir"] / task_config["answer_file"]
-        return compute_metric_details(
+        result = compute_metric_details(
             answer_path,
             submission_path,
             task_config["metric"],
@@ -261,6 +262,10 @@ class CommandExecutor:
             pred_column=task_config.get("pred_column"),
             id_column=task_config.get("id_column"),
         )
+        source = self._submission_source(submission_path)
+        if source:
+            result["submission_source"] = source
+        return result
 
     def _load_task_config(self, task_id: str) -> dict[str, Any]:
         tasks_dir = self.context.tasks_dir.resolve()
@@ -323,6 +328,83 @@ class CommandExecutor:
             tasks_dir=self.context.tasks_dir,
         ).build_feedback()
 
+    def _submission_source(self, submission_path: Path) -> dict[str, Any] | None:
+        submission_name = submission_path.name
+        for record in reversed(self.context.trajectory):
+            if record.get("status") != "ok":
+                continue
+            command = str(record.get("command") or "")
+            args = record.get("args")
+            if not isinstance(args, dict):
+                continue
+
+            if command == "run_python":
+                source = self._run_python_source(args, submission_name)
+                if source:
+                    return source
+
+            if command in {"write_file", "edit_file"}:
+                source = self._python_file_source(args, submission_name, command)
+                if source:
+                    return source
+        return None
+
+    def _run_python_source(self, args: dict[str, Any], submission_name: str) -> dict[str, Any] | None:
+        code_or_file = args.get("code_or_file")
+        if not isinstance(code_or_file, str):
+            return None
+
+        candidate = self._maybe_workspace_path(code_or_file)
+        if candidate and candidate.exists() and candidate.is_file():
+            content = self._read_submission_source_file(candidate)
+            if content and _looks_like_submission_code(content, submission_name):
+                return {
+                    "kind": "python_file",
+                    "path": self._display_path(candidate),
+                    "content": content,
+                    "truncated": len(content) >= MAX_SUBMISSION_SOURCE_CHARS,
+                }
+            return None
+
+        if _looks_like_submission_code(code_or_file, submission_name):
+            truncated = len(code_or_file) > MAX_SUBMISSION_SOURCE_CHARS
+            return {
+                "kind": "python_inline",
+                "path": None,
+                "content": code_or_file[:MAX_SUBMISSION_SOURCE_CHARS],
+                "truncated": truncated,
+            }
+        return None
+
+    def _python_file_source(
+        self,
+        args: dict[str, Any],
+        submission_name: str,
+        command: str,
+    ) -> dict[str, Any] | None:
+        path_value = args.get("path")
+        if not isinstance(path_value, str):
+            return None
+        path = self._maybe_workspace_path(path_value)
+        if not path or path.suffix.lower() != ".py" or not path.exists():
+            return None
+        content = self._read_submission_source_file(path)
+        if not content or not _looks_like_submission_code(content, submission_name):
+            return None
+        return {
+            "kind": command,
+            "path": self._display_path(path),
+            "content": content,
+            "truncated": len(content) >= MAX_SUBMISSION_SOURCE_CHARS,
+        }
+
+    def _read_submission_source_file(self, path: Path) -> str:
+        try:
+            content = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return ""
+        return content[:MAX_SUBMISSION_SOURCE_CHARS]
+
     def _error(self, command: ParsedCommand, error: str, started_at: float) -> dict[str, Any]:
         return {
             "status": "error",
@@ -371,6 +453,20 @@ def _parse_edit_diff(diff: Any) -> tuple[str, str]:
     if not isinstance(old, str) or not isinstance(new, str):
         raise ValueError('edit_file diff must contain string fields "old" and "new"')
     return old, new
+
+
+def _looks_like_submission_code(code: str, submission_name: str) -> bool:
+    lowered = code.lower()
+    has_submission_file = submission_name.lower() in lowered or "submission.csv" in lowered
+    has_csv_writer = any(
+        marker in lowered
+        for marker in {
+            "to_csv(",
+            "csv.writer",
+            "writerow(",
+        }
+    )
+    return has_submission_file and has_csv_writer
 
 
 def _trajectory_record(command: ParsedCommand, result: dict[str, Any]) -> dict[str, Any]:
