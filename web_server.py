@@ -669,9 +669,10 @@ def build_followup_prompt(results: list[dict[str, Any]], feedback: dict[str, Any
             lines.extend(format_web_command_result(index, result))
     else:
         lines.append("- команд не было")
-    if feedback and state.requests > 1:
+    feedback_lines = format_web_feedback(feedback) if feedback and state.requests > 1 else []
+    if feedback_lines:
         lines.extend(["", "Подсказки:"])
-        lines.extend(format_web_feedback(feedback))
+        lines.extend(feedback_lines)
     return "\n".join(lines)
 
 
@@ -718,13 +719,19 @@ def format_web_result_payload(command: str, payload: Any) -> list[str]:
 def format_web_feedback(feedback: dict[str, Any]) -> list[str]:
     hints = feedback.get("hints")
     if not isinstance(hints, list) or not hints:
-        return [f"- {short_web_json(feedback, 1500)}"]
+        return []
     lines: list[str] = []
     for hint in hints[:8]:
         if isinstance(hint, dict):
-            lines.append(f"- {hint.get('stage', 'hint')}: {hint.get('message', '')}")
+            message = str(hint.get("message") or "").strip()
+            if not message:
+                continue
+            stage = str(hint.get("stage") or "hint").strip()
+            lines.append(f"- {stage}: {message}")
         else:
-            lines.append(f"- {hint}")
+            text = str(hint).strip()
+            if text:
+                lines.append(f"- {text}")
     if len(hints) > 8:
         lines.append(f"- ... (+{len(hints) - 8} more hints)")
     return lines
@@ -1311,6 +1318,7 @@ function renderMarkdownLine(line){
 }
 function renderMarkdownish(text, options = {}){
   const shouldStrip = options.strip !== false;
+  const allowCsv = options.csv === true;
   text = shouldStrip ? stripContentFromText(text) : cleanText(text);
   if(!text) return '<div class="md-paragraph">Empty message.</div>';
   const parts = [];
@@ -1321,7 +1329,7 @@ function renderMarkdownish(text, options = {}){
     parts.push(before.split('\n').map(renderMarkdownLine).join(''));
     const langName = cleanText(match[1] || '');
     const blockText = match[2].replace(/\n$/, '');
-    if(langName.toLowerCase() === 'csv' || isLikelyCsv(blockText)) {
+    if(allowCsv && (langName.toLowerCase() === 'csv' || isLikelyCsv(blockText))) {
       parts.push(renderCsvTable(blockText));
     } else {
       const lang = langName ? `<div class="code-lang">${esc(langName)}</div>` : '';
@@ -1419,7 +1427,6 @@ function renderJsonScalar(value){
   if(typeof value === 'string') {
     const text = cleanText(value);
     if(!text) return '<span class="json-muted">-</span>';
-    if(isLikelyCsv(text)) return renderCsvTable(text);
     if(isProbablyCode(text) || text.includes('\\n')) return `<div class="code-block">${esc(text)}</div>`;
     return `<span class="json-pill">${esc(shortText(text, 240))}</span>`;
   }
@@ -1467,14 +1474,12 @@ function renderJsonSummary(value, depth=0){
   return renderJsonScalar(value);
 }
 function renderValue(value){
-  if(typeof value === 'string' && isLikelyCsv(value)) return renderCsvTable(value);
   if(isProbablyCode(value)) return `<div class="code-block">${esc(cleanText(value))}</div>`;
   return renderJsonSummary(value);
 }
 function renderTextPreview(value){
   const text = cleanText(value);
   if(!text) return '<span class="json-muted">-</span>';
-  if(isLikelyCsv(text)) return renderCsvTable(text);
   return `<pre>${esc(text)}</pre>`;
 }
 function renderCommandCall(name, args){
@@ -1576,13 +1581,17 @@ function renderSubmissionHtml(submission){
       </div>
     </div>`;
 }
-function renderPromptHtml(text){
+function renderPromptHtml(text, allowCsv=false){
   const fullText = cleanText(text);
   try {
-    return `<div class="chat-body structured">${renderMarkdownish(fullText, {strip:false})}</div>`;
+    return `<div class="chat-body structured">${renderMarkdownish(fullText, {strip:false, csv:allowCsv})}</div>`;
   } catch {
     return safeTextBlock(fullText);
   }
+}
+function validHints(hints){
+  if(!Array.isArray(hints)) return [];
+  return hints.filter(h => h && typeof h === 'object' && cleanText(h.message));
 }
 function renderCommandNote(event){
   const name = cleanText(event.title || event.data?.command || '');
@@ -1630,7 +1639,7 @@ function eventMainText(event){
 }
 function eventBodyHtml(event){
   const data = event.data || {};
-  if(event.kind === 'prompt') return renderPromptHtml(data.content || '');
+  if(event.kind === 'prompt') return renderPromptHtml(data.content || '', false);
   if(event.kind === 'llm') return `<div class="chat-body structured">${renderMarkdownish(data.content || '')}</div>`;
   if(event.kind === 'result') {
     if(data.command === 'submit') return renderSubmissionHtml(data);
@@ -1672,7 +1681,7 @@ function renderTurn(turn, index){
     const prompt = turn.prompt ? renderChatEvent(
       'prompt',
       'You',
-      `${renderPromptHtml(promptText)}${turn.hints.length ? `<div class="turn-hint-label">Подсказки к вашему сообщению</div><ul class="turn-hints">${turn.hints.map(h => `<li><strong>${esc(h.stage)}</strong>: ${esc(h.message)}</li>`).join('')}</ul>` : ''}`,
+      `${renderPromptHtml(promptText, index === 0)}${validHints(turn.hints).length ? `<div class="turn-hint-label">Подсказки к вашему сообщению</div><ul class="turn-hints">${validHints(turn.hints).map(h => `<li><strong>${esc(h.stage || 'hint')}</strong>: ${esc(h.message)}</li>`).join('')}</ul>` : ''}`,
       new Date(turn.prompt.time).toLocaleTimeString(),
       'user'
     ) : '';
@@ -1834,7 +1843,7 @@ function render(run){
       continue;
     }
     if(event.kind === 'feedback') {
-      if(currentTurn) currentTurn.hints = Array.isArray(event.data?.hints) ? event.data.hints : [];
+      if(currentTurn) currentTurn.hints = validHints(event.data?.hints);
       continue;
     }
     if(event.kind === 'command') {
