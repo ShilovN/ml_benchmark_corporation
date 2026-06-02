@@ -678,7 +678,9 @@ def format_web_command_result(index: int, result: dict[str, Any]) -> list[str]:
     command = str(result.get("command", "unknown"))
     status = str(result.get("status", "unknown"))
     if status != "ok":
-        return [f"{index}. {command}: error", f"   {short_web_text(str(result.get('error', 'unknown error')), 1200)}"]
+        lines = [f"{index}. {command}: error"]
+        lines.extend(f"   {line}" for line in fenced_web_text_block(str(result.get("error", "unknown error")), 1200))
+        return lines
     lines = [f"{index}. {command}: ok"]
     lines.extend(f"   {line}" for line in format_web_result_payload(command, result.get("result")))
     return lines
@@ -698,10 +700,10 @@ def format_web_result_payload(command: str, payload: Any) -> list[str]:
         stderr = str(payload.get("stderr", ""))
         if stdout:
             lines.append("stdout:")
-            lines.extend(indent_web_block(short_web_text(stdout, 1800), "  "))
+            lines.extend(fenced_web_text_block(stdout, 1800))
         if stderr:
             lines.append("stderr:")
-            lines.extend(indent_web_block(short_web_text(stderr, 1800), "  "))
+            lines.extend(fenced_web_text_block(stderr, 1800))
         return lines
     if command == "list_files" and isinstance(payload, list):
         shown = [str(item) for item in payload[:30]]
@@ -729,6 +731,10 @@ def format_web_feedback(feedback: dict[str, Any]) -> list[str]:
 
 def short_web_json(value: Any, limit: int) -> str:
     return short_web_text(json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str), limit)
+
+
+def fenced_web_text_block(value: str, limit: int) -> list[str]:
+    return ["```text", *short_web_text(value, limit).splitlines(), "```"]
 
 
 def short_web_text(value: str, limit: int) -> str:

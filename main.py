@@ -918,10 +918,9 @@ def format_command_result_for_prompt(index: int, result: dict[str, Any]) -> list
     command = str(result.get("command", "unknown"))
     status = str(result.get("status", "unknown"))
     if status != "ok":
-        return [
-            f"{index}. {command}: error",
-            f"   {truncate_middle(str(result.get('error', 'unknown error')), 1200)}",
-        ]
+        lines = [f"{index}. {command}: error"]
+        lines.extend(f"   {line}" for line in fenced_text_block(str(result.get("error", "unknown error")), 1200))
+        return lines
     lines = [f"{index}. {command}: ok"]
     lines.extend(f"   {line}" for line in format_result_payload(command, result.get("result")))
     return lines
@@ -941,10 +940,10 @@ def format_result_payload(command: str, payload: Any) -> list[str]:
         stderr = str(payload.get("stderr", ""))
         if stdout:
             lines.append("stdout:")
-            lines.extend(indent_block(truncate_middle(stdout, 1800), "  "))
+            lines.extend(fenced_text_block(stdout, 1800))
         if stderr:
             lines.append("stderr:")
-            lines.extend(indent_block(truncate_middle(stderr, 1800), "  "))
+            lines.extend(fenced_text_block(stderr, 1800))
         return lines
     if command == "list_files" and isinstance(payload, list):
         shown = [str(item) for item in payload[:30]]
@@ -985,6 +984,10 @@ def format_short_value(value: Any, limit: int) -> str:
     if isinstance(value, str):
         return truncate_middle(value, limit)
     return truncate_middle(json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str), limit)
+
+
+def fenced_text_block(value: str, limit: int) -> list[str]:
+    return ["```text", *truncate_middle(value, limit).splitlines(), "```"]
 
 
 def indent_block(text: str, prefix: str) -> list[str]:
