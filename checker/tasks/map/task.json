@@ -1,6 +1,6 @@
 {
-  "id": "salary_prediction",
-  "name": "Salary prediction",
+  "id": "map",
+  "name": "Map",
   "metric": "f1",
   "answer_file": "answers.csv",
   "id_column": "ID",
