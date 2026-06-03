@@ -1749,6 +1749,12 @@ function truncateText(value, limit=180){
 function esc(v){return String(v).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');}
 function escAttr(v){return esc(v).replaceAll('"','&quot;').replaceAll("'","&#39;");}
 function cleanText(value){return String(value ?? '').trim();}
+function isProbablyCode(value){
+  const text = cleanText(value);
+  if(!text) return false;
+  if(text.includes('\n')) return true;
+  return /\b(?:import|from|def|class|for|while|if|try|except|with|return|print)\b|[=;{}]/.test(text);
+}
 function isPlainObject(value){return value !== null && typeof value === 'object' && !Array.isArray(value);}
 function safeTextBlock(value){
   return `<div class="chat-body structured"><pre>${esc(cleanText(value) || 'Empty message.')}</pre></div>`;
@@ -2178,18 +2184,36 @@ function renderCommandNote(event){
   const code = cleanText(args.code_or_file || '');
   const path = cleanText(args.path || args.file || '');
   const content = cleanText(args.content || args.diff || '');
-  const isCode = name === 'run_python';
-  const fileOps = new Set(['read_file', 'write_file', 'edit_file', 'load_dataset', 'list_files', 'show_dataset_info', 'show_sample_rows']);
-  if(!isCode && !fileOps.has(name)) return '';
-  const summary = isCode ? 'Выполняю код' : 'Открываю файл';
+  const labels = {
+    list_files: 'Показываю список файлов',
+    read_file: 'Открываю файл',
+    write_file: 'Создаю файл',
+    edit_file: 'Редактирую файл',
+    load_dataset: 'Загружаю датасет',
+    show_dataset_info: 'Показываю информацию о датасете',
+    show_sample_rows: 'Показываю sample строки',
+    run_python: 'Выполняю код',
+    get_budget_status: 'Проверяю бюджет шагов',
+    get_remaining_time: 'Проверяю оставшееся время',
+    get_trajectory: 'Показываю trajectory',
+    get_hints: 'Запрашиваю подсказки',
+    submit: 'Отправляю submission'
+  };
+  const summary = labels[name] || `Выполняю команду ${name || 'unknown'}`;
   const details = [];
-  if(isCode) {
+  details.push(`<div class="note-meta">Команда: <span class="inline-code">${esc(renderCommandCall(name, args))}</span></div>`);
+  if(name === 'run_python') {
     if(code) details.push(`<div class="note-meta">Код</div><pre>${esc(code)}</pre>`);
     else details.push('<div class="note-meta">Код не передан.</div>');
   } else {
     if(path) details.push(`<div class="note-meta">Путь: <span class="inline-code">${esc(path)}</span></div>`);
+    if(args.n !== undefined) details.push(`<div class="note-meta">Строк: <span class="inline-code">${esc(args.n)}</span></div>`);
     if(content) details.push(`<div class="note-meta">Содержимое</div>${renderTextPreview(content)}`);
-    if(!path && !content) details.push('<div class="note-meta">Без дополнительных данных.</div>');
+    if(!path && !content && args.n === undefined) {
+      const argEntries = Object.keys(args || {});
+      if(argEntries.length) details.push(renderJsonSummary(args));
+      else details.push('<div class="note-meta">Без аргументов.</div>');
+    }
   }
   return `
     <div class="command-note">
