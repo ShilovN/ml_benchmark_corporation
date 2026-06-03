@@ -539,7 +539,6 @@ def make_handler(manager: AgentRunManager) -> type[BaseHTTPRequestHandler]:
         def log_message(self, format: str, *args: Any) -> None:
             print(f"{self.address_string()} - {format % args}")
 
-            return runs
 
     return AgentWebHandler
 
