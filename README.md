@@ -44,6 +44,7 @@ Run:
 ```bash
 export OPENAI_API_KEY="your_openai_key"
 export LETOVO_API_KEY="your_letovo_key"
+docker build -f Dockerfile.benchmark -t ml-benchmark-runner:latest .
 python3 web_server.py --host 127.0.0.1 --port 8010
 ```
 
@@ -69,6 +70,11 @@ Supported model choices:
 
 Letovo models use `LETOVO_API_KEY`; OpenAI models use `OPENAI_API_KEY`. A custom
 OpenAI-compatible endpoint can be set with `LLM_URL`.
+
+By default, each Web UI run starts an isolated Docker container from
+`ml-benchmark-runner:latest`, and agent `run_python(...)` commands execute inside
+that container. Use `--no-docker` to run agent Python commands on the host
+instead, or `--docker-image IMAGE` to use another prebuilt image.
 
 Each run gets an isolated workspace under `benchmark_runs/`. Public task files
 such as `train.csv`, `test.csv`, and public `task.json` are copied there. Hidden
