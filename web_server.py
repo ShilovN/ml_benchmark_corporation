@@ -9,6 +9,7 @@ import csv
 import html
 import json
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -45,6 +46,7 @@ from agent.parser import COMMAND_NAMES, FENCED_BLOCK_RE, ParsedCommand, parse_co
 
 DEFAULT_TASKS_DIR = Path("checker/tasks")
 DEFAULT_RUN_ROOT = Path("benchmark_runs")
+DEFAULT_DOCKER_IMAGE = "ml-benchmark-runner:latest"
 TEXT_EXTENSIONS = {".csv", ".json", ".md", ".py", ".txt", ".tsv", ".yaml", ".yml"}
 MAX_CONTEXT_CHARS = 28000
 MAX_FILE_PREVIEW_CHARS = 2500
@@ -127,6 +129,8 @@ class RunState:
     final_submit_requested: bool = False
     fixed_stage_index: int = 0
     fixed_stage_attempts: dict[str, int] = field(default_factory=dict)
+    docker_container: str | None = None
+    created_container: bool = False
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -143,15 +147,28 @@ class RunState:
             "submitted": self.submitted,
             "submission_result": self.submission_result,
             "error": self.error,
+            "docker_container": self.docker_container,
             "events": self.events[-200:],
         }
 
 
 class AgentRunManager:
-    def __init__(self, project_root: Path, tasks_dir: Path, run_root: Path) -> None:
+    def __init__(
+        self,
+        project_root: Path,
+        tasks_dir: Path,
+        run_root: Path,
+        *,
+        use_docker: bool = True,
+        docker_image: str = DEFAULT_DOCKER_IMAGE,
+        keep_containers: bool = False,
+    ) -> None:
         self.project_root = project_root.resolve()
         self.tasks_dir = resolve_path(project_root, tasks_dir)
         self.run_root = resolve_path(project_root, run_root)
+        self.use_docker = use_docker
+        self.docker_image = docker_image
+        self.keep_containers = keep_containers
         self.runs: dict[str, RunState] = {}
         self.lock = threading.Lock()
 
@@ -174,6 +191,12 @@ class AgentRunManager:
     def start_run(self, config: RunConfig) -> RunState:
         run_id = uuid.uuid4().hex[:12]
         workspace = prepare_run_workspace(self.project_root, self.tasks_dir, self.run_root, config.task_id, run_id)
+        docker_container = None
+        created_container = False
+        if self.use_docker:
+            docker_container = default_container_name(config.task_id, run_id)
+            create_container(name=docker_container, image=self.docker_image, workspace=workspace)
+            created_container = True
         executor = CommandExecutor(
             AgentContext(
                 workspace=workspace,
@@ -181,9 +204,17 @@ class AgentRunManager:
                 tasks_dir=self.tasks_dir,
                 max_steps=config.max_steps,
                 history_file=Path("agent_history.txt"),
+                docker_container=docker_container,
             )
         )
-        state = RunState(run_id=run_id, config=config, workspace=workspace, executor=executor)
+        state = RunState(
+            run_id=run_id,
+            config=config,
+            workspace=workspace,
+            executor=executor,
+            docker_container=docker_container,
+            created_container=created_container,
+        )
         thread = threading.Thread(target=self._run_loop, args=(state,), daemon=True)
         state.thread = thread
         with self.lock:
@@ -212,7 +243,16 @@ class AgentRunManager:
     def _run_loop(self, state: RunState) -> None:
         user_message = apply_mode_instruction(state, build_initial_prompt(state.workspace, state.config.task_id))
         history: list[dict[str, str]] = []
-        add_event(state, "system", "Run started", {"task_id": state.config.task_id, "mode": state.config.mode})
+        add_event(
+            state,
+            "system",
+            "Run started",
+            {
+                "task_id": state.config.task_id,
+                "mode": state.config.mode,
+                "docker_container": state.docker_container,
+            },
+        )
 
         try:
             while not state.stop_requested:
@@ -355,6 +395,9 @@ class AgentRunManager:
             state.stop_reason = "error"
             state.error = str(exc)
             add_event(state, "error", "Run failed", {"error": str(exc)})
+        finally:
+            if state.created_container and state.docker_container and not self.keep_containers:
+                remove_container(state.docker_container)
 
     def _force_final_submit(self, state: RunState) -> None:
         if state.submitted:
@@ -507,7 +550,18 @@ def make_handler(manager: AgentRunManager) -> type[BaseHTTPRequestHandler]:
                     max_tokens=int(payload["max_tokens"]) if "max_tokens" in payload else DEFAULT_MAX_TOKENS,
                     request_timeout=int(payload["request_timeout"]) if "request_timeout" in payload else DEFAULT_TIMEOUT,
                 )
-                run = manager.start_run(config)
+                try:
+                    run = manager.start_run(config)
+                except subprocess.CalledProcessError as exc:
+                    self._send_json(
+                        {
+                            "status": "error",
+                            "error": "Could not start benchmark Docker container",
+                            "details": (exc.stderr or exc.stdout or str(exc)).strip(),
+                        },
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                    return
                 self._send_json({"status": "ok", "run": run.public_dict()})
                 return
             if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/stop"):
@@ -578,6 +632,37 @@ def prepare_run_workspace(
     public_config = {key: value for key, value in config.items() if key not in {"answer_file", "private_files"}}
     (workspace / "task.json").write_text(json.dumps(public_config, ensure_ascii=False, indent=2), encoding="utf-8")
     return workspace
+
+
+def create_container(*, name: str, image: str, workspace: Path) -> None:
+    subprocess.run(
+        [
+            "docker",
+            "run",
+            "-d",
+            "--name",
+            name,
+            "-v",
+            f"{workspace.resolve()}:/workspace",
+            "-w",
+            "/workspace",
+            image,
+            "sleep",
+            "infinity",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def remove_container(container: str) -> None:
+    subprocess.run(["docker", "rm", "-f", container], check=False, capture_output=True, text=True)
+
+
+def default_container_name(task_id: str, run_id: str) -> str:
+    safe_task_id = "".join(char if char.isalnum() or char in "-_" else "-" for char in task_id)
+    return f"ml-benchmark-web-{safe_task_id}-{run_id}"
 
 
 def create_baseline_submission(workspace: Path) -> Path:
@@ -2449,14 +2534,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--project-root", type=Path, default=Path.cwd())
     parser.add_argument("--tasks-dir", type=Path, default=DEFAULT_TASKS_DIR)
     parser.add_argument("--run-root", type=Path, default=DEFAULT_RUN_ROOT)
+    parser.add_argument(
+        "--docker-image",
+        default=DEFAULT_DOCKER_IMAGE,
+        help="Prebuilt Docker image used for agent run_python commands.",
+    )
+    parser.add_argument(
+        "--no-docker",
+        action="store_true",
+        help="Run agent Python commands on the host instead of a benchmark Docker container.",
+    )
+    parser.add_argument(
+        "--keep-containers",
+        action="store_true",
+        help="Do not remove per-run benchmark containers after runs finish.",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    manager = AgentRunManager(args.project_root, args.tasks_dir, args.run_root)
+    manager = AgentRunManager(
+        args.project_root,
+        args.tasks_dir,
+        args.run_root,
+        use_docker=not args.no_docker,
+        docker_image=args.docker_image,
+        keep_containers=args.keep_containers,
+    )
     server = ThreadingHTTPServer((args.host, args.port), make_handler(manager))
     print(f"Agent web UI is running on http://{args.host}:{args.port}")
+    if args.no_docker:
+        print("Agent Python execution: host python3")
+    else:
+        print(f"Agent Python execution: Docker image {args.docker_image}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
