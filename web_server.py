@@ -375,6 +375,52 @@ class AgentRunManager:
             state.stop_reason = f"{reason}_forced_submit_failed" if reason else "forced_submit_failed"
             add_event(state, "error", "Forced final submit failed", {"error": str(exc)})
 
+        def _history_path(self, run_id: str) -> Path:
+            return self.history_dir / f"{run_id}.json"
+
+
+        def save_run(self, state: RunState) -> None:
+            payload = state.public_dict()
+            path = self._history_path(state.run_id)
+            print(f"Saving run history to {path}")
+            tmp_path = path.with_suffix(".json.tmp")
+            tmp_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+            tmp_path.replace(path)
+
+
+        def load_saved_run(self, run_id: str) -> dict[str, Any] | None:
+            path = self._history_path(run_id)
+            if not path.exists():
+                return None
+            return json.loads(path.read_text(encoding="utf-8"))
+
+
+        def list_saved_runs(self) -> list[dict[str, Any]]:
+            runs: list[dict[str, Any]] = []
+            for path in sorted(self.history_dir.glob("*.json"), reverse=True):
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError:
+                    continue
+
+                submission = data.get("submission_result") or {}
+                result = submission.get("result") if isinstance(submission, dict) else {}
+                metric = result if isinstance(result, dict) else {}
+
+                runs.append({
+                    "run_id": data.get("run_id"),
+                    "created_at": data.get("created_at"),
+                    "task_id": data.get("task_id"),
+                    "model": data.get("model"),
+                    "mode": data.get("mode"),
+                    "status": data.get("status"),
+                    "stop_reason": data.get("stop_reason"),
+                    "metric": metric.get("metric"),
+                    "value": metric.get("value"),
+                })
 
 def make_handler(manager: AgentRunManager) -> type[BaseHTTPRequestHandler]:
     class AgentWebHandler(BaseHTTPRequestHandler):
@@ -491,52 +537,6 @@ def make_handler(manager: AgentRunManager) -> type[BaseHTTPRequestHandler]:
         def log_message(self, format: str, *args: Any) -> None:
             print(f"{self.address_string()} - {format % args}")
 
-        def _history_path(self, run_id: str) -> Path:
-            return self.history_dir / f"{run_id}.json"
-
-
-        def save_run(self, state: RunState) -> None:
-            payload = state.public_dict()
-            path = self._history_path(state.run_id)
-            print(f"Saving run history to {path}")
-            tmp_path = path.with_suffix(".json.tmp")
-            tmp_path.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2, default=str),
-                encoding="utf-8",
-            )
-            tmp_path.replace(path)
-
-
-        def load_saved_run(self, run_id: str) -> dict[str, Any] | None:
-            path = self._history_path(run_id)
-            if not path.exists():
-                return None
-            return json.loads(path.read_text(encoding="utf-8"))
-
-
-        def list_saved_runs(self) -> list[dict[str, Any]]:
-            runs: list[dict[str, Any]] = []
-            for path in sorted(self.history_dir.glob("*.json"), reverse=True):
-                try:
-                    data = json.loads(path.read_text(encoding="utf-8"))
-                except json.JSONDecodeError:
-                    continue
-
-                submission = data.get("submission_result") or {}
-                result = submission.get("result") if isinstance(submission, dict) else {}
-                metric = result if isinstance(result, dict) else {}
-
-                runs.append({
-                    "run_id": data.get("run_id"),
-                    "created_at": data.get("created_at"),
-                    "task_id": data.get("task_id"),
-                    "model": data.get("model"),
-                    "mode": data.get("mode"),
-                    "status": data.get("status"),
-                    "stop_reason": data.get("stop_reason"),
-                    "metric": metric.get("metric"),
-                    "value": metric.get("value"),
-                })
             return runs
 
     return AgentWebHandler
