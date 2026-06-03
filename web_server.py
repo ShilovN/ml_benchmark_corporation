@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import csv
 import html
 import json
@@ -785,13 +786,6 @@ def validate_mode_command_batch(state: RunState, commands: list[ParsedCommand]) 
             "commands": command_names,
             "allowed_commands": sorted(SINGLE_SHOT_ALLOWED_COMMANDS),
         }
-    if not any(name in {"run_python", "write_file"} for name in command_names):
-        return {
-            "reason": "single_shot_missing_solution_command",
-            "error": "Single-shot response must create or run a solution before submit.",
-            "commands": command_names,
-            "allowed_commands": sorted(SINGLE_SHOT_ALLOWED_COMMANDS),
-        }
     return None
 
 
@@ -1258,7 +1252,8 @@ def command_candidates(text: str) -> list[str]:
     candidates: list[str] = []
     for block in FENCED_BLOCK_RE.findall(text):
         if block.strip():
-            candidates.append(block.strip())
+            block_commands = command_block_candidates(block)
+            candidates.extend(block_commands if block_commands else [block.strip()])
     for line in text.splitlines():
         stripped = line.strip()
         if stripped.startswith("{") or any(
@@ -1270,6 +1265,29 @@ def command_candidates(text: str) -> list[str]:
         if candidate not in unique:
             unique.append(candidate)
     return unique
+
+
+def command_block_candidates(block: str) -> list[str]:
+    stripped = block.strip()
+    if not stripped:
+        return []
+    try:
+        module = ast.parse(stripped, mode="exec")
+    except SyntaxError:
+        return []
+
+    candidates: list[str] = []
+    for node in module.body:
+        if not isinstance(node, ast.Expr):
+            continue
+        if not isinstance(node.value, ast.Call) or not isinstance(node.value.func, ast.Name):
+            continue
+        if node.value.func.id not in COMMAND_NAMES:
+            continue
+        source = ast.get_source_segment(stripped, node)
+        if source:
+            candidates.append(source.strip())
+    return candidates
 
 
 def add_event(state: RunState, kind: str, title: str, data: dict[str, Any]) -> None:

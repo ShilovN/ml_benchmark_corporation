@@ -28,7 +28,9 @@ from web_server import (
     apply_mode_after_results,
     apply_mode_instruction,
     current_fixed_stage,
+    extract_commands,
     record_fixed_stage_attempt,
+    validate_mode_command_batch,
     validate_mode_command,
 )
 
@@ -571,6 +573,27 @@ class WebServerModeTest(unittest.TestCase):
         self.assertEqual(error["status"], "error")
         self.assertIn("not allowed during EDA", error["error"])
         self.assertIsNone(allowed)
+
+    def test_extract_commands_accepts_single_shot_fenced_batch(self) -> None:
+        text = '''Мысль: делаю решение
+```command
+run_python("""
+print("create submission")
+""")
+submit("submission.csv")
+```'''
+
+        commands = extract_commands(text)
+
+        self.assertEqual([command.name for command in commands], ["run_python", "submit"])
+        self.assertIn("create submission", commands[0].args["code_or_file"])
+
+    def test_single_shot_submit_only_is_not_batch_error(self) -> None:
+        state = self._state("single-shot")
+
+        error = validate_mode_command_batch(state, [parse_command('submit("submission.csv")')])
+
+        self.assertIsNone(error)
 
     def test_fixed_transitions_advances_stages_and_finishes_after_train(self) -> None:
         state = self._state("fixed-transitions")
