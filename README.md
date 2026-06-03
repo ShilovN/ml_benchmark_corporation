@@ -1,27 +1,39 @@
 # ML Benchmark Corporation
 
-This repository contains a prototype of an AutoML-style benchmark environment.
-The project has two main parts:
+This repository contains a prototype of an AutoML Gym style benchmark
+environment: an LLM agent solves ML tasks through a controlled command API, and
+the checker evaluates the produced `submission.csv`.
 
-- `checker/` - task server and metric checker for submitted solutions;
-- `agent/` - command parser, executor, trajectory logging, and feedback hints for
-  an LLM agent.
+The project has three main parts:
 
-The current demo task is salary prediction: predict `salary` for vacancies.
-The metric is `mae`.
+- `web_server.py` - browser UI and benchmark loop for running the LLM agent;
+- `agent/` - command parser, executor, trajectory logging, and feedback hints;
+- `checker/` - task files, metric checker, and upload/scoring server.
 
-## Project Mechanics
+Bundled tasks live in `checker/tasks/`, including salary prediction, map
+prediction, and wifi prediction.
 
-The intended loop is:
+## Project Loop
 
-1. An LLM produces a command or a short response containing one command.
-2. `agent` extracts, parses, validates, and executes the command.
-3. The executed command is appended to `agent_history.txt`.
-4. The agent receives command output plus abstract feedback hints.
-5. The agent improves the solution and eventually calls `submit(file)`.
-6. `checker` validates the submission and returns the metric.
+The intended benchmark loop is:
 
-## LLM Agent Web UI
+1. The web runner copies public task files into an isolated workspace under
+   `benchmark_runs/`.
+2. The LLM receives the task prompt and answers with agent commands.
+3. `agent.parser` extracts valid commands even if the model includes short
+   surrounding text.
+4. `agent.executor` executes commands inside the run workspace.
+5. Every executed command is appended to `agent_history.txt`.
+6. The LLM receives command outputs plus abstract feedback hints.
+7. The loop continues according to the selected run mode.
+8. The run ends when the model calls `submit(file)` or when the runner performs
+   a forced final submit.
+9. `checker` validates the submitted file and returns the metric.
+
+The LLM never receives hidden answer files. They are only used by `submit(file)`
+for scoring.
+
+## Agent Web UI
 
 The main interface for the benchmark is the agent runner. It starts the LLM,
 shows the model responses, parsed commands, command outputs, feedback hints,
@@ -30,7 +42,8 @@ budget counters, and the final submission result.
 Run:
 
 ```bash
-export OPENAI_API_KEY="your_api_key_here"
+export OPENAI_API_KEY="your_openai_key"
+export LETOVO_API_KEY="your_letovo_key"
 python3 web_server.py --host 127.0.0.1 --port 8010
 ```
 
@@ -43,27 +56,43 @@ http://127.0.0.1:8010/
 From the page you can:
 
 - choose a task;
-- choose a model; Letovo models and ChatGPT models switch endpoints automatically;
-- use Letovo models: `deepseek-v4-flash`, `gemma-4-26b`;
-- use ChatGPT models: `gpt-5-mini`, `gpt-4.1-mini`, `gpt-4o-mini`, `gpt-4.1-nano`;
+- choose a model;
 - choose a run mode: `single-shot`, `repeated`, `fixed-transitions`, or `flexible`;
 - start or stop a benchmark run;
 - watch the live trajectory of prompts, model responses, commands, results, and hints;
 - see the final `submit(file)` result.
 
+Supported model choices:
+
+- Letovo: `deepseek-v4-flash`, `gemma-4-26b`;
+- OpenAI: `gpt-5-mini`, `gpt-4.1-mini`, `gpt-4o-mini`, `gpt-4.1-nano`.
+
+Letovo models use `LETOVO_API_KEY`; OpenAI models use `OPENAI_API_KEY`. A custom
+OpenAI-compatible endpoint can be set with `LLM_URL`.
+
 Each run gets an isolated workspace under `benchmark_runs/`. Public task files
 such as `train.csv`, `test.csv`, and public `task.json` are copied there. Hidden
 answer files stay in `checker/tasks/...` and are only used by `submit(file)`.
 
-Run modes control how the web runner drives the command loop:
+## Run Modes
 
-- `single-shot`: the model gets one response; if it does not call `submit(file)`,
-  the runner performs a forced final submit.
-- `repeated`: the model can make up to five attempts before forced final submit.
-- `fixed-transitions`: the run advances through `EDA`, `FEATURES`, and `TRAIN`;
-  early `submit(file)` calls are blocked until `TRAIN`.
-- `flexible`: the model can iterate freely until it submits or hits configured
-  limits.
+Run modes define how many model responses the agent gets and how the benchmark
+loop transitions between attempts.
+
+- `single-shot`: the model gets exactly one response for the whole task. It may
+  return multiple commands in that response, but there is no second model
+  attempt. The prompt tells the model to complete the solution end-to-end and
+  finish with `submit("submission.csv")`.
+- `repeated`: the model gets up to five attempts. After each attempt, the runner
+  sends back command results and feedback hints. The prompt tells the model to
+  improve or verify the solution on each attempt, avoid premature submission
+  when useful checks remain, and submit on the final attempt.
+- `fixed-transitions`: the runner moves through three required stages:
+  `EDA -> FEATURES -> TRAIN`. The model gets stage-specific instructions.
+  `submit(file)` is blocked during `EDA` and `FEATURES`; the `TRAIN` stage must
+  create, verify, and submit `submission.csv`.
+- `flexible`: the model can choose commands freely until it submits or reaches
+  configured limits.
 
 If limits are reached before submit, the runner still performs a forced final
 submit: existing `submission.csv` is used when present, otherwise a simple
@@ -161,11 +190,11 @@ Environment:
 
 - `get_budget_status()`
 - `get_remaining_time()`
-- `get_hints()`
 
 Logging:
 
 - `get_trajectory()`
+- `get_hints()`
 
 Submission:
 
@@ -206,11 +235,12 @@ Build the benchmark image once:
 docker build -f Dockerfile.benchmark -t ml-benchmark-runner:latest .
 ```
 
-By default, `main.py` creates a per-run container from this prebuilt image and
-mounts a fresh workspace containing the public task files. Dependencies are not
-installed during each benchmark run. The image includes OpenMP runtime plus the
-ML stack from `requirements-ml.txt`: pandas, NumPy, SciPy, scikit-learn,
-plotting libraries, gradient boosting libraries, and Optuna.
+`main.py` can run a lower-level benchmark loop with or without Docker. By
+default, it creates a per-run container from this prebuilt image and mounts a
+fresh workspace containing public task files. Dependencies are not installed
+during each benchmark run. The image includes the ML stack from
+`requirements-ml.txt`: pandas, NumPy, SciPy, scikit-learn, plotting libraries,
+gradient boosting libraries, and Optuna.
 
 Use a different prebuilt image:
 
@@ -262,9 +292,11 @@ Example hint:
 }
 ```
 
-During the benchmark loop, feedback is added once after the full batch of
-commands from the latest model response has executed. The LLM can explicitly
-request the same hints with:
+During the benchmark loop, feedback is added after the full batch of commands
+from the latest model response has executed. The hints are intentionally
+abstract: they point the model toward issues such as missing values, target
+definition, leakage, validation, or submission format without revealing hidden
+answers. The LLM can explicitly request the same hints with:
 
 ```text
 get_hints()
@@ -289,6 +321,9 @@ checker: OK
 ## Repository Structure
 
 ```text
+web_server.py      browser UI and LLM benchmark runner
+main.py            lower-level benchmark loop
+
 agent/
   parser.py        command parsing and command extraction from model responses
   executor.py      command execution and trajectory logging
@@ -300,4 +335,6 @@ checker/
   server.py
   tasks/
     salary_prediction/
+    map/
+    wifi/
 ```

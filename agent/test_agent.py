@@ -28,6 +28,7 @@ from web_server import (
     apply_mode_after_results,
     apply_mode_instruction,
     current_fixed_stage,
+    record_fixed_stage_attempt,
     list_workspace_files,
     resolve_workspace_file,
     validate_mode_command,
@@ -652,12 +653,23 @@ class WebServerModeTest(unittest.TestCase):
         state = self._state("fixed-transitions")
 
         self.assertEqual(current_fixed_stage(state), "EDA")
+        for _ in range(2):
+            record_fixed_stage_attempt(state)
+            self.assertIsNone(apply_mode_after_results(state, [{"status": "ok", "command": "read_file"}]))
+            self.assertEqual(current_fixed_stage(state), "EDA")
+        record_fixed_stage_attempt(state)
         self.assertIsNone(apply_mode_after_results(state, [{"status": "ok", "command": "read_file"}]))
         self.assertEqual(current_fixed_stage(state), "FEATURES")
         self.assertIsNone(apply_mode_after_results(state, [{"status": "error", "command": "write_file"}]))
         self.assertEqual(current_fixed_stage(state), "FEATURES")
+        for _ in range(4):
+            record_fixed_stage_attempt(state)
+            self.assertIsNone(apply_mode_after_results(state, [{"status": "ok", "command": "write_file"}]))
+            self.assertEqual(current_fixed_stage(state), "FEATURES")
+        record_fixed_stage_attempt(state)
         self.assertIsNone(apply_mode_after_results(state, [{"status": "ok", "command": "write_file"}]))
         self.assertEqual(current_fixed_stage(state), "TRAIN")
+        record_fixed_stage_attempt(state)
         self.assertEqual(
             apply_mode_after_results(state, [{"status": "ok", "command": "run_python"}]),
             "fixed_transitions_finished",

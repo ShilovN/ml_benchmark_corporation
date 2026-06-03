@@ -54,10 +54,14 @@ TOKEN_ESTIMATE_CHARS_PER_TOKEN = 3
 MAX_HISTORY_MESSAGES = 6
 FINAL_SUBMIT_MAX_TOKENS = 1200
 FINAL_SUBMIT_TOKEN_RESERVE = 300
+SINGLE_SHOT_MIN_MAX_TOKENS = 4096
 ALLOWED_MODES = {"single-shot", "repeated", "fixed-transitions", "flexible"}
 DEFAULT_MODE = "flexible"
 REPEATED_MAX_ATTEMPTS = 5
+SINGLE_SHOT_ALLOWED_COMMANDS = {"write_file", "run_python", "submit"}
+PRODUCTIVE_SOLUTION_COMMANDS = {"write_file", "edit_file", "run_python"}
 FIXED_TRANSITION_STAGES = ["EDA", "FEATURES", "TRAIN"]
+FIXED_STAGE_MIN_ATTEMPTS = {"EDA": 3, "FEATURES": 5, "TRAIN": 1}
 FIXED_STAGE_ALLOWED_COMMANDS = {
     "EDA": {
         "list_files",
@@ -121,6 +125,7 @@ class RunState:
     stop_requested: bool = False
     final_submit_requested: bool = False
     fixed_stage_index: int = 0
+    fixed_stage_attempts: dict[str, int] = field(default_factory=dict)
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -218,6 +223,8 @@ class AgentRunManager:
                     break
                 history = compact_history(history)
                 request_max_tokens = state.config.max_tokens
+                if state.config.mode == "single-shot":
+                    request_max_tokens = max(request_max_tokens, SINGLE_SHOT_MIN_MAX_TOKENS)
                 if should_stop_before_next_llm_request(state, user_message, history, request_max_tokens):
                     final_message = build_emergency_submit_prompt(state)
                     if state.final_submit_requested or not can_send_llm_request(
@@ -254,6 +261,8 @@ class AgentRunManager:
                     timeout=state.config.request_timeout,
                 )
                 state.requests += 1
+                if state.config.mode == "fixed-transitions":
+                    record_fixed_stage_attempt(state)
                 usage = response.get("usage", {})
                 if isinstance(usage, dict):
                     state.total_tokens += int(usage.get("total_tokens") or 0)
@@ -281,6 +290,15 @@ class AgentRunManager:
                     )
                     continue
 
+                batch_error = validate_mode_command_batch(state, commands)
+                if batch_error:
+                    add_event(state, "parse_error", "Invalid command batch", batch_error)
+                    if should_retry_after_batch_error(state):
+                        user_message = apply_mode_instruction(state, build_batch_error_prompt(batch_error))
+                        continue
+                    state.stop_reason = batch_error["reason"]
+                    break
+
                 results: list[dict[str, Any]] = []
                 for command in commands:
                     add_event(state, "command", command.name, {"args": command.args})
@@ -300,6 +318,10 @@ class AgentRunManager:
                 if state.submitted:
                     break
 
+                if state.config.mode == "single-shot":
+                    state.stop_reason = "single_shot_missing_successful_submit"
+                    break
+
                 mode_stop_reason = apply_mode_after_results(state, results)
                 if mode_stop_reason:
                     state.stop_reason = mode_stop_reason
@@ -314,6 +336,14 @@ class AgentRunManager:
                 state.status = "stopped"
             elif state.submitted:
                 state.status = "completed"
+            elif state.config.mode == "single-shot":
+                self._force_final_submit(state)
+                state.status = "completed"
+            elif not should_force_final_submit(state):
+                state.status = "error"
+                if not state.error:
+                    state.error = mode_failure_message(state)
+                add_event(state, "error", "Run failed before valid submit", {"error": state.error})
             else:
                 self._force_final_submit(state)
                 state.status = "stopped"
@@ -339,10 +369,20 @@ class AgentRunManager:
                 source = "auto-generated baseline submission.csv"
 
             command = ParsedCommand("submit", {"file": "submission.csv"})
+            if state.config.mode == "single-shot":
+                title = "Single-shot final submit"
+                result_title = "single-shot submit"
+                stop_suffix = "single_shot_submit"
+                error_prefix = "Single-shot final submit failed"
+            else:
+                title = "Forced final submit"
+                result_title = "forced submit"
+                stop_suffix = "forced_submit"
+                error_prefix = "Forced final submit failed"
             add_event(
                 state,
                 "command",
-                "Forced final submit",
+                title,
                 {"reason": reason, "source": source, "args": command.args},
             )
             state.executor.context.max_steps = max(
@@ -352,17 +392,23 @@ class AgentRunManager:
             result = state.executor.execute(command)
             state.submitted = True
             state.submission_result = result
-            state.stop_reason = f"{reason}_forced_submit" if reason else "forced_submit"
-            add_event(state, "result", f"forced submit: {result['status']}", result)
+            if state.config.mode == "single-shot":
+                state.stop_reason = stop_suffix
+            else:
+                state.stop_reason = f"{reason}_{stop_suffix}" if reason else stop_suffix
+            add_event(state, "result", f"{result_title}: {result['status']}", result)
         except Exception as exc:
             state.submitted = True
             state.submission_result = {
                 "status": "error",
                 "command": "submit",
-                "error": f"Forced final submit failed: {exc}",
+                "error": f"{error_prefix}: {exc}",
             }
-            state.stop_reason = f"{reason}_forced_submit_failed" if reason else "forced_submit_failed"
-            add_event(state, "error", "Forced final submit failed", {"error": str(exc)})
+            if state.config.mode == "single-shot":
+                state.stop_reason = f"{stop_suffix}_failed"
+            else:
+                state.stop_reason = f"{reason}_{stop_suffix}_failed" if reason else f"{stop_suffix}_failed"
+            add_event(state, "error", error_prefix, {"error": str(exc)})
 
 
 def make_handler(manager: AgentRunManager) -> type[BaseHTTPRequestHandler]:
@@ -616,32 +662,118 @@ def mode_instruction(state: RunState) -> str:
     mode = state.config.mode
     if mode == "single-shot":
         return (
-            "Режим single-shot: это единственный ответ модели. "
-            "Сразу создай/проверь submission.csv и вызови submit(\"submission.csv\")."
+            "Режим single-shot: у тебя ровно один ответ модели на всю задачу. "
+            "В этом ответе можно вернуть несколько команд подряд, но после их выполнения новых попыток не будет. "
+            "Файлы train.csv, test.csv и task.json уже показаны выше, поэтому НЕ трать единственный ответ на list_files/read_file/load_dataset/show_sample_rows. "
+            "В single-shot разрешены только продуктивные команды: write_file, run_python, submit. "
+            "Ответ без submit(\"submission.csv\") будет отклонен.\n"
+            "Лучший формат для длинного кода:\n"
+            "Мысль: делаю полный быстрый пайплайн и отправляю решение\n"
+            "```command\n"
+            "run_python(\"\"\"\n"
+            "<полный python-код: читает train.csv/test.csv, обучает или строит baseline, создает submission.csv и печатает проверку формата>\n"
+            "\"\"\")\n"
+            "```\n"
+            "```command\n"
+            "submit(\"submission.csv\")\n"
+            "```\n"
+            "Если сложная модель рискованна, сделай простой валидный baseline, но обязательно создай submission.csv и вызови submit."
         )
     if mode == "repeated":
         attempt = min(state.requests + 1, REPEATED_MAX_ATTEMPTS)
+        if attempt == 1:
+            stage_note = (
+                "Это единственная попытка, где можно в основном читать и изучать файлы. "
+                "К концу ответа сформулируй следующий продуктивный шаг."
+            )
+        elif attempt < REPEATED_MAX_ATTEMPTS:
+            stage_note = (
+                "На этой попытке одних read_file/list_files уже недостаточно. "
+                "Обязательно создай или измени решение продуктивной командой: write_file, edit_file или run_python. "
+                "Сделай baseline, признаки, обучение, валидацию или генерацию submission.csv."
+            )
+        else:
+            stage_note = (
+                "Это последняя попытка. Используй лучшее уже подготовленное решение, "
+                "создай/проверь submission.csv и обязательно вызови submit(\"submission.csv\")."
+            )
         return (
             f"Режим repeated: попытка {attempt}/{REPEATED_MAX_ATTEMPTS}. "
-            "Каждая попытка должна улучшать или проверять решение; при готовности вызывай submit."
+            "После каждой попытки ты получаешь результаты команд и можешь улучшить решение в следующей попытке. "
+            "Не трать несколько попыток подряд только на открытие файлов. "
+            f"{stage_note}"
         )
     if mode == "fixed-transitions":
         stage = current_fixed_stage(state)
+        attempt = current_fixed_stage_attempt(state) + 1
+        minimum = FIXED_STAGE_MIN_ATTEMPTS.get(stage, 1)
         if stage == "EDA":
-            detail = "изучи файлы и данные; не вызывай submit на этом этапе"
+            detail = (
+                "это этап 1/3. Изучи файлы, целевую колонку, размер данных, пропуски, распределения и первые идеи признаков. "
+                "На этом этапе submit запрещен."
+            )
         elif stage == "FEATURES":
-            detail = "подготовь признаки, скрипты или промежуточные файлы; submit пока запрещен"
+            detail = (
+                "это этап 2/3. Подготовь и сравни признаки, предобработку и скрипты для обучения/инференса. "
+                "На этом этапе submit еще запрещен."
+            )
         else:
-            detail = "обучи модель, создай submission.csv, проверь формат и вызови submit"
-        return f"Режим fixed-transitions: текущий обязательный этап {stage}. Задача этапа: {detail}."
+            detail = (
+                "это этап 3/3. Обучи или запусти лучшую модель, создай и проверь submission.csv, "
+                "затем обязательно вызови submit(\"submission.csv\")."
+            )
+        return (
+            f"Режим fixed-transitions: текущий обязательный этап {stage}. "
+            f"Итерация этапа {attempt}/{minimum}. "
+            "Этапы идут строго по порядку: EDA -> FEATURES -> TRAIN; команды вне текущего этапа блокируются. "
+            "Не пытайся завершить этап за один короткий ответ: используй несколько итераций на глубину, как в flexible. "
+            f"Задача этапа: {detail}"
+        )
     if mode == "flexible":
-        return "Режим flexible: можно свободно выбирать следующие агентские команды до submit или лимитов."
+        return flexible_mode_instruction(state)
     return ""
+
+
+def flexible_mode_instruction(state: RunState) -> str:
+    budget = build_budget_payload(state)
+    remaining_steps = int(budget["remaining_steps"])
+    remaining_percent = budget["remaining_token_percent"]
+    if remaining_steps <= FINALIZE_REMAINING_STEPS or (
+        remaining_percent is not None and remaining_percent <= FINALIZE_REMAINING_TOKEN_RATIO * 100
+    ):
+        return (
+            "Режим flexible: финальная стадия. Используй лучшее уже подготовленное решение, "
+            "проверь submission.csv и вызывай submit(\"submission.csv\")."
+        )
+    if state.requests <= 1:
+        return (
+            "Режим flexible: это ранняя стадия решения, не отправляй submit сразу. "
+            "Сначала используй доступные итерации на EDA, проверку формата, baseline, валидацию и хотя бы одно улучшение модели. "
+            "Submit уместен только после созданного submission.csv и понятной проверки качества/формата."
+        )
+    if remaining_percent is not None and remaining_percent >= 55:
+        return (
+            "Режим flexible: бюджет еще большой, продолжай улучшать решение вместо раннего submit. "
+            "Сравни baseline с более сильной моделью, проверь признаки, валидацию и формат submission.csv."
+        )
+    return (
+        "Режим flexible: можно свободно выбирать следующие агентские команды. "
+        "Доведи решение до лучшего найденного качества и отправляй submit только когда файл проверен или началась финальная стадия."
+    )
 
 
 def current_fixed_stage(state: RunState) -> str:
     index = min(state.fixed_stage_index, len(FIXED_TRANSITION_STAGES) - 1)
     return FIXED_TRANSITION_STAGES[index]
+
+
+def current_fixed_stage_attempt(state: RunState) -> int:
+    return int(state.fixed_stage_attempts.get(current_fixed_stage(state), 0))
+
+
+def record_fixed_stage_attempt(state: RunState) -> None:
+    stage = current_fixed_stage(state)
+    state.fixed_stage_attempts[stage] = current_fixed_stage_attempt(state) + 1
 
 
 def validate_mode_command(state: RunState, command: ParsedCommand) -> dict[str, Any] | None:
@@ -661,6 +793,103 @@ def validate_mode_command(state: RunState, command: ParsedCommand) -> dict[str, 
     }
 
 
+def validate_mode_command_batch(state: RunState, commands: list[ParsedCommand]) -> dict[str, Any] | None:
+    command_names = [command.name for command in commands]
+    if state.config.mode == "repeated":
+        return validate_repeated_command_batch(state, command_names)
+    if state.config.mode == "fixed-transitions":
+        return validate_fixed_transition_command_batch(state, command_names)
+    if state.config.mode != "single-shot":
+        return None
+    disallowed = [name for name in command_names if name not in SINGLE_SHOT_ALLOWED_COMMANDS]
+    if disallowed:
+        return {
+            "reason": "single_shot_disallowed_commands",
+            "error": (
+                "Single-shot must not spend its only response on exploration commands. "
+                f"Disallowed commands: {', '.join(disallowed)}. "
+                "Use run_python/write_file to create submission.csv, then submit(\"submission.csv\")."
+            ),
+            "commands": command_names,
+            "allowed_commands": sorted(SINGLE_SHOT_ALLOWED_COMMANDS),
+        }
+    if "submit" not in command_names:
+        return {
+            "reason": "single_shot_missing_submit",
+            "error": "Single-shot response must include submit(\"submission.csv\") in the same answer.",
+            "commands": command_names,
+            "allowed_commands": sorted(SINGLE_SHOT_ALLOWED_COMMANDS),
+        }
+    if not any(name in {"run_python", "write_file"} for name in command_names):
+        return {
+            "reason": "single_shot_missing_solution_command",
+            "error": "Single-shot response must create or run a solution before submit.",
+            "commands": command_names,
+            "allowed_commands": sorted(SINGLE_SHOT_ALLOWED_COMMANDS),
+        }
+    return None
+
+
+def validate_fixed_transition_command_batch(state: RunState, command_names: list[str]) -> dict[str, Any] | None:
+    stage = current_fixed_stage(state)
+    has_productive = any(name in PRODUCTIVE_SOLUTION_COMMANDS for name in command_names)
+    has_submit = "submit" in command_names
+    if stage == "FEATURES" and not has_productive:
+        return {
+            "reason": "fixed_features_no_productive_progress",
+            "error": (
+                "FEATURES stage must create or change the solution. "
+                "Use write_file, edit_file, or run_python for preprocessing, features, or reusable scripts."
+            ),
+            "stage": stage,
+            "commands": command_names,
+            "productive_commands": sorted(PRODUCTIVE_SOLUTION_COMMANDS),
+        }
+    if stage == "TRAIN":
+        if not has_productive and not (state.workspace / "submission.csv").exists():
+            return {
+                "reason": "fixed_train_no_solution",
+                "error": (
+                    "TRAIN stage must train/run a solution or create submission.csv before submit. "
+                    "Use run_python or write_file, then submit(\"submission.csv\")."
+                ),
+                "stage": stage,
+                "commands": command_names,
+                "productive_commands": sorted(PRODUCTIVE_SOLUTION_COMMANDS),
+            }
+        if not has_submit:
+            return {
+                "reason": "fixed_train_missing_submit",
+                "error": "TRAIN stage must include the model's own submit(\"submission.csv\") command.",
+                "stage": stage,
+                "commands": command_names,
+            }
+    return None
+
+
+def validate_repeated_command_batch(state: RunState, command_names: list[str]) -> dict[str, Any] | None:
+    attempt = state.requests
+    has_productive = any(name in PRODUCTIVE_SOLUTION_COMMANDS for name in command_names)
+    has_submit = "submit" in command_names
+    if attempt >= REPEATED_MAX_ATTEMPTS and not has_submit:
+        return {
+            "reason": "repeated_final_missing_submit",
+            "error": "Final repeated attempt must include submit(\"submission.csv\").",
+            "commands": command_names,
+        }
+    if attempt >= 2 and not has_productive and not has_submit:
+        return {
+            "reason": "repeated_no_productive_progress",
+            "error": (
+                "Repeated mode allows exploration at the beginning, but this attempt must make productive progress. "
+                "Use write_file, edit_file, or run_python to build, validate, or improve the solution."
+            ),
+            "commands": command_names,
+            "productive_commands": sorted(PRODUCTIVE_SOLUTION_COMMANDS),
+        }
+    return None
+
+
 def apply_mode_after_results(state: RunState, results: list[dict[str, Any]]) -> str | None:
     if state.config.mode == "single-shot":
         return "single_shot_finished"
@@ -675,6 +904,21 @@ def apply_mode_after_results(state: RunState, results: list[dict[str, Any]]) -> 
         return None
 
     stage = current_fixed_stage(state)
+    stage_attempts = current_fixed_stage_attempt(state)
+    minimum_attempts = FIXED_STAGE_MIN_ATTEMPTS.get(stage, 1)
+    if stage_attempts < minimum_attempts:
+        add_event(
+            state,
+            "stage",
+            f"{stage} continues",
+            {
+                "stage": stage,
+                "attempts": stage_attempts,
+                "minimum_attempts": minimum_attempts,
+            },
+        )
+        return None
+
     add_event(state, "stage", f"{stage} completed", {"stage": stage})
     if stage == "TRAIN":
         return "fixed_transitions_finished"
@@ -684,12 +928,65 @@ def apply_mode_after_results(state: RunState, results: list[dict[str, Any]]) -> 
     return None
 
 
+def should_force_final_submit(state: RunState) -> bool:
+    if state.config.mode == "single-shot":
+        return False
+    if state.config.mode == "fixed-transitions":
+        return False
+    if state.config.mode == "repeated" and not (state.workspace / "submission.csv").exists():
+        return has_productive_history(state)
+    return True
+
+
+def has_productive_history(state: RunState) -> bool:
+    return any(
+        record.get("command") in PRODUCTIVE_SOLUTION_COMMANDS
+        for record in state.executor.context.trajectory
+    )
+
+
+def mode_failure_message(state: RunState) -> str:
+    if state.config.mode == "single-shot":
+        return "Single-shot response did not produce executable commands or submission.csv."
+    if state.config.mode == "repeated":
+        return "Repeated mode ended without productive solution commands or submission.csv."
+    if state.config.mode == "fixed-transitions":
+        return "Fixed-transitions mode ended before the model produced its own submit(\"submission.csv\")."
+    return "Run ended before a valid submission was produced."
+
+
+def should_retry_after_batch_error(state: RunState) -> bool:
+    if state.config.mode == "repeated":
+        return state.requests < REPEATED_MAX_ATTEMPTS
+    return state.config.mode == "fixed-transitions"
+
+
+def build_batch_error_prompt(batch_error: dict[str, Any]) -> str:
+    return (
+        "Предыдущий ответ не подходит для текущего режима.\n"
+        f"Ошибка: {batch_error.get('error', 'invalid command batch')}\n"
+        "Верни короткую строку `Мысль: ...`, затем команды, которые реально продвигают решение. "
+        "Если это последняя попытка, создай/проверь submission.csv и вызови submit(\"submission.csv\")."
+    )
+
+
 def build_followup_prompt(results: list[dict[str, Any]], feedback: dict[str, Any], state: RunState) -> str:
     used_steps = state.executor.context.used_steps
     max_steps = state.config.max_steps
     remaining_steps = max(0, max_steps - used_steps)
+    if state.config.mode == "fixed-transitions":
+        opener = fixed_transition_followup_opener(state)
+    elif state.config.mode == "repeated":
+        opener = repeated_followup_opener(state)
+    elif state.config.mode == "flexible" and not is_finalization_phase(state):
+        opener = (
+            "Продолжай улучшать решение. Верни короткую строку `Мысль: ...`, затем следующую команду или команды. "
+            "Не вызывай submit рано: сначала используй итерации на проверку данных, признаки, валидацию и улучшение модели."
+        )
+    else:
+        opener = "Продолжай решение. Верни короткую строку `Мысль: ...`, затем следующую команду или команды."
     lines = [
-        "Продолжай решение. Верни короткую строку `Мысль: ...`, затем следующую команду или команды.",
+        opener,
         "",
         "Статус benchmark:",
         (
@@ -709,6 +1006,53 @@ def build_followup_prompt(results: list[dict[str, Any]], feedback: dict[str, Any
         lines.extend(["", "Подсказки:"])
         lines.extend(feedback_lines)
     return "\n".join(lines)
+
+
+def repeated_followup_opener(state: RunState) -> str:
+    next_attempt = min(state.requests + 1, REPEATED_MAX_ATTEMPTS)
+    if next_attempt >= REPEATED_MAX_ATTEMPTS:
+        return (
+            "Это последняя repeated-попытка. Верни короткую строку `Мысль: ...`, затем команды: "
+            "создай или проверь submission.csv и обязательно вызови submit(\"submission.csv\")."
+        )
+    if next_attempt >= 2:
+        return (
+            "Продолжай repeated-решение. Верни короткую строку `Мысль: ...`, затем команды с продуктивным шагом: "
+            "write_file, edit_file или run_python для baseline, признаков, обучения, валидации или submission.csv. "
+            "Не трать попытку только на открытие файлов."
+        )
+    return "Продолжай решение. Верни короткую строку `Мысль: ...`, затем следующую команду или команды."
+
+
+def fixed_transition_followup_opener(state: RunState) -> str:
+    stage = current_fixed_stage(state)
+    attempts = current_fixed_stage_attempt(state)
+    minimum = FIXED_STAGE_MIN_ATTEMPTS.get(stage, 1)
+    progress = f"Итераций этапа: {attempts}/{minimum}."
+    if stage == "EDA":
+        return (
+            f"Продолжай fixed-transitions этап EDA. {progress} "
+            "Верни короткую строку `Мысль: ...`, затем команды для более глубокого анализа данных. "
+            "Переход к FEATURES произойдет только после минимального числа EDA-итераций."
+        )
+    if stage == "FEATURES":
+        return (
+            f"Продолжай fixed-transitions этап FEATURES. {progress} "
+            "Верни короткую строку `Мысль: ...`, затем продуктивные команды "
+            "write_file, edit_file или run_python для признаков, preprocessing или скриптов решения."
+        )
+    return (
+        "Продолжай fixed-transitions этап TRAIN. Верни короткую строку `Мысль: ...`, затем команды, которые создают/проверяют "
+        "submission.csv, и обязательно вызови submit(\"submission.csv\"). Без собственного submit этап TRAIN не завершится."
+    )
+
+
+def is_finalization_phase(state: RunState) -> bool:
+    budget = build_budget_payload(state)
+    if budget["remaining_steps"] <= FINALIZE_REMAINING_STEPS:
+        return True
+    percent = budget["remaining_token_percent"]
+    return percent is not None and percent <= FINALIZE_REMAINING_TOKEN_RATIO * 100
 
 
 def format_web_command_result(index: int, result: dict[str, Any]) -> list[str]:
