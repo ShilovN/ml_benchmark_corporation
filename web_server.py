@@ -422,7 +422,7 @@ class AgentRunManager:
                 "value": metric.get("value"),
             })
 
-            return runs
+        return runs
 
 def make_handler(manager: AgentRunManager) -> type[BaseHTTPRequestHandler]:
     class AgentWebHandler(BaseHTTPRequestHandler):
