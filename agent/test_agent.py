@@ -513,9 +513,16 @@ class WebServerModeTest(unittest.TestCase):
 
     def test_mode_instruction_mentions_current_mode(self) -> None:
         fixed_state = self._state("fixed-transitions")
+        flexible_state = self._state("flexible")
         repeated_state = self._state("repeated")
 
-        self.assertIn("текущий обязательный этап EDA", apply_mode_instruction(fixed_state, "base"))
+        fixed_prompt = apply_mode_instruction(fixed_state, "base")
+        flexible_prompt = apply_mode_instruction(flexible_state, "base")
+
+        self.assertIn("текущий обязательный этап EDA", fixed_prompt)
+        self.assertIn("stage: EDA", fixed_prompt)
+        self.assertIn("Режим flexible", flexible_prompt)
+        self.assertIn("укажи текущий stage", flexible_prompt)
         self.assertIn(f"попытка 1/{REPEATED_MAX_ATTEMPTS}", apply_mode_instruction(repeated_state, "base"))
 
 

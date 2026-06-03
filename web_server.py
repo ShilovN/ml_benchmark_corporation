@@ -597,9 +597,12 @@ def mode_instruction(state: RunState) -> str:
             detail = "подготовь признаки, скрипты или промежуточные файлы; submit пока запрещен"
         else:
             detail = "обучи модель, создай submission.csv, проверь формат и вызови submit"
-        return f"Режим fixed-transitions: текущий обязательный этап {stage}. Задача этапа: {detail}."
+        return (
+            f"Режим fixed-transitions: текущий обязательный этап {stage}. Задача этапа: {detail}. "
+            f"В начале ответа укажи stage: {stage}."
+        )
     if mode == "flexible":
-        return "Режим flexible: можно свободно выбирать следующие агентские команды до submit или лимитов."
+        return "Режим flexible: продолжай решение до submit или лимитов. В начале ответа укажи текущий stage."
     return ""
 
 
