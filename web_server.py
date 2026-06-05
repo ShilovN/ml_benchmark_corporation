@@ -173,6 +173,8 @@ class AgentRunManager:
         self.keep_containers = keep_containers
         self.runs: dict[str, RunState] = {}
         self.lock = threading.Lock()
+        self.history_dir = self.run_root / "history"
+        self.history_dir.mkdir(parents=True, exist_ok=True)
 
     def list_tasks(self) -> list[dict[str, Any]]:
         tasks: list[dict[str, Any]] = []
@@ -221,6 +223,7 @@ class AgentRunManager:
         state.thread = thread
         with self.lock:
             self.runs[run_id] = state
+        self.save_run(state)
         thread.start()
         return state
 
@@ -398,6 +401,7 @@ class AgentRunManager:
             state.error = str(exc)
             add_event(state, "error", "Run failed", {"error": str(exc)})
         finally:
+            self.save_run(state)
             if state.created_container and state.docker_container and not self.keep_containers:
                 remove_container(state.docker_container)
 
