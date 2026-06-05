@@ -2388,6 +2388,12 @@ function applyTrajectoryUiState(){
     });
   });
 }
+function isScrolledToBottom(element, threshold=24){
+  return element.scrollHeight - element.scrollTop - element.clientHeight <= threshold;
+}
+function scrollToBottom(element){
+  element.scrollTop = element.scrollHeight;
+}
 function eventPreviewHtml(event){
   const text = truncateText(eventMainText(event));
   return text ? `<div class="event-preview">${esc(text)}</div>` : '';
@@ -2512,6 +2518,7 @@ function formatBytes(size){
   return `${(value / 1024 / 1024).toFixed(1)} MB`;
 }
 function render(run){
+  const shouldStickToBottom = isScrolledToBottom(eventsEl);
   saveCsvScrollPositions();
   statusEl.textContent = run.status + ' / ' + run.stop_reason;
   statusEl.classList.remove('is-thinking');
@@ -2581,7 +2588,8 @@ function render(run){
     message.textContent = `Mode: ${run.mode}. Task: ${run.task_id}. Модель размышляет...`;
   }
   eventsEl.innerHTML = turns.length ? turns.map(renderTurn).join('') : '<div class="message">No events yet.</div>';
-applyTrajectoryUiState();
+  applyTrajectoryUiState();
+  if(shouldStickToBottom) scrollToBottom(eventsEl);
 }
 start.addEventListener('click', startRun);
 stop.addEventListener('click', stopRun);
