@@ -28,6 +28,9 @@ from web_server import (
     apply_mode_after_results,
     apply_mode_instruction,
     current_fixed_stage,
+    extract_commands,
+    record_fixed_stage_attempt,
+    validate_mode_command_batch,
     list_workspace_files,
     resolve_workspace_file,
     validate_mode_command,
@@ -79,8 +82,8 @@ load_dataset("train.csv")
 
         self.assertEqual(extract_command_text(text), 'read_file("checker/README.md")')
 
-    def test_extract_command_after_short_comment(self) -> None:
-        text = """Посмотрю, какие файлы есть в проекте.
+    def test_extract_command_after_short_thought(self) -> None:
+        text = """Мысль: Посмотрю, какие файлы есть в проекте.
 list_files(".")"""
 
         command = parse_model_response(text)
@@ -648,16 +651,48 @@ class WebServerModeTest(unittest.TestCase):
         self.assertIn("not allowed during EDA", error["error"])
         self.assertIsNone(allowed)
 
+    def test_extract_commands_accepts_single_shot_fenced_batch(self) -> None:
+        text = '''Мысль: делаю решение
+```command
+run_python("""
+print("create submission")
+""")
+submit("submission.csv")
+```'''
+
+        commands = extract_commands(text)
+
+        self.assertEqual([command.name for command in commands], ["run_python", "submit"])
+        self.assertIn("create submission", commands[0].args["code_or_file"])
+
+    def test_single_shot_submit_only_is_not_batch_error(self) -> None:
+        state = self._state("single-shot")
+
+        error = validate_mode_command_batch(state, [parse_command('submit("submission.csv")')])
+
+        self.assertIsNone(error)
+
     def test_fixed_transitions_advances_stages_and_finishes_after_train(self) -> None:
         state = self._state("fixed-transitions")
 
         self.assertEqual(current_fixed_stage(state), "EDA")
+        for _ in range(2):
+            record_fixed_stage_attempt(state)
+            self.assertIsNone(apply_mode_after_results(state, [{"status": "ok", "command": "read_file"}]))
+            self.assertEqual(current_fixed_stage(state), "EDA")
+        record_fixed_stage_attempt(state)
         self.assertIsNone(apply_mode_after_results(state, [{"status": "ok", "command": "read_file"}]))
         self.assertEqual(current_fixed_stage(state), "FEATURES")
         self.assertIsNone(apply_mode_after_results(state, [{"status": "error", "command": "write_file"}]))
         self.assertEqual(current_fixed_stage(state), "FEATURES")
+        for _ in range(4):
+            record_fixed_stage_attempt(state)
+            self.assertIsNone(apply_mode_after_results(state, [{"status": "ok", "command": "write_file"}]))
+            self.assertEqual(current_fixed_stage(state), "FEATURES")
+        record_fixed_stage_attempt(state)
         self.assertIsNone(apply_mode_after_results(state, [{"status": "ok", "command": "write_file"}]))
         self.assertEqual(current_fixed_stage(state), "TRAIN")
+        record_fixed_stage_attempt(state)
         self.assertEqual(
             apply_mode_after_results(state, [{"status": "ok", "command": "run_python"}]),
             "fixed_transitions_finished",

@@ -743,8 +743,8 @@ def build_initial_prompt(
     budget_line = format_budget_line(stats, args)
     return (
         f"{budget_line}\n\n"
-        "ML benchmark. В каждом ответе сначала напиши одну короткую строку намерения, "
-        "затем агентские команды, по одной на строку. "
+        "ML benchmark. В каждом ответе сначала напиши короткую строку намерения "
+        "в формате `Мысль: ...`, затем агентские команды, по одной на строку. "
         "Сначала проверь данные, затем быстро готовь submission.csv и вызови submit(\"submission.csv\"). "
         "Не пиши длинные рассуждения.\n\n"
         f"task_id: {task_id}\n"
@@ -866,7 +866,7 @@ def build_parse_error_prompt(
         f"{format_budget_line(stats, args)}\n\n"
         "Твой прошлый ответ не распарсился как команда.\n"
         f"Ошибка парсинга: {exc}\n\n"
-        "Верни короткий комментарий, затем валидные команды, по одной на строку. Без длинных объяснений.\n\n"
+        "Верни короткую строку `Мысль: ...`, затем валидные команды, по одной на строку. Без длинных объяснений.\n\n"
         f"Прошлый ответ:\n{truncate_middle(assistant_text, 1200)}"
     )
 
@@ -879,7 +879,7 @@ def build_followup_prompt(
 ) -> str:
     prefix = (
         f"{format_budget_line(stats, args)} "
-        "Продолжай решение.\n\n"
+        "Дальше верни короткую строку `Мысль: ...`, затем команды.\n\n"
     )
     body = format_followup_body(command_results, stats, args, feedback)
     return prefix + truncate_middle(body, MAX_FOLLOWUP_PROMPT_CHARS - len(prefix))

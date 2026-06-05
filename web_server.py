@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import csv
 import html
 import json
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -44,6 +46,7 @@ from agent.parser import COMMAND_NAMES, FENCED_BLOCK_RE, ParsedCommand, parse_co
 
 DEFAULT_TASKS_DIR = Path("checker/tasks")
 DEFAULT_RUN_ROOT = Path("benchmark_runs")
+DEFAULT_DOCKER_IMAGE = "ml-benchmark-runner:latest"
 TEXT_EXTENSIONS = {".csv", ".json", ".md", ".py", ".txt", ".tsv", ".yaml", ".yml"}
 MAX_CONTEXT_CHARS = 28000
 MAX_FILE_PREVIEW_CHARS = 2500
@@ -54,10 +57,14 @@ TOKEN_ESTIMATE_CHARS_PER_TOKEN = 3
 MAX_HISTORY_MESSAGES = 6
 FINAL_SUBMIT_MAX_TOKENS = 1200
 FINAL_SUBMIT_TOKEN_RESERVE = 300
+SINGLE_SHOT_MIN_MAX_TOKENS = 4096
 ALLOWED_MODES = {"single-shot", "repeated", "fixed-transitions", "flexible"}
 DEFAULT_MODE = "flexible"
 REPEATED_MAX_ATTEMPTS = 5
+SINGLE_SHOT_ALLOWED_COMMANDS = {"write_file", "run_python", "submit"}
+PRODUCTIVE_SOLUTION_COMMANDS = {"write_file", "edit_file", "run_python"}
 FIXED_TRANSITION_STAGES = ["EDA", "FEATURES", "TRAIN"]
+FIXED_STAGE_MIN_ATTEMPTS = {"EDA": 3, "FEATURES": 5, "TRAIN": 1}
 FIXED_STAGE_ALLOWED_COMMANDS = {
     "EDA": {
         "list_files",
@@ -121,37 +128,49 @@ class RunState:
     stop_requested: bool = False
     final_submit_requested: bool = False
     fixed_stage_index: int = 0
+    fixed_stage_attempts: dict[str, int] = field(default_factory=dict)
+    docker_container: str | None = None
+    created_container: bool = False
 
     def public_dict(self) -> dict[str, Any]:
         return {
-        "run_id": self.run_id,
-        "task_id": self.config.task_id,
-        "model": self.config.model,
-        "created_at": self.created_at,
-        "mode": self.config.mode,
-        "workspace": str(self.workspace),
-        "status": self.status,
-        "stop_reason": self.stop_reason,
-        "requests": self.requests,
-        "total_tokens": self.total_tokens,
-        "used_steps": self.executor.context.used_steps,
-        "max_steps": self.config.max_steps,
-        "submitted": self.submitted,
-        "submission_result": self.submission_result,
-        "error": self.error,
-        "events": self.events[-200:],
+            "run_id": self.run_id,
+            "task_id": self.config.task_id,
+            "created_at": self.created_at,
+            "mode": self.config.mode,
+            "status": self.status,
+            "stop_reason": self.stop_reason,
+            "requests": self.requests,
+            "total_tokens": self.total_tokens,
+            "used_steps": self.executor.context.used_steps,
+            "max_steps": self.config.max_steps,
+            "submitted": self.submitted,
+            "submission_result": self.submission_result,
+            "error": self.error,
+            "docker_container": self.docker_container,
+            "events": self.events[-200:],
         }
 
 
 class AgentRunManager:
-    def __init__(self, project_root: Path, tasks_dir: Path, run_root: Path) -> None:
+    def __init__(
+        self,
+        project_root: Path,
+        tasks_dir: Path,
+        run_root: Path,
+        *,
+        use_docker: bool = True,
+        docker_image: str = DEFAULT_DOCKER_IMAGE,
+        keep_containers: bool = False,
+    ) -> None:
         self.project_root = project_root.resolve()
         self.tasks_dir = resolve_path(project_root, tasks_dir)
         self.run_root = resolve_path(project_root, run_root)
+        self.use_docker = use_docker
+        self.docker_image = docker_image
+        self.keep_containers = keep_containers
         self.runs: dict[str, RunState] = {}
         self.lock = threading.Lock()
-        self.history_dir = self.run_root / "history"
-        self.history_dir.mkdir(parents=True, exist_ok=True)
 
     def list_tasks(self) -> list[dict[str, Any]]:
         tasks: list[dict[str, Any]] = []
@@ -172,6 +191,12 @@ class AgentRunManager:
     def start_run(self, config: RunConfig) -> RunState:
         run_id = uuid.uuid4().hex[:12]
         workspace = prepare_run_workspace(self.project_root, self.tasks_dir, self.run_root, config.task_id, run_id)
+        docker_container = None
+        created_container = False
+        if self.use_docker:
+            docker_container = default_container_name(config.task_id, run_id)
+            create_container(name=docker_container, image=self.docker_image, workspace=workspace)
+            created_container = True
         executor = CommandExecutor(
             AgentContext(
                 workspace=workspace,
@@ -179,16 +204,21 @@ class AgentRunManager:
                 tasks_dir=self.tasks_dir,
                 max_steps=config.max_steps,
                 history_file=Path("agent_history.txt"),
+                docker_container=docker_container,
             )
         )
-        state = RunState(run_id=run_id, config=config, workspace=workspace, executor=executor)
+        state = RunState(
+            run_id=run_id,
+            config=config,
+            workspace=workspace,
+            executor=executor,
+            docker_container=docker_container,
+            created_container=created_container,
+        )
         thread = threading.Thread(target=self._run_loop, args=(state,), daemon=True)
         state.thread = thread
         with self.lock:
             self.runs[run_id] = state
-
-        self.save_run(state)
-        
         thread.start()
         return state
 
@@ -213,7 +243,16 @@ class AgentRunManager:
     def _run_loop(self, state: RunState) -> None:
         user_message = apply_mode_instruction(state, build_initial_prompt(state.workspace, state.config.task_id))
         history: list[dict[str, str]] = []
-        add_event(state, "system", "Run started", {"task_id": state.config.task_id, "mode": state.config.mode})
+        add_event(
+            state,
+            "system",
+            "Run started",
+            {
+                "task_id": state.config.task_id,
+                "mode": state.config.mode,
+                "docker_container": state.docker_container,
+            },
+        )
 
         try:
             while not state.stop_requested:
@@ -225,6 +264,8 @@ class AgentRunManager:
                     break
                 history = compact_history(history)
                 request_max_tokens = state.config.max_tokens
+                if state.config.mode == "single-shot":
+                    request_max_tokens = max(request_max_tokens, SINGLE_SHOT_MIN_MAX_TOKENS)
                 if should_stop_before_next_llm_request(state, user_message, history, request_max_tokens):
                     final_message = build_emergency_submit_prompt(state)
                     if state.final_submit_requested or not can_send_llm_request(
@@ -261,6 +302,8 @@ class AgentRunManager:
                     timeout=state.config.request_timeout,
                 )
                 state.requests += 1
+                if state.config.mode == "fixed-transitions":
+                    record_fixed_stage_attempt(state)
                 usage = response.get("usage", {})
                 if isinstance(usage, dict):
                     state.total_tokens += int(usage.get("total_tokens") or 0)
@@ -284,9 +327,18 @@ class AgentRunManager:
                         state,
                         "Твой ответ не удалось распарсить как команду.\n"
                         f"Ошибка: {exc}\n"
-                        "Верни короткий комментарий, затем валидную команду или несколько команд, по одной на строку.",
+                        "Верни короткую строку `Мысль: ...`, затем валидную команду или несколько команд, по одной на строку.",
                     )
                     continue
+
+                batch_error = validate_mode_command_batch(state, commands)
+                if batch_error:
+                    add_event(state, "parse_error", "Invalid command batch", batch_error)
+                    if should_retry_after_batch_error(state):
+                        user_message = apply_mode_instruction(state, build_batch_error_prompt(batch_error))
+                        continue
+                    state.stop_reason = batch_error["reason"]
+                    break
 
                 results: list[dict[str, Any]] = []
                 for command in commands:
@@ -307,34 +359,45 @@ class AgentRunManager:
                 if state.submitted:
                     break
 
+                if state.config.mode == "single-shot":
+                    state.stop_reason = "single_shot_missing_successful_submit"
+                    break
+
                 mode_stop_reason = apply_mode_after_results(state, results)
                 if mode_stop_reason:
                     state.stop_reason = mode_stop_reason
                     break
 
                 feedback = state.executor.build_feedback()
-                add_event(state, "feedback", "Feedback hints", feedback)
+                if state.requests > 1:
+                    add_event(state, "feedback", "Feedback hints", feedback)
                 user_message = apply_mode_instruction(state, build_followup_prompt(results, feedback, state))
 
             if state.stop_requested:
                 state.status = "stopped"
             elif state.submitted:
                 state.status = "completed"
+            elif state.config.mode == "single-shot":
+                self._force_final_submit(state)
+                state.status = "completed"
+            elif not should_force_final_submit(state):
+                state.status = "error"
+                if not state.error:
+                    state.error = mode_failure_message(state)
+                add_event(state, "error", "Run failed before valid submit", {"error": state.error})
             else:
                 self._force_final_submit(state)
                 state.status = "stopped"
-
             if state.stop_reason == "not_finished":
                 state.stop_reason = "finished"
-
-            self.save_run(state)
-
         except Exception as exc:
             state.status = "error"
             state.stop_reason = "error"
             state.error = str(exc)
             add_event(state, "error", "Run failed", {"error": str(exc)})
-            self.save_run(state)
+        finally:
+            if state.created_container and state.docker_container and not self.keep_containers:
+                remove_container(state.docker_container)
 
     def _force_final_submit(self, state: RunState) -> None:
         if state.submitted:
@@ -350,10 +413,20 @@ class AgentRunManager:
                 source = "auto-generated baseline submission.csv"
 
             command = ParsedCommand("submit", {"file": "submission.csv"})
+            if state.config.mode == "single-shot":
+                title = "Single-shot final submit"
+                result_title = "single-shot submit"
+                stop_suffix = "single_shot_submit"
+                error_prefix = "Single-shot final submit failed"
+            else:
+                title = "Forced final submit"
+                result_title = "forced submit"
+                stop_suffix = "forced_submit"
+                error_prefix = "Forced final submit failed"
             add_event(
                 state,
                 "command",
-                "Forced final submit",
+                title,
                 {"reason": reason, "source": source, "args": command.args},
             )
             state.executor.context.max_steps = max(
@@ -363,17 +436,23 @@ class AgentRunManager:
             result = state.executor.execute(command)
             state.submitted = True
             state.submission_result = result
-            state.stop_reason = f"{reason}_forced_submit" if reason else "forced_submit"
-            add_event(state, "result", f"forced submit: {result['status']}", result)
+            if state.config.mode == "single-shot":
+                state.stop_reason = stop_suffix
+            else:
+                state.stop_reason = f"{reason}_{stop_suffix}" if reason else stop_suffix
+            add_event(state, "result", f"{result_title}: {result['status']}", result)
         except Exception as exc:
             state.submitted = True
             state.submission_result = {
                 "status": "error",
                 "command": "submit",
-                "error": f"Forced final submit failed: {exc}",
+                "error": f"{error_prefix}: {exc}",
             }
-            state.stop_reason = f"{reason}_forced_submit_failed" if reason else "forced_submit_failed"
-            add_event(state, "error", "Forced final submit failed", {"error": str(exc)})
+            if state.config.mode == "single-shot":
+                state.stop_reason = f"{stop_suffix}_failed"
+            else:
+                state.stop_reason = f"{reason}_{stop_suffix}_failed" if reason else f"{stop_suffix}_failed"
+            add_event(state, "error", error_prefix, {"error": str(exc)})
 
     def _history_path(self, run_id: str) -> Path:
         return self.history_dir / f"{run_id}.json"
@@ -451,27 +530,44 @@ def make_handler(manager: AgentRunManager) -> type[BaseHTTPRequestHandler]:
                         HTTPStatus.BAD_REQUEST,
                     )
                 return
-            if parsed.path == "/api/runs":
-                self._send_json({"status": "ok", "runs": manager.list_saved_runs()})
-                return
             if parsed.path == "/api/runs/latest":
                 run = manager.latest_run()
                 self._send_json({"status": "ok", "run": run.public_dict() if run else None})
                 return
             if parsed.path.startswith("/api/runs/"):
-                run_id = parsed.path.rsplit("/", 1)[-1]
+                parts = parsed.path.strip("/").split("/")
+                run_id = parts[2] if len(parts) >= 3 else ""
                 run = manager.get_run(run_id)
-                if run:
-                    self._send_json({"status": "ok", "run": run.public_dict()})
+                if not run:
+                    self._send_json({"status": "error", "error": "Run not found"}, HTTPStatus.NOT_FOUND)
                     return
-
-                saved_run = manager.load_saved_run(run_id)
-                if saved_run:
-                    self._send_json({"status": "ok", "run": saved_run})
+                if len(parts) == 4 and parts[3] == "files":
+                    self._send_json({"status": "ok", "files": list_workspace_files(run.workspace)})
                     return
-
-                self._send_json({"status": "error", "error": "Run not found"}, HTTPStatus.NOT_FOUND)
+                if len(parts) == 5 and parts[3] == "files" and parts[4] == "view":
+                    file_path = _first_query_value(parsed.query, "path") or ""
+                    try:
+                        payload = workspace_file_preview(run.workspace, file_path)
+                    except ValueError as exc:
+                        self._send_json({"status": "error", "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                        return
+                    self._send_json({"status": "ok", "file": payload})
+                    return
+                if len(parts) == 5 and parts[3] == "files" and parts[4] == "download":
+                    file_path = _first_query_value(parsed.query, "path") or ""
+                    try:
+                        path = resolve_workspace_file(run.workspace, file_path)
+                    except ValueError as exc:
+                        self._send_json({"status": "error", "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                        return
+                    self._send_file_download(path)
+                    return
+                if len(parts) != 3:
+                    self._send_json({"status": "error", "error": "Not found"}, HTTPStatus.NOT_FOUND)
+                    return
+                self._send_json({"status": "ok", "run": run.public_dict()})
                 return
+            self._send_json({"status": "error", "error": "Not found"}, HTTPStatus.NOT_FOUND)
 
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
@@ -502,7 +598,18 @@ def make_handler(manager: AgentRunManager) -> type[BaseHTTPRequestHandler]:
                     max_tokens=int(payload["max_tokens"]) if "max_tokens" in payload else DEFAULT_MAX_TOKENS,
                     request_timeout=int(payload["request_timeout"]) if "request_timeout" in payload else DEFAULT_TIMEOUT,
                 )
-                run = manager.start_run(config)
+                try:
+                    run = manager.start_run(config)
+                except subprocess.CalledProcessError as exc:
+                    self._send_json(
+                        {
+                            "status": "error",
+                            "error": "Could not start benchmark Docker container",
+                            "details": (exc.stderr or exc.stdout or str(exc)).strip(),
+                        },
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                    return
                 self._send_json({"status": "ok", "run": run.public_dict()})
                 return
             if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/stop"):
@@ -536,9 +643,18 @@ def make_handler(manager: AgentRunManager) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             self.wfile.write(body)
 
+        def _send_file_download(self, path: Path) -> None:
+            body = path.read_bytes()
+            filename = path.name.replace('"', "")
+            self.send_response(HTTPStatus.OK.value)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def log_message(self, format: str, *args: Any) -> None:
             print(f"{self.address_string()} - {format % args}")
-
 
     return AgentWebHandler
 
@@ -564,6 +680,37 @@ def prepare_run_workspace(
     public_config = {key: value for key, value in config.items() if key not in {"answer_file", "private_files"}}
     (workspace / "task.json").write_text(json.dumps(public_config, ensure_ascii=False, indent=2), encoding="utf-8")
     return workspace
+
+
+def create_container(*, name: str, image: str, workspace: Path) -> None:
+    subprocess.run(
+        [
+            "docker",
+            "run",
+            "-d",
+            "--name",
+            name,
+            "-v",
+            f"{workspace.resolve()}:/workspace",
+            "-w",
+            "/workspace",
+            image,
+            "sleep",
+            "infinity",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def remove_container(container: str) -> None:
+    subprocess.run(["docker", "rm", "-f", container], check=False, capture_output=True, text=True)
+
+
+def default_container_name(task_id: str, run_id: str) -> str:
+    safe_task_id = "".join(char if char.isalnum() or char in "-_" else "-" for char in task_id)
+    return f"ml-benchmark-web-{safe_task_id}-{run_id}"
 
 
 def create_baseline_submission(workspace: Path) -> Path:
@@ -628,7 +775,7 @@ def baseline_prediction(rows: list[dict[str, str]], target_column: str, metric: 
 def build_initial_prompt(workspace: Path, task_id: str) -> str:
     return (
         "Ты решаешь ML benchmark task через агентские команды.\n"
-        "В одном ответе сначала напиши короткий комментарий, затем одну или несколько команд, по одной на строку.\n"
+        "В одном ответе сначала напиши короткую строку `Мысль: ...`, затем одну или несколько команд, по одной на строку.\n"
         "Работай как в обычной ML-задаче: осмотри данные, сделай признаки, обучи и проверь модель. "
         "Перед submit проверь, что submission.csv существует, имеет нужные колонки, правильное число строк "
         "и не содержит пустых предсказаний. Когда всё готово, вызови submit(\"submission.csv\").\n\n"
@@ -649,32 +796,118 @@ def mode_instruction(state: RunState) -> str:
     mode = state.config.mode
     if mode == "single-shot":
         return (
-            "Режим single-shot: это единственный ответ модели. "
-            "Сразу создай/проверь submission.csv и вызови submit(\"submission.csv\")."
+            "Режим single-shot: у тебя ровно один ответ модели на всю задачу. "
+            "В этом ответе можно вернуть несколько команд подряд, но после их выполнения новых попыток не будет. "
+            "Файлы train.csv, test.csv и task.json уже показаны выше, поэтому НЕ трать единственный ответ на list_files/read_file/load_dataset/show_sample_rows. "
+            "В single-shot разрешены только продуктивные команды: write_file, run_python, submit. "
+            "Ответ без submit(\"submission.csv\") будет отклонен.\n"
+            "Лучший формат для длинного кода:\n"
+            "Мысль: делаю полный быстрый пайплайн и отправляю решение\n"
+            "```command\n"
+            "run_python(\"\"\"\n"
+            "<полный python-код: читает train.csv/test.csv, обучает или строит baseline, создает submission.csv и печатает проверку формата>\n"
+            "\"\"\")\n"
+            "```\n"
+            "```command\n"
+            "submit(\"submission.csv\")\n"
+            "```\n"
+            "Если сложная модель рискованна, сделай простой валидный baseline, но обязательно создай submission.csv и вызови submit."
         )
     if mode == "repeated":
         attempt = min(state.requests + 1, REPEATED_MAX_ATTEMPTS)
+        if attempt == 1:
+            stage_note = (
+                "Это единственная попытка, где можно в основном читать и изучать файлы. "
+                "К концу ответа сформулируй следующий продуктивный шаг."
+            )
+        elif attempt < REPEATED_MAX_ATTEMPTS:
+            stage_note = (
+                "На этой попытке одних read_file/list_files уже недостаточно. "
+                "Обязательно создай или измени решение продуктивной командой: write_file, edit_file или run_python. "
+                "Сделай baseline, признаки, обучение, валидацию или генерацию submission.csv."
+            )
+        else:
+            stage_note = (
+                "Это последняя попытка. Используй лучшее уже подготовленное решение, "
+                "создай/проверь submission.csv и обязательно вызови submit(\"submission.csv\")."
+            )
         return (
             f"Режим repeated: попытка {attempt}/{REPEATED_MAX_ATTEMPTS}. "
-            "Каждая попытка должна улучшать или проверять решение; при готовности вызывай submit."
+            "После каждой попытки ты получаешь результаты команд и можешь улучшить решение в следующей попытке. "
+            "Не трать несколько попыток подряд только на открытие файлов. "
+            f"{stage_note}"
         )
     if mode == "fixed-transitions":
         stage = current_fixed_stage(state)
+        attempt = current_fixed_stage_attempt(state) + 1
+        minimum = FIXED_STAGE_MIN_ATTEMPTS.get(stage, 1)
         if stage == "EDA":
-            detail = "изучи файлы и данные; не вызывай submit на этом этапе"
+            detail = (
+                "это этап 1/3. Изучи файлы, целевую колонку, размер данных, пропуски, распределения и первые идеи признаков. "
+                "На этом этапе submit запрещен."
+            )
         elif stage == "FEATURES":
-            detail = "подготовь признаки, скрипты или промежуточные файлы; submit пока запрещен"
+            detail = (
+                "это этап 2/3. Подготовь и сравни признаки, предобработку и скрипты для обучения/инференса. "
+                "На этом этапе submit еще запрещен."
+            )
         else:
-            detail = "обучи модель, создай submission.csv, проверь формат и вызови submit"
-        return f"Режим fixed-transitions: текущий обязательный этап {stage}. Задача этапа: {detail}."
+            detail = (
+                "это этап 3/3. Обучи или запусти лучшую модель, создай и проверь submission.csv, "
+                "затем обязательно вызови submit(\"submission.csv\")."
+            )
+        return (
+            f"Режим fixed-transitions: текущий обязательный этап {stage}. "
+            f"Итерация этапа {attempt}/{minimum}. "
+            "Этапы идут строго по порядку: EDA -> FEATURES -> TRAIN; команды вне текущего этапа блокируются. "
+            "Не пытайся завершить этап за один короткий ответ: используй несколько итераций на глубину, как в flexible. "
+            f"Задача этапа: {detail}"
+        )
     if mode == "flexible":
-        return "Режим flexible: можно свободно выбирать следующие агентские команды до submit или лимитов."
+        return flexible_mode_instruction(state)
     return ""
+
+
+def flexible_mode_instruction(state: RunState) -> str:
+    budget = build_budget_payload(state)
+    remaining_steps = int(budget["remaining_steps"])
+    remaining_percent = budget["remaining_token_percent"]
+    if remaining_steps <= FINALIZE_REMAINING_STEPS or (
+        remaining_percent is not None and remaining_percent <= FINALIZE_REMAINING_TOKEN_RATIO * 100
+    ):
+        return (
+            "Режим flexible: финальная стадия. Используй лучшее уже подготовленное решение, "
+            "проверь submission.csv и вызывай submit(\"submission.csv\")."
+        )
+    if state.requests <= 1:
+        return (
+            "Режим flexible: это ранняя стадия решения, не отправляй submit сразу. "
+            "Сначала используй доступные итерации на EDA, проверку формата, baseline, валидацию и хотя бы одно улучшение модели. "
+            "Submit уместен только после созданного submission.csv и понятной проверки качества/формата."
+        )
+    if remaining_percent is not None and remaining_percent >= 55:
+        return (
+            "Режим flexible: бюджет еще большой, продолжай улучшать решение вместо раннего submit. "
+            "Сравни baseline с более сильной моделью, проверь признаки, валидацию и формат submission.csv."
+        )
+    return (
+        "Режим flexible: можно свободно выбирать следующие агентские команды. "
+        "Доведи решение до лучшего найденного качества и отправляй submit только когда файл проверен или началась финальная стадия."
+    )
 
 
 def current_fixed_stage(state: RunState) -> str:
     index = min(state.fixed_stage_index, len(FIXED_TRANSITION_STAGES) - 1)
     return FIXED_TRANSITION_STAGES[index]
+
+
+def current_fixed_stage_attempt(state: RunState) -> int:
+    return int(state.fixed_stage_attempts.get(current_fixed_stage(state), 0))
+
+
+def record_fixed_stage_attempt(state: RunState) -> None:
+    stage = current_fixed_stage(state)
+    state.fixed_stage_attempts[stage] = current_fixed_stage_attempt(state) + 1
 
 
 def validate_mode_command(state: RunState, command: ParsedCommand) -> dict[str, Any] | None:
@@ -694,6 +927,96 @@ def validate_mode_command(state: RunState, command: ParsedCommand) -> dict[str, 
     }
 
 
+def validate_mode_command_batch(state: RunState, commands: list[ParsedCommand]) -> dict[str, Any] | None:
+    command_names = [command.name for command in commands]
+    if state.config.mode == "repeated":
+        return validate_repeated_command_batch(state, command_names)
+    if state.config.mode == "fixed-transitions":
+        return validate_fixed_transition_command_batch(state, command_names)
+    if state.config.mode != "single-shot":
+        return None
+    disallowed = [name for name in command_names if name not in SINGLE_SHOT_ALLOWED_COMMANDS]
+    if disallowed:
+        return {
+            "reason": "single_shot_disallowed_commands",
+            "error": (
+                "Single-shot must not spend its only response on exploration commands. "
+                f"Disallowed commands: {', '.join(disallowed)}. "
+                "Use run_python/write_file to create submission.csv, then submit(\"submission.csv\")."
+            ),
+            "commands": command_names,
+            "allowed_commands": sorted(SINGLE_SHOT_ALLOWED_COMMANDS),
+        }
+    if "submit" not in command_names:
+        return {
+            "reason": "single_shot_missing_submit",
+            "error": "Single-shot response must include submit(\"submission.csv\") in the same answer.",
+            "commands": command_names,
+            "allowed_commands": sorted(SINGLE_SHOT_ALLOWED_COMMANDS),
+        }
+    return None
+
+
+def validate_fixed_transition_command_batch(state: RunState, command_names: list[str]) -> dict[str, Any] | None:
+    stage = current_fixed_stage(state)
+    has_productive = any(name in PRODUCTIVE_SOLUTION_COMMANDS for name in command_names)
+    has_submit = "submit" in command_names
+    if stage == "FEATURES" and not has_productive:
+        return {
+            "reason": "fixed_features_no_productive_progress",
+            "error": (
+                "FEATURES stage must create or change the solution. "
+                "Use write_file, edit_file, or run_python for preprocessing, features, or reusable scripts."
+            ),
+            "stage": stage,
+            "commands": command_names,
+            "productive_commands": sorted(PRODUCTIVE_SOLUTION_COMMANDS),
+        }
+    if stage == "TRAIN":
+        if not has_productive and not (state.workspace / "submission.csv").exists():
+            return {
+                "reason": "fixed_train_no_solution",
+                "error": (
+                    "TRAIN stage must train/run a solution or create submission.csv before submit. "
+                    "Use run_python or write_file, then submit(\"submission.csv\")."
+                ),
+                "stage": stage,
+                "commands": command_names,
+                "productive_commands": sorted(PRODUCTIVE_SOLUTION_COMMANDS),
+            }
+        if not has_submit:
+            return {
+                "reason": "fixed_train_missing_submit",
+                "error": "TRAIN stage must include the model's own submit(\"submission.csv\") command.",
+                "stage": stage,
+                "commands": command_names,
+            }
+    return None
+
+
+def validate_repeated_command_batch(state: RunState, command_names: list[str]) -> dict[str, Any] | None:
+    attempt = state.requests
+    has_productive = any(name in PRODUCTIVE_SOLUTION_COMMANDS for name in command_names)
+    has_submit = "submit" in command_names
+    if attempt >= REPEATED_MAX_ATTEMPTS and not has_submit:
+        return {
+            "reason": "repeated_final_missing_submit",
+            "error": "Final repeated attempt must include submit(\"submission.csv\").",
+            "commands": command_names,
+        }
+    if attempt >= 2 and not has_productive and not has_submit:
+        return {
+            "reason": "repeated_no_productive_progress",
+            "error": (
+                "Repeated mode allows exploration at the beginning, but this attempt must make productive progress. "
+                "Use write_file, edit_file, or run_python to build, validate, or improve the solution."
+            ),
+            "commands": command_names,
+            "productive_commands": sorted(PRODUCTIVE_SOLUTION_COMMANDS),
+        }
+    return None
+
+
 def apply_mode_after_results(state: RunState, results: list[dict[str, Any]]) -> str | None:
     if state.config.mode == "single-shot":
         return "single_shot_finished"
@@ -708,6 +1031,21 @@ def apply_mode_after_results(state: RunState, results: list[dict[str, Any]]) -> 
         return None
 
     stage = current_fixed_stage(state)
+    stage_attempts = current_fixed_stage_attempt(state)
+    minimum_attempts = FIXED_STAGE_MIN_ATTEMPTS.get(stage, 1)
+    if stage_attempts < minimum_attempts:
+        add_event(
+            state,
+            "stage",
+            f"{stage} continues",
+            {
+                "stage": stage,
+                "attempts": stage_attempts,
+                "minimum_attempts": minimum_attempts,
+            },
+        )
+        return None
+
     add_event(state, "stage", f"{stage} completed", {"stage": stage})
     if stage == "TRAIN":
         return "fixed_transitions_finished"
@@ -717,12 +1055,65 @@ def apply_mode_after_results(state: RunState, results: list[dict[str, Any]]) -> 
     return None
 
 
+def should_force_final_submit(state: RunState) -> bool:
+    if state.config.mode == "single-shot":
+        return False
+    if state.config.mode == "fixed-transitions":
+        return False
+    if state.config.mode == "repeated" and not (state.workspace / "submission.csv").exists():
+        return has_productive_history(state)
+    return True
+
+
+def has_productive_history(state: RunState) -> bool:
+    return any(
+        record.get("command") in PRODUCTIVE_SOLUTION_COMMANDS
+        for record in state.executor.context.trajectory
+    )
+
+
+def mode_failure_message(state: RunState) -> str:
+    if state.config.mode == "single-shot":
+        return "Single-shot response did not produce executable commands or submission.csv."
+    if state.config.mode == "repeated":
+        return "Repeated mode ended without productive solution commands or submission.csv."
+    if state.config.mode == "fixed-transitions":
+        return "Fixed-transitions mode ended before the model produced its own submit(\"submission.csv\")."
+    return "Run ended before a valid submission was produced."
+
+
+def should_retry_after_batch_error(state: RunState) -> bool:
+    if state.config.mode == "repeated":
+        return state.requests < REPEATED_MAX_ATTEMPTS
+    return state.config.mode == "fixed-transitions"
+
+
+def build_batch_error_prompt(batch_error: dict[str, Any]) -> str:
+    return (
+        "Предыдущий ответ не подходит для текущего режима.\n"
+        f"Ошибка: {batch_error.get('error', 'invalid command batch')}\n"
+        "Верни короткую строку `Мысль: ...`, затем команды, которые реально продвигают решение. "
+        "Если это последняя попытка, создай/проверь submission.csv и вызови submit(\"submission.csv\")."
+    )
+
+
 def build_followup_prompt(results: list[dict[str, Any]], feedback: dict[str, Any], state: RunState) -> str:
     used_steps = state.executor.context.used_steps
     max_steps = state.config.max_steps
     remaining_steps = max(0, max_steps - used_steps)
+    if state.config.mode == "fixed-transitions":
+        opener = fixed_transition_followup_opener(state)
+    elif state.config.mode == "repeated":
+        opener = repeated_followup_opener(state)
+    elif state.config.mode == "flexible" and not is_finalization_phase(state):
+        opener = (
+            "Продолжай улучшать решение. Верни короткую строку `Мысль: ...`, затем следующую команду или команды. "
+            "Не вызывай submit рано: сначала используй итерации на проверку данных, признаки, валидацию и улучшение модели."
+        )
+    else:
+        opener = "Продолжай решение. Верни короткую строку `Мысль: ...`, затем следующую команду или команды."
     lines = [
-        "Продолжай решение.",
+        opener,
         "",
         "Статус benchmark:",
         (
@@ -737,23 +1128,84 @@ def build_followup_prompt(results: list[dict[str, Any]], feedback: dict[str, Any
             lines.extend(format_web_command_result(index, result))
     else:
         lines.append("- команд не было")
-    if feedback:
+    feedback_lines = format_web_feedback(feedback) if feedback and state.requests > 1 else []
+    if feedback_lines:
         lines.extend(["", "Подсказки:"])
-        lines.extend(format_web_feedback(feedback))
+        lines.extend(feedback_lines)
     return "\n".join(lines)
+
+
+def repeated_followup_opener(state: RunState) -> str:
+    next_attempt = min(state.requests + 1, REPEATED_MAX_ATTEMPTS)
+    if next_attempt >= REPEATED_MAX_ATTEMPTS:
+        return (
+            "Это последняя repeated-попытка. Верни короткую строку `Мысль: ...`, затем команды: "
+            "создай или проверь submission.csv и обязательно вызови submit(\"submission.csv\")."
+        )
+    if next_attempt >= 2:
+        return (
+            "Продолжай repeated-решение. Верни короткую строку `Мысль: ...`, затем команды с продуктивным шагом: "
+            "write_file, edit_file или run_python для baseline, признаков, обучения, валидации или submission.csv. "
+            "Не трать попытку только на открытие файлов."
+        )
+    return "Продолжай решение. Верни короткую строку `Мысль: ...`, затем следующую команду или команды."
+
+
+def fixed_transition_followup_opener(state: RunState) -> str:
+    stage = current_fixed_stage(state)
+    attempts = current_fixed_stage_attempt(state)
+    minimum = FIXED_STAGE_MIN_ATTEMPTS.get(stage, 1)
+    progress = f"Итераций этапа: {attempts}/{minimum}."
+    if stage == "EDA":
+        return (
+            f"Продолжай fixed-transitions этап EDA. {progress} "
+            "Верни короткую строку `Мысль: ...`, затем команды для более глубокого анализа данных. "
+            "Переход к FEATURES произойдет только после минимального числа EDA-итераций."
+        )
+    if stage == "FEATURES":
+        return (
+            f"Продолжай fixed-transitions этап FEATURES. {progress} "
+            "Верни короткую строку `Мысль: ...`, затем продуктивные команды "
+            "write_file, edit_file или run_python для признаков, preprocessing или скриптов решения."
+        )
+    return (
+        "Продолжай fixed-transitions этап TRAIN. Верни короткую строку `Мысль: ...`, затем команды, которые создают/проверяют "
+        "submission.csv, и обязательно вызови submit(\"submission.csv\"). Без собственного submit этап TRAIN не завершится."
+    )
+
+
+def is_finalization_phase(state: RunState) -> bool:
+    budget = build_budget_payload(state)
+    if budget["remaining_steps"] <= FINALIZE_REMAINING_STEPS:
+        return True
+    percent = budget["remaining_token_percent"]
+    return percent is not None and percent <= FINALIZE_REMAINING_TOKEN_RATIO * 100
 
 
 def format_web_command_result(index: int, result: dict[str, Any]) -> list[str]:
     command = str(result.get("command", "unknown"))
     status = str(result.get("status", "unknown"))
     if status != "ok":
-        return [f"{index}. {command}: error", f"   {short_web_text(str(result.get('error', 'unknown error')), 1200)}"]
+        lines = [f"{index}. {command}: error"]
+        lines.extend(f"   {line}" for line in fenced_web_text_block(str(result.get("error", "unknown error")), 1200))
+        return lines
     lines = [f"{index}. {command}: ok"]
-    lines.extend(f"   {line}" for line in format_web_result_payload(command, result.get("result")))
+    detail = "\n".join(format_web_result_payload(command, result.get("result")))
+    lines.extend(f"   {line}" for line in fenced_web_text_block(detail, 4000))
     return lines
 
 
 def format_web_result_payload(command: str, payload: Any) -> list[str]:
+    if command == "submit" and isinstance(payload, dict):
+        lines = [
+            f"metric={payload.get('metric', '?')}; value={payload.get('value', '?')}; "
+            f"rows_checked={payload.get('rows_checked', '?')}"
+        ]
+        source = payload.get("submission_source")
+        if isinstance(source, dict):
+            path = source.get("path") or source.get("kind") or "inline"
+            lines.append(f"submission_source={path}; truncated={source.get('truncated', False)}")
+        return lines
     if command == "read_file" and isinstance(payload, dict):
         lines = [f"path={payload.get('path', '?')}; truncated={payload.get('truncated', False)}"]
         content = str(payload.get("content", ""))
@@ -784,13 +1236,19 @@ def format_web_result_payload(command: str, payload: Any) -> list[str]:
 def format_web_feedback(feedback: dict[str, Any]) -> list[str]:
     hints = feedback.get("hints")
     if not isinstance(hints, list) or not hints:
-        return [f"- {short_web_json(feedback, 1500)}"]
+        return []
     lines: list[str] = []
     for hint in hints[:8]:
         if isinstance(hint, dict):
-            lines.append(f"- {hint.get('stage', 'hint')}: {hint.get('message', '')}")
+            message = str(hint.get("message") or "").strip()
+            if not message:
+                continue
+            stage = str(hint.get("stage") or "hint").strip()
+            lines.append(f"- {stage}: {message}")
         else:
-            lines.append(f"- {hint}")
+            text = str(hint).strip()
+            if text:
+                lines.append(f"- {text}")
     if len(hints) > 8:
         lines.append(f"- ... (+{len(hints) - 8} more hints)")
     return lines
@@ -798,6 +1256,10 @@ def format_web_feedback(feedback: dict[str, Any]) -> list[str]:
 
 def short_web_json(value: Any, limit: int) -> str:
     return short_web_text(json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str), limit)
+
+
+def fenced_web_text_block(value: str, limit: int) -> list[str]:
+    return ["```text", *short_web_text(value, limit).splitlines(), "```"]
 
 
 def short_web_text(value: str, limit: int) -> str:
@@ -829,7 +1291,7 @@ def build_emergency_submit_prompt(state: RunState) -> str:
         instruction = (
             "FINAL SUBMIT NOW.\n"
             "В workspace уже есть submission.csv. Не улучшай решение и не запускай EDA.\n"
-            "Верни короткий комментарий, затем одну команду:\n"
+            "Верни короткую строку `Мысль: отправляю готовый файл`, затем одну команду:\n"
             "submit(\"submission.csv\")\n\n"
         )
     else:
@@ -837,7 +1299,7 @@ def build_emergency_submit_prompt(state: RunState) -> str:
             "FINAL SUBMIT NOW.\n"
             "Нужно дать последнее лучшее решение. Не делай EDA и долгие улучшения.\n"
             "Создай submission.csv самым надежным быстрым способом и в этом же ответе вызови submit(\"submission.csv\").\n"
-            "Верни короткий комментарий, затем команды.\n\n"
+            "Верни короткую строку `Мысль: завершаю решение`, затем команды.\n\n"
         )
     payload = {
         "task": task_config,
@@ -945,6 +1407,54 @@ def collect_file_previews(workspace: Path) -> str:
     return "\n".join(chunks) if chunks else "(no readable files)"
 
 
+def list_workspace_files(workspace: Path) -> list[dict[str, Any]]:
+    files: list[dict[str, Any]] = []
+    workspace = workspace.resolve()
+    for path in sorted(workspace.rglob("*")):
+        if not path.is_file():
+            continue
+        relative = path.resolve().relative_to(workspace)
+        stat = path.stat()
+        files.append(
+            {
+                "path": str(relative),
+                "name": path.name,
+                "size": stat.st_size,
+                "modified": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+                "previewable": path.suffix.lower() in TEXT_EXTENSIONS,
+            }
+        )
+    return files
+
+
+def workspace_file_preview(workspace: Path, file_path: str) -> dict[str, Any]:
+    path = resolve_workspace_file(workspace, file_path)
+    if path.suffix.lower() not in TEXT_EXTENSIONS:
+        raise ValueError("Preview is available only for text-like files")
+    content = path.read_text(encoding="utf-8", errors="ignore")
+    return {
+        "path": str(path.resolve().relative_to(workspace.resolve())),
+        "content": content[:MAX_FILE_PREVIEW_CHARS],
+        "truncated": len(content) > MAX_FILE_PREVIEW_CHARS,
+        "size": path.stat().st_size,
+    }
+
+
+def resolve_workspace_file(workspace: Path, file_path: str) -> Path:
+    if not file_path:
+        raise ValueError("File path is required")
+    raw_path = Path(file_path)
+    if raw_path.is_absolute():
+        raise ValueError("Absolute paths are not allowed")
+    workspace = workspace.resolve()
+    path = (workspace / raw_path).resolve()
+    if path != workspace and workspace not in path.parents:
+        raise ValueError("File path is outside workspace")
+    if not path.exists() or not path.is_file():
+        raise ValueError("File not found")
+    return path
+
+
 def extract_assistant_text(response: dict[str, Any]) -> str:
     return str(response["choices"][0]["message"]["content"])
 
@@ -968,7 +1478,8 @@ def command_candidates(text: str) -> list[str]:
     candidates: list[str] = []
     for block in FENCED_BLOCK_RE.findall(text):
         if block.strip():
-            candidates.append(block.strip())
+            block_commands = command_block_candidates(block)
+            candidates.extend(block_commands if block_commands else [block.strip()])
     for line in text.splitlines():
         stripped = line.strip()
         if stripped.startswith("{") or any(
@@ -980,6 +1491,29 @@ def command_candidates(text: str) -> list[str]:
         if candidate not in unique:
             unique.append(candidate)
     return unique
+
+
+def command_block_candidates(block: str) -> list[str]:
+    stripped = block.strip()
+    if not stripped:
+        return []
+    try:
+        module = ast.parse(stripped, mode="exec")
+    except SyntaxError:
+        return []
+
+    candidates: list[str] = []
+    for node in module.body:
+        if not isinstance(node, ast.Expr):
+            continue
+        if not isinstance(node.value, ast.Call) or not isinstance(node.value.func, ast.Name):
+            continue
+        if node.value.func.id not in COMMAND_NAMES:
+            continue
+        source = ast.get_source_segment(stripped, node)
+        if source:
+            candidates.append(source.strip())
+    return candidates
 
 
 def add_event(state: RunState, kind: str, title: str, data: dict[str, Any]) -> None:
@@ -1063,13 +1597,13 @@ def render_agent_page() -> str:
   <style>
     :root { --bg:#f5f7fa; --surface:#fff; --border:#d8e0ea; --text:#152033; --muted:#667085; --accent:#155eef; --ok:#067647; --bad:#b42318; }
     body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:var(--bg); color:var(--text); }
-    main { max-width:1240px; margin:0 auto; padding:28px 20px 44px; overflow-x:hidden; }
+    main { max-width:1480px; margin:0 auto; padding:28px 20px 44px; overflow-x:hidden; }
     header { display:flex; justify-content:space-between; gap:18px; align-items:flex-start; margin-bottom:20px; }
     h1 { margin:0 0 8px; font-size:30px; line-height:1.15; }
     h2 { margin:0 0 14px; font-size:18px; }
     p { margin:0; color:var(--muted); }
     section { min-width:0; background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:18px; margin-bottom:16px; }
-    .layout { display:grid; grid-template-columns:360px minmax(0,1fr); gap:18px; align-items:start; }
+    .layout { display:grid; grid-template-columns:320px minmax(0,1fr); gap:18px; align-items:start; }
     .layout > * { min-width:0; }
     label { display:block; margin:0 0 7px; font-weight:700; }
     input, select, button { box-sizing:border-box; width:100%; min-height:40px; font:inherit; }
@@ -1083,25 +1617,26 @@ def render_agent_page() -> str:
     .cards { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; }
     .card { border:1px solid var(--border); border-radius:8px; padding:12px; background:#f8fafc; }
     .card strong { display:block; font-size:22px; margin-top:4px; }
-    .events { display:grid; gap:12px; min-width:0; max-height:72vh; overflow:auto; padding-right:4px; }
+    .events { display:grid; gap:12px; min-width:0; max-width:100%; max-height:72vh; overflow-y:auto; overflow-x:hidden; padding-right:4px; }
     .event { min-width:0; max-width:100%; overflow:hidden; }
-    .chat-event { display:grid; gap:6px; }
-    .chat-row { display:flex; gap:10px; align-items:flex-start; }
+    .turn { min-width:0; max-width:100%; overflow:hidden; }
+    .chat-event { display:grid; gap:6px; min-width:0; max-width:100%; overflow:hidden; }
+    .chat-row { display:flex; gap:10px; align-items:flex-start; min-width:0; max-width:100%; }
     .chat-row.user { flex-direction:row-reverse; }
     .chat-avatar { flex:0 0 auto; width:34px; height:34px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-weight:800; font-size:12px; color:#fff; background:var(--accent); }
     .chat-row.user .chat-avatar { background:#0f766e; }
     .chat-meta { display:flex; justify-content:space-between; gap:12px; color:var(--muted); font-size:12px; margin:0 4px; }
     .chat-row.user .chat-meta { flex-direction:row-reverse; }
-    .bubble { min-width:0; max-width:min(100%, 920px); border:1px solid var(--border); border-radius:14px; padding:12px 14px; background:#f8fafc; }
+    .bubble { box-sizing:border-box; flex:0 1 auto; width:fit-content; min-width:0; max-width:min(100%, 980px); overflow:hidden; border:1px solid var(--border); border-radius:14px; padding:12px 14px; background:#f8fafc; }
     .chat-row.user .bubble { background:#effdf7; border-color:#c8e7da; }
     .chat-title { font-weight:800; margin-bottom:8px; color:var(--text); }
-    .chat-body { width:100%; min-width:0; white-space:pre-wrap; line-height:1.5; background:transparent; border:0; padding:0; margin:0; max-height:none; overflow:visible; }
+    .chat-body { box-sizing:border-box; width:100%; max-width:100%; min-width:0; white-space:pre-wrap; line-height:1.5; background:transparent; border:0; padding:0; margin:0; max-height:none; overflow:visible; }
     .chat-body.structured { white-space:normal; }
     .chat-body .code-block { max-height:calc(1.45em * 5 + 24px); overflow:hidden; white-space:pre-wrap; word-break:break-word; }
     .chat-body .code-block pre { line-height:1.45; }
     .chat-body .block { margin:10px 0; }
     .chat-body pre { max-height:none; white-space:pre-wrap; word-break:break-word; }
-    .chat-tail { display:flex; justify-content:space-between; gap:10px; color:var(--muted); font-size:12px; margin:0 44px; }
+    .chat-tail { box-sizing:border-box; display:flex; justify-content:space-between; gap:10px; min-width:0; max-width:100%; color:var(--muted); font-size:12px; padding:0 44px; }
     .event.command, .event.result, .event.feedback, .event.system, .event.error, .event.parse_error { border:1px solid var(--border); border-radius:10px; padding:10px 12px; background:white; }
     .event.command { border-left:4px solid #c2410c; }
     .event.result { border-left:4px solid #067647; }
@@ -1127,9 +1662,46 @@ def render_agent_page() -> str:
     .code-block.is-expanded .code-toggle::before { transform:rotate(180deg); }
     .code-toggle:hover { border-color:rgba(148,163,184,0.9); }
     .code-toggle:focus-visible { outline:2px solid #93c5fd; outline-offset:2px; }
+    .submit-card { display:grid; gap:12px; min-width:0; max-width:100%; }
+    .csv-table-wrap { box-sizing:border-box; width:100%; max-width:100%; max-height:360px; overflow:auto; border:1px solid var(--border); border-radius:8px; background:white; margin:8px 0; }
+    .csv-table-inner { width:max-content; min-width:100%; }
+    .csv-table { width:max-content; min-width:100%; border-collapse:collapse; font-size:13px; }
+    .csv-table th, .csv-table td { max-width:240px; padding:7px 9px; border-bottom:1px solid var(--border); border-right:1px solid var(--border); text-align:left; vertical-align:top; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .csv-table th { position:sticky; top:0; background:#eef3f8; color:var(--text); font-weight:900; z-index:1; }
+    .csv-table td { color:#344054; }
+    .csv-table tr:last-child td { border-bottom:0; }
+    .csv-caption { display:flex; justify-content:space-between; gap:12px; padding:8px 10px; color:var(--muted); font-size:12px; font-weight:700; background:#f8fafc; border-top:1px solid var(--border); }
+    .submit-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+    .submit-title { font-weight:900; color:var(--text); }
+    .submit-subtitle { margin-top:3px; color:var(--muted); font-size:13px; }
+    .submit-badge { display:inline-flex; align-items:center; min-height:26px; padding:0 10px; border-radius:999px; font-size:12px; font-weight:900; text-transform:uppercase; }
+    .submit-badge.ok { color:#067647; background:#ecfdf3; border:1px solid #abefc6; }
+    .submit-badge.error { color:#b42318; background:#fef3f2; border:1px solid #fecdca; }
+    .submit-metrics { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; }
+    .submit-metric { min-width:0; border:1px solid var(--border); border-radius:8px; background:#f8fafc; padding:10px; }
+    .submit-metric span { display:block; color:var(--muted); font-size:12px; font-weight:800; margin-bottom:4px; }
+    .submit-metric strong { display:block; color:var(--text); font-size:18px; overflow-wrap:anywhere; }
+    .submit-error { border:1px solid #fecdca; border-radius:8px; background:#fef3f2; color:#b42318; padding:10px; line-height:1.45; overflow-wrap:anywhere; }
+    .submission-source { box-sizing:border-box; min-width:0; max-width:100%; overflow:hidden; border:1px solid var(--border); border-radius:8px; background:#fff; padding:10px 12px; }
+    .submission-source summary { cursor:pointer; font-weight:800; color:var(--text); overflow-wrap:anywhere; }
+    .submission-source pre { box-sizing:border-box; width:100%; max-width:100%; min-width:0; margin:10px 0 0; background:#111827; color:#f9fafb; border-radius:6px; padding:12px; max-height:360px; overflow:auto; font-size:13px; line-height:1.45; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; }
     .message { border-radius:8px; padding:12px; background:#eef3f8; color:var(--muted); margin-top:12px; }
+    .file-panel { display:grid; gap:10px; }
+    .file-list { display:grid; gap:6px; max-height:240px; overflow:auto; padding-right:2px; }
+    .file-row { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px; align-items:center; border:1px solid var(--border); border-radius:6px; background:#f8fafc; padding:8px; }
+    .file-main { min-width:0; }
+    .file-name { color:var(--text); font-weight:800; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .file-meta { margin-top:2px; color:var(--muted); font-size:12px; }
+    .file-actions { display:flex; gap:6px; }
+    .file-actions button, .file-actions a { display:inline-flex; align-items:center; justify-content:center; min-height:28px; width:auto; padding:0 8px; border-radius:6px; font-size:12px; font-weight:800; text-decoration:none; border:1px solid var(--border); }
+    .file-actions button { color:var(--accent); background:#fff; }
+    .file-actions button:disabled { color:var(--muted); cursor:not-allowed; background:#eef3f8; }
+    .file-actions a { color:white; background:var(--accent); border-color:var(--accent); }
+    .file-preview { min-width:0; border:1px solid var(--border); border-radius:6px; background:#fff; overflow:hidden; }
+    .file-preview-head { display:flex; justify-content:space-between; gap:8px; padding:8px 10px; color:var(--muted); font-size:12px; font-weight:800; border-bottom:1px solid var(--border); }
+    .file-preview pre { box-sizing:border-box; width:100%; max-height:260px; margin:0; padding:10px; overflow:auto; background:#111827; color:#f9fafb; font-size:12px; line-height:1.45; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; }
     .error { color:var(--bad); background:#fef3f2; border:1px solid #fecdca; }
-    @media (max-width:900px){ header,.layout{display:block}.row,.cards{grid-template-columns:1fr} }
+    @media (max-width:900px){ header,.layout{display:block}.row,.cards,.submit-metrics{grid-template-columns:1fr} }
   </style>
 </head>
 <body>
@@ -1171,6 +1743,16 @@ __MODEL_OPTIONS__
         </div>
         <div class="message" id="message">Готово к запуску. Нужен доступ к OpenAI-compatible LLM endpoint.</div>
       </section>
+      <section>
+        <h2>Workspace Files</h2>
+        <div class="file-panel">
+          <div class="file-list" id="file-list"><div class="message">Start a run to browse files.</div></div>
+          <div class="file-preview" id="file-preview">
+            <div class="file-preview-head"><span>Preview</span><span>-</span></div>
+            <pre>Select a text file to preview it.</pre>
+          </div>
+        </div>
+      </section>
     </aside>
     <div>
       <section>
@@ -1193,6 +1775,9 @@ __MODEL_OPTIONS__
 <script>
 let currentRun = null;
 let timer = null;
+const csvScrollPositions = new Map();
+const expandedCodeBlocks = new Set();
+const openDetails = new Set();
 const task = document.getElementById('task');
 const model = document.getElementById('model');
 const mode = document.getElementById('mode');
@@ -1203,12 +1788,25 @@ const stop = document.getElementById('stop');
 const message = document.getElementById('message');
 const statusEl = document.getElementById('status');
 const eventsEl = document.getElementById('events');
+const fileListEl = document.getElementById('file-list');
+const filePreviewEl = document.getElementById('file-preview');
 function truncateText(value, limit=180){
   const text = cleanText(value).replace(/\\s+/g, ' ');
   return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
 }
 function esc(v){return String(v).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');}
+function escAttr(v){return esc(v).replaceAll('"','&quot;').replaceAll("'","&#39;");}
 function cleanText(value){return String(value ?? '').trim();}
+function isProbablyCode(value){
+  const text = cleanText(value);
+  if(!text) return false;
+  if(text.includes('\n')) return true;
+  return /\b(?:import|from|def|class|for|while|if|try|except|with|return|print)\b|[=;{}]/.test(text);
+}
+function isPlainObject(value){return value !== null && typeof value === 'object' && !Array.isArray(value);}
+function safeTextBlock(value){
+  return `<div class="chat-body structured"><pre>${esc(cleanText(value) || 'Empty message.')}</pre></div>`;
+}
 function isLikelyJsonChunk(text){
   const trimmed = cleanText(text);
   if(!trimmed) return false;
@@ -1342,8 +1940,10 @@ function renderMarkdownLine(line){
   }
   return `<div class="md-paragraph">${renderInlineMarkup(trimmed)}</div>`;
 }
-function renderMarkdownish(text){
-  text = stripContentFromText(text);
+function renderMarkdownish(text, options = {}){
+  const shouldStrip = options.strip !== false;
+  const allowCsv = options.csv === true;
+  text = shouldStrip ? stripContentFromText(text) : cleanText(text);
   if(!text) return '<div class="md-paragraph">Empty message.</div>';
   const parts = [];
   const fence = /```(?:([a-zA-Z0-9_-]+)\n)?([\s\S]*?)```/g;
@@ -1351,12 +1951,79 @@ function renderMarkdownish(text){
   for(const match of text.matchAll(fence)){
     const before = text.slice(last, match.index);
     parts.push(before.split('\n').map(renderMarkdownLine).join(''));
-    const lang = match[1] ? `<div class="code-lang">${esc(match[1])}</div>` : '';
-    parts.push(`<div class="code-block collapsible">${lang}<button type="button" class="code-toggle" aria-label="Expand code"></button><pre>${esc(match[2].replace(/\n$/, ''))}</pre></div>`);
+    const langName = cleanText(match[1] || '');
+    const blockText = match[2].replace(/\n$/, '');
+    if(allowCsv && (langName.toLowerCase() === 'csv' || isLikelyCsv(blockText))) {
+      parts.push(renderCsvTable(blockText));
+    } else {
+      const lang = langName ? `<div class="code-lang">${esc(langName)}</div>` : '';
+      parts.push(`<div class="code-block collapsible">${lang}<button type="button" class="code-toggle" aria-label="Expand code"></button><pre>${esc(blockText)}</pre></div>`);
+    }
     last = match.index + match[0].length;
   }
   parts.push(text.slice(last).split('\n').map(renderMarkdownLine).join(''));
   return parts.join('');
+}
+function parseCsvLine(line){
+  const cells = [];
+  let current = '';
+  let quoted = false;
+  for(let i = 0; i < line.length; i++){
+    const ch = line[i];
+    const next = line[i + 1];
+    if(ch === '"'){
+      if(quoted && next === '"'){
+        current += '"';
+        i++;
+      } else {
+        quoted = !quoted;
+      }
+      continue;
+    }
+    if(ch === ',' && !quoted){
+      cells.push(current);
+      current = '';
+      continue;
+    }
+    current += ch;
+  }
+  cells.push(current);
+  return cells.map(cell => cell.trim());
+}
+function isLikelyCsv(text){
+  text = cleanText(text);
+  if(!text || !text.includes(',')) return false;
+  const lines = text.split('\n').map(line => line.trim()).filter(Boolean);
+  if(lines.length < 2 || lines.length > 300) return false;
+  const first = parseCsvLine(lines[0]);
+  if(first.length < 2 || first.length > 40) return false;
+  const comparable = lines.slice(1, Math.min(lines.length, 6)).map(parseCsvLine);
+  const matching = comparable.filter(row => Math.abs(row.length - first.length) <= 1).length;
+  return matching >= Math.min(2, comparable.length);
+}
+function renderCsvTable(text){
+  const lines = cleanText(text).split('\n').filter(line => line.trim());
+  if(lines.length < 2) return `<div class="code-block">${esc(cleanText(text))}</div>`;
+  const header = parseCsvLine(lines[0]);
+  const rows = lines.slice(1, 13).map(parseCsvLine);
+  const totalRows = Math.max(0, lines.length - 1);
+  const shownCols = header.slice(0, 12);
+  const hiddenCols = Math.max(0, header.length - shownCols.length);
+  return `
+    <div class="csv-table-wrap">
+      <div class="csv-table-inner">
+        <table class="csv-table">
+          <thead><tr>${shownCols.map(cell => `<th>${esc(cell || '-')}</th>`).join('')}${hiddenCols ? '<th>...</th>' : ''}</tr></thead>
+          <tbody>
+            ${rows.map(row => `<tr>${shownCols.map((_, index) => `<td title="${escAttr(row[index] ?? '')}">${esc(row[index] ?? '')}</td>`).join('')}${hiddenCols ? `<td>+${hiddenCols} cols</td>` : ''}</tr>`).join('')}
+          </tbody>
+        </table>
+        <div class="csv-caption">
+          <span>${esc(totalRows)} row${totalRows === 1 ? '' : 's'}</span>
+          <span>${esc(header.length)} column${header.length === 1 ? '' : 's'}${totalRows > rows.length ? `, showing ${rows.length}` : ''}</span>
+        </div>
+      </div>
+    </div>`;
 }
 function setupCodeToggles(){
   document.addEventListener('click', (event) => {
@@ -1365,8 +2032,18 @@ function setupCodeToggles(){
     const block = button.closest('.code-block');
     if(!block) return;
     block.classList.toggle('is-expanded');
+    if(block.dataset.uiKey) {
+      if(block.classList.contains('is-expanded')) expandedCodeBlocks.add(block.dataset.uiKey);
+      else expandedCodeBlocks.delete(block.dataset.uiKey);
+    }
     button.setAttribute('aria-label', block.classList.contains('is-expanded') ? 'Collapse code' : 'Expand code');
   });
+  document.addEventListener('toggle', (event) => {
+    const details = event.target.closest('details');
+    if(!details || !details.dataset.uiKey) return;
+    if(details.open) openDetails.add(details.dataset.uiKey);
+    else openDetails.delete(details.dataset.uiKey);
+  }, true);
 }
 function renderJsonScalar(value){
   if(value === null || value === undefined) return '<span class="json-muted">-</span>';
@@ -1424,6 +2101,11 @@ function renderValue(value){
   if(isProbablyCode(value)) return `<div class="code-block">${esc(cleanText(value))}</div>`;
   return renderJsonSummary(value);
 }
+function renderTextPreview(value){
+  const text = cleanText(value);
+  if(!text) return '<span class="json-muted">-</span>';
+  return `<pre>${esc(text)}</pre>`;
+}
 function renderCommandCall(name, args){
   const argValues = Object.entries(args || {}).map(([key, value]) => {
     if(typeof value === 'string') {
@@ -1454,20 +2136,14 @@ function commandResultSummary(result){
     return `
       <div class="block">
         <div class="block-title">run_python finished with code ${esc(payload.returncode ?? 'unknown')}</div>
-        ${payload.stdout ? `<div class="block-title">stdout</div><pre>${esc(payload.stdout)}</pre>` : ''}
-        ${payload.stderr ? `<div class="block-title">stderr</div><pre>${esc(payload.stderr)}</pre>` : ''}
+        ${payload.stdout ? `<div class="block-title">stdout</div>${renderTextPreview(payload.stdout)}` : ''}
+        ${payload.stderr ? `<div class="block-title">stderr</div>${renderTextPreview(payload.stderr)}` : ''}
       </div>`;
   }
   if(result.command === 'submit') {
     return `
       <div class="block">
-        <div class="block-title">submit result</div>
-        <div class="kv">
-          <span>Status</span><span>${esc(result.status)}</span>
-          <span>Metric</span><span>${esc(payload.metric || '-')}</span>
-          <span>Value</span><span>${esc(payload.value ?? '-')}</span>
-          <span>Rows checked</span><span>${esc(payload.rows_checked ?? '-')}</span>
-        </div>
+        ${renderSubmissionHtml(result)}
       </div>`;
   }
   return `
@@ -1505,27 +2181,50 @@ function renderFeedbackHtml(data){
 }
 function renderSubmissionHtml(submission){
   const payload = submission.result || {};
+  const status = submission.status || 'unknown';
+  const ok = status === 'ok';
+  const error = submission.error || payload.error || '';
+  const metric = payload.metric || '-';
+  const value = payload.value ?? '-';
+  const rows = payload.rows_checked ?? '-';
+  const elapsed = submission.elapsed_ms ?? '-';
+  const source = payload.submission_source || null;
+  const sourcePath = source && (source.path || source.kind || 'inline');
+  const sourceCode = source && source.content ? cleanText(source.content) : '';
   return `
-    <strong>${submission.status === 'ok' ? 'Submitted.' : 'Submission attempted.'}</strong>
-    <div class="kv" style="margin-top:10px">
-      <span>Status</span><span>${esc(submission.status || '-')}</span>
-      <span>Metric</span><span>${esc(payload.metric || '-')}</span>
-      <span>Value</span><span>${esc(payload.value ?? '-')}</span>
-      <span>Rows checked</span><span>${esc(payload.rows_checked ?? '-')}</span>
-    </div>
-    <details>
-      <summary>Details</summary>
-      <div class="kv">
-        <span>Command</span><span>${esc(submission.command || 'submit')}</span>
-        <span>Elapsed ms</span><span>${esc(submission.elapsed_ms ?? '-')}</span>
-        <span>Result status</span><span>${esc(payload.status || submission.status || '-')}</span>
-        ${payload.error ? `<span>Error</span><span>${esc(payload.error)}</span>` : ''}
+    <div class="submit-card">
+      <div class="submit-head">
+        <div>
+          <div class="submit-title">${ok ? 'Submission accepted' : 'Submission failed'}</div>
+          <div class="submit-subtitle">${esc(submission.command || 'submit')} ${elapsed !== '-' ? `completed in ${esc(elapsed)} ms` : ''}</div>
+        </div>
+        <span class="submit-badge ${ok ? 'ok' : 'error'}">${esc(status)}</span>
       </div>
-    </details>`;
+      ${error ? `<div class="submit-error">${esc(error)}</div>` : ''}
+      <div class="submit-metrics">
+        <div class="submit-metric"><span>Metric</span><strong>${esc(metric)}</strong></div>
+        <div class="submit-metric"><span>Value</span><strong>${esc(value)}</strong></div>
+        <div class="submit-metric"><span>Rows checked</span><strong>${esc(rows)}</strong></div>
+      </div>
+      ${sourceCode ? `
+        <details class="submission-source">
+          <summary>Код, который сформировал submission.csv</summary>
+          <div class="note-meta">Источник: <span class="inline-code">${esc(sourcePath)}</span>${source.truncated ? ' · truncated' : ''}</div>
+          <pre>${esc(sourceCode)}</pre>
+        </details>` : ''}
+    </div>`;
 }
-function renderPromptHtml(text){
-  const parsed = tryParseFollowupPrompt(text);
-  return `<div class="chat-body structured">${renderMarkdownish(parsed ? parsed.intro : text)}</div>`;
+function renderPromptHtml(text, allowCsv=false){
+  const fullText = cleanText(text);
+  try {
+    return `<div class="chat-body structured">${renderMarkdownish(fullText, {strip:false, csv:allowCsv})}</div>`;
+  } catch {
+    return safeTextBlock(fullText);
+  }
+}
+function validHints(hints){
+  if(!Array.isArray(hints)) return [];
+  return hints.filter(h => h && typeof h === 'object' && cleanText(h.message));
 }
 function renderCommandNote(event){
   const name = cleanText(event.title || event.data?.command || '');
@@ -1533,18 +2232,36 @@ function renderCommandNote(event){
   const code = cleanText(args.code_or_file || '');
   const path = cleanText(args.path || args.file || '');
   const content = cleanText(args.content || args.diff || '');
-  const isCode = name === 'run_python';
-  const fileOps = new Set(['read_file', 'write_file', 'edit_file', 'load_dataset', 'list_files', 'show_dataset_info', 'show_sample_rows']);
-  if(!isCode && !fileOps.has(name)) return '';
-  const summary = isCode ? 'Выполняю код' : 'Открываю файл';
+  const labels = {
+    list_files: 'Показываю список файлов',
+    read_file: 'Открываю файл',
+    write_file: 'Создаю файл',
+    edit_file: 'Редактирую файл',
+    load_dataset: 'Загружаю датасет',
+    show_dataset_info: 'Показываю информацию о датасете',
+    show_sample_rows: 'Показываю sample строки',
+    run_python: 'Выполняю код',
+    get_budget_status: 'Проверяю бюджет шагов',
+    get_remaining_time: 'Проверяю оставшееся время',
+    get_trajectory: 'Показываю trajectory',
+    get_hints: 'Запрашиваю подсказки',
+    submit: 'Отправляю submission'
+  };
+  const summary = labels[name] || `Выполняю команду ${name || 'unknown'}`;
   const details = [];
-  if(isCode) {
+  details.push(`<div class="note-meta">Команда: <span class="inline-code">${esc(renderCommandCall(name, args))}</span></div>`);
+  if(name === 'run_python') {
     if(code) details.push(`<div class="note-meta">Код</div><pre>${esc(code)}</pre>`);
     else details.push('<div class="note-meta">Код не передан.</div>');
   } else {
     if(path) details.push(`<div class="note-meta">Путь: <span class="inline-code">${esc(path)}</span></div>`);
-    if(content) details.push(`<div class="note-meta">Содержимое</div><pre>${esc(content)}</pre>`);
-    if(!path && !content) details.push('<div class="note-meta">Без дополнительных данных.</div>');
+    if(args.n !== undefined) details.push(`<div class="note-meta">Строк: <span class="inline-code">${esc(args.n)}</span></div>`);
+    if(content) details.push(`<div class="note-meta">Содержимое</div>${renderTextPreview(content)}`);
+    if(!path && !content && args.n === undefined) {
+      const argEntries = Object.keys(args || {});
+      if(argEntries.length) details.push(renderJsonSummary(args));
+      else details.push('<div class="note-meta">Без аргументов.</div>');
+    }
   }
   return `
     <div class="command-note">
@@ -1573,7 +2290,7 @@ function eventMainText(event){
 }
 function eventBodyHtml(event){
   const data = event.data || {};
-  if(event.kind === 'prompt') return renderPromptHtml(data.content || '');
+  if(event.kind === 'prompt') return renderPromptHtml(data.content || '', false);
   if(event.kind === 'llm') return `<div class="chat-body structured">${renderMarkdownish(data.content || '')}</div>`;
   if(event.kind === 'result') {
     if(data.command === 'submit') return renderSubmissionHtml(data);
@@ -1608,6 +2325,79 @@ function renderTechEvent(event, index){
       ${summary ? `<div class="event-preview">${esc(summary)}</div>` : ''}
     </div>`;
 }
+function renderTurn(turn, index){
+  try {
+    const promptText = turn.prompt?.data?.content || '';
+    const llmText = turn.llm?.data?.content || '';
+    const prompt = turn.prompt ? renderChatEvent(
+      'prompt',
+      'You',
+      `${renderPromptHtml(promptText, index === 0)}${validHints(turn.hints).length ? `<div class="turn-hint-label">Подсказки к вашему сообщению</div><ul class="turn-hints">${validHints(turn.hints).map(h => `<li><strong>${esc(h.stage || 'hint')}</strong>: ${esc(h.message)}</li>`).join('')}</ul>` : ''}`,
+      new Date(turn.prompt.time).toLocaleTimeString(),
+      'user'
+    ) : '';
+    const llm = turn.llm ? `
+      <div class="event chat-event llm assistant">
+        <div class="chat-row assistant">
+          <div class="chat-avatar">LLM</div>
+          <div class="bubble">
+            <div class="chat-title">LLM</div>
+            <div class="chat-body structured">${renderMarkdownish(llmText)}</div>
+            ${turn.notes.length ? `<div class="command-notes">${turn.notes.join('')}</div>` : ''}
+          </div>
+        </div>
+        <div class="chat-tail">
+          <span>LLM response</span>
+          <span>${esc(new Date(turn.llm.time).toLocaleTimeString())}</span>
+        </div>
+      </div>` : '';
+    return `<div class="turn" data-turn-index="${index}">${prompt}${llm}</div>`;
+  } catch (error) {
+    const promptText = turn.prompt?.data?.content || '';
+    const llmText = turn.llm?.data?.content || '';
+    return `
+      <div class="turn" data-turn-index="${index}">
+        ${turn.prompt ? renderChatEvent('prompt', 'You', safeTextBlock(promptText), new Date(turn.prompt.time).toLocaleTimeString(), 'user') : ''}
+        ${turn.llm ? renderChatEvent('llm', 'LLM', safeTextBlock(llmText), new Date(turn.llm.time).toLocaleTimeString(), 'assistant') : ''}
+        <div class="event error"><div class="event-title">Render fallback</div><div class="event-preview">${esc(error.message || String(error))}</div></div>
+      </div>`;
+  }
+}
+function saveCsvScrollPositions(){
+  eventsEl.querySelectorAll('.turn').forEach((turn, turnIndex) => {
+    turn.querySelectorAll('.csv-table-wrap').forEach((table, index) => {
+      const key = table.dataset.uiKey || `turn-${turnIndex}-csv-${index}`;
+      csvScrollPositions.set(key, {left: table.scrollLeft, top: table.scrollTop});
+    });
+  });
+}
+function applyTrajectoryUiState(){
+  eventsEl.querySelectorAll('.turn').forEach((turn, turnIndex) => {
+    turn.querySelectorAll('.code-block').forEach((block, index) => {
+      const key = `turn-${turnIndex}-code-${index}`;
+      block.dataset.uiKey = key;
+      if(expandedCodeBlocks.has(key)) {
+        block.classList.add('is-expanded');
+        const button = block.querySelector('.code-toggle');
+        if(button) button.setAttribute('aria-label', 'Collapse code');
+      }
+    });
+    turn.querySelectorAll('.csv-table-wrap').forEach((table, index) => {
+      const key = `turn-${turnIndex}-csv-${index}`;
+      table.dataset.uiKey = key;
+      const position = csvScrollPositions.get(key);
+      if(position) {
+        table.scrollLeft = position.left;
+        table.scrollTop = position.top;
+      }
+    });
+    turn.querySelectorAll('details').forEach((details, index) => {
+      const key = `turn-${turnIndex}-details-${index}`;
+      details.dataset.uiKey = key;
+      if(openDetails.has(key)) details.open = true;
+    });
+  });
+}
 function eventPreviewHtml(event){
   const text = truncateText(eventMainText(event));
   return text ? `<div class="event-preview">${esc(text)}</div>` : '';
@@ -1632,6 +2422,8 @@ async function loadTasks(){
 }
 async function startRun(){
   start.disabled = true; stop.disabled = false; message.textContent = 'Starting run...';
+  renderFileList([]);
+  renderFilePreview(null);
   const res = await fetch('/api/runs', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({
     task_id: task.value,
     model: model.value,
@@ -1656,11 +2448,80 @@ async function poll(){
   const data = await res.json();
   if(data.status !== 'ok') return;
   render(data.run);
+  loadRunFiles();
   if(['completed','stopped','error'].includes(data.run.status)){
     clearInterval(timer); start.disabled=false; stop.disabled=true;
   }
 }
+async function loadRunFiles(){
+  if(!currentRun) {
+    renderFileList([]);
+    return;
+  }
+  const res = await fetch(`/api/runs/${currentRun}/files`);
+  const data = await res.json();
+  if(data.status !== 'ok') {
+    fileListEl.innerHTML = `<div class="message error">${esc(data.error || 'Failed to load files')}</div>`;
+    return;
+  }
+  renderFileList(data.files || []);
+}
+function renderFileList(files){
+  if(!currentRun) {
+    fileListEl.innerHTML = '<div class="message">Start a run to browse files.</div>';
+    return;
+  }
+  if(!files.length) {
+    fileListEl.innerHTML = '<div class="message">No files in workspace yet.</div>';
+    return;
+  }
+  fileListEl.innerHTML = files.map(file => {
+    const path = cleanText(file.path);
+    const viewDisabled = file.previewable ? '' : 'disabled';
+    const downloadHref = `/api/runs/${encodeURIComponent(currentRun)}/files/download?path=${encodeURIComponent(path)}`;
+    return `
+      <div class="file-row">
+        <div class="file-main">
+          <div class="file-name" title="${escAttr(path)}">${esc(path)}</div>
+          <div class="file-meta">${esc(formatBytes(file.size || 0))}</div>
+        </div>
+        <div class="file-actions">
+          <button type="button" data-file-view="${escAttr(path)}" ${viewDisabled}>View</button>
+          <a href="${escAttr(downloadHref)}">Download</a>
+        </div>
+      </div>`;
+  }).join('');
+}
+function renderFilePreview(file){
+  if(!file) {
+    filePreviewEl.innerHTML = '<div class="file-preview-head"><span>Preview</span><span>-</span></div><pre>Select a text file to preview it.</pre>';
+    return;
+  }
+  filePreviewEl.innerHTML = `
+    <div class="file-preview-head">
+      <span>${esc(file.path)}</span>
+      <span>${file.truncated ? 'truncated' : formatBytes(file.size || 0)}</span>
+    </div>
+    <pre>${esc(file.content || '')}</pre>`;
+}
+async function viewRunFile(path){
+  if(!currentRun || !path) return;
+  const res = await fetch(`/api/runs/${encodeURIComponent(currentRun)}/files/view?path=${encodeURIComponent(path)}`);
+  const data = await res.json();
+  if(data.status !== 'ok') {
+    filePreviewEl.innerHTML = `<div class="file-preview-head"><span>Preview error</span><span>-</span></div><pre>${esc(data.error || 'Failed to preview file')}</pre>`;
+    return;
+  }
+  renderFilePreview(data.file);
+}
+function formatBytes(size){
+  const value = Number(size) || 0;
+  if(value < 1024) return `${value} B`;
+  if(value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / 1024 / 1024).toFixed(1)} MB`;
+}
 function render(run){
+  saveCsvScrollPositions();
   statusEl.textContent = run.status + ' / ' + run.stop_reason;
   document.getElementById('s-status').textContent = run.status;
   document.getElementById('s-requests').textContent = run.requests;
@@ -1703,7 +2564,7 @@ function render(run){
       continue;
     }
     if(event.kind === 'feedback') {
-      if(currentTurn) currentTurn.hints = Array.isArray(event.data?.hints) ? event.data.hints : [];
+      if(currentTurn) currentTurn.hints = validHints(event.data?.hints);
       continue;
     }
     if(event.kind === 'command') {
@@ -1720,34 +2581,16 @@ function render(run){
       if(currentTurn) currentTurn.notes.push(renderTechEvent(event, turns.length));
     }
   }
-  eventsEl.innerHTML = turns.length ? turns.map((turn, index) => {
-    const prompt = turn.prompt ? renderChatEvent(
-      'prompt',
-      'You',
-      `${renderPromptHtml(turn.prompt.data?.content || '')}${turn.hints.length ? `<div class="turn-hint-label">Подсказки к вашему сообщению</div><ul class="turn-hints">${turn.hints.map(h => `<li><strong>${esc(h.stage)}</strong>: ${esc(h.message)}</li>`).join('')}</ul>` : ''}`,
-      new Date(turn.prompt.time).toLocaleTimeString(),
-      'user'
-    ) : '';
-    const llm = turn.llm ? `
-      <div class="event chat-event llm assistant">
-        <div class="chat-row assistant">
-          <div class="chat-avatar">LLM</div>
-          <div class="bubble">
-            <div class="chat-title">LLM</div>
-            <div class="chat-body structured">${renderMarkdownish(turn.llm.data?.content || '')}</div>
-            ${turn.notes.length ? `<div class="command-notes">${turn.notes.join('')}</div>` : ''}
-          </div>
-        </div>
-        <div class="chat-tail">
-          <span>LLM response</span>
-          <span>${esc(new Date(turn.llm.time).toLocaleTimeString())}</span>
-        </div>
-      </div>` : '';
-    return `<div class="turn" data-turn-index="${index}">${prompt}${llm}</div>`;
-  }).join('') : '<div class="message">No events yet.</div>';
+  eventsEl.innerHTML = turns.length ? turns.map(renderTurn).join('') : '<div class="message">No events yet.</div>';
+applyTrajectoryUiState();
 }
 start.addEventListener('click', startRun);
 stop.addEventListener('click', stopRun);
+fileListEl.addEventListener('click', (event) => {
+  const button = event.target.closest('[data-file-view]');
+  if(!button) return;
+  viewRunFile(button.dataset.fileView || '');
+});
 setupCodeToggles();
 loadTasks();
 </script>
@@ -1763,14 +2606,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--project-root", type=Path, default=Path.cwd())
     parser.add_argument("--tasks-dir", type=Path, default=DEFAULT_TASKS_DIR)
     parser.add_argument("--run-root", type=Path, default=DEFAULT_RUN_ROOT)
+    parser.add_argument(
+        "--docker-image",
+        default=DEFAULT_DOCKER_IMAGE,
+        help="Prebuilt Docker image used for agent run_python commands.",
+    )
+    parser.add_argument(
+        "--no-docker",
+        action="store_true",
+        help="Run agent Python commands on the host instead of a benchmark Docker container.",
+    )
+    parser.add_argument(
+        "--keep-containers",
+        action="store_true",
+        help="Do not remove per-run benchmark containers after runs finish.",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    manager = AgentRunManager(args.project_root, args.tasks_dir, args.run_root)
+    manager = AgentRunManager(
+        args.project_root,
+        args.tasks_dir,
+        args.run_root,
+        use_docker=not args.no_docker,
+        docker_image=args.docker_image,
+        keep_containers=args.keep_containers,
+    )
     server = ThreadingHTTPServer((args.host, args.port), make_handler(manager))
     print(f"Agent web UI is running on http://{args.host}:{args.port}")
+    if args.no_docker:
+        print("Agent Python execution: host python3")
+    else:
+        print(f"Agent Python execution: Docker image {args.docker_image}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
