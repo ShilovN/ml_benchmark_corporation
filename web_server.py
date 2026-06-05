@@ -509,6 +509,7 @@ class AgentRunManager:
                 "value": metric.get("value"),
             })
 
+        runs.sort(key=lambda run: str(run.get("created_at") or ""), reverse=True)
         return runs
 
 def make_handler(manager: AgentRunManager) -> type[BaseHTTPRequestHandler]:
@@ -1721,21 +1722,22 @@ async function loadRuns() {
     <table>
       <thead>
         <tr>
-          <th>#</th>
-          <th>Run</th>
-          <th>Модель</th>
-          <th>Лимиты</th>
-          <th>Metric</th>
+            <th>#</th>
+            <th>Дата и время</th>
+            <th>Run</th>
+            <th>Модель</th>
+            <th>Лимиты</th>
+            <th>Metric</th>
         </tr>
       </thead>
       <tbody>
         ${runs.map((run, index) => `
           <tr class="run-row ${run.run_id === selectedRunId ? 'selected' : ''}" data-run-id="${esc(run.run_id)}">
             <td>${index + 1}</td>
-            <td>
-              <div class="mono">${esc(run.run_id)}</div>
-              <div class="muted">${esc(formatDate(run.created_at))}</div>
-              <div class="muted">${esc(short(run.task_id))} / ${esc(short(run.mode))}</div>
+            <td>${esc(formatDate(run.created_at))}</td>
+                <td>
+                <div class="mono">${esc(run.run_id)}</div>
+                <div class="muted">${esc(short(run.task_id))} / ${esc(short(run.mode))}</div>
             </td>
             <td>${esc(short(run.model))}</td>
             <td>
