@@ -1576,6 +1576,8 @@ def render_agent_page() -> str:
     button.secondary { background:#eef3f8; color:var(--text); border:1px solid var(--border); }
     button:disabled { opacity:.55; cursor:not-allowed; }
     .status { display:inline-flex; min-height:32px; align-items:center; padding:0 12px; border-radius:999px; border:1px solid var(--border); background:white; color:var(--muted); }
+    .status.is-thinking { color:var(--accent); border-color:#b9cdfd; background:#eff4ff; }
+    .status.is-thinking::before { content:""; width:8px; height:8px; margin-right:8px; border-radius:50%; background:var(--accent); animation:thinking-pulse 1s ease-in-out infinite; }
     .cards { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; }
     .card { border:1px solid var(--border); border-radius:8px; padding:12px; background:#f8fafc; }
     .card strong { display:block; font-size:22px; margin-top:4px; }
@@ -1599,6 +1601,14 @@ def render_agent_page() -> str:
     .chat-body .block { margin:10px 0; }
     .chat-body pre { max-height:none; white-space:pre-wrap; word-break:break-word; }
     .chat-tail { box-sizing:border-box; display:flex; justify-content:space-between; gap:10px; min-width:0; max-width:100%; color:var(--muted); font-size:12px; padding:0 44px; }
+    .thinking-bubble { border-color:#b9cdfd; background:#f6f9ff; }
+    .thinking-line { display:flex; align-items:center; gap:10px; color:var(--muted); font-weight:700; }
+    .thinking-dots { display:inline-flex; align-items:center; gap:4px; }
+    .thinking-dots span { width:6px; height:6px; border-radius:50%; background:var(--accent); opacity:.35; animation:thinking-dot 1.2s ease-in-out infinite; }
+    .thinking-dots span:nth-child(2) { animation-delay:.16s; }
+    .thinking-dots span:nth-child(3) { animation-delay:.32s; }
+    @keyframes thinking-dot { 0%, 80%, 100% { transform:translateY(0); opacity:.35; } 40% { transform:translateY(-4px); opacity:1; } }
+    @keyframes thinking-pulse { 0%, 100% { transform:scale(.8); opacity:.45; } 50% { transform:scale(1.15); opacity:1; } }
     .event.command, .event.result, .event.feedback, .event.system, .event.error, .event.parse_error { border:1px solid var(--border); border-radius:10px; padding:10px 12px; background:white; }
     .event.command { border-left:4px solid #c2410c; }
     .event.result { border-left:4px solid #067647; }
@@ -2314,7 +2324,24 @@ function renderTurn(turn, index){
           <span>${esc(new Date(turn.llm.time).toLocaleTimeString())}</span>
         </div>
       </div>` : '';
-    return `<div class="turn" data-turn-index="${index}">${prompt}${llm}</div>`;
+    const thinking = turn.thinking ? `
+      <div class="event chat-event llm assistant">
+        <div class="chat-row assistant">
+          <div class="chat-avatar">LLM</div>
+          <div class="bubble thinking-bubble">
+            <div class="chat-title">LLM</div>
+            <div class="thinking-line">
+              <span>Модель размышляет</span>
+              <span class="thinking-dots" aria-hidden="true"><span></span><span></span><span></span></span>
+            </div>
+          </div>
+        </div>
+        <div class="chat-tail">
+          <span>Generating response</span>
+          <span>${esc(new Date().toLocaleTimeString())}</span>
+        </div>
+      </div>` : '';
+    return `<div class="turn" data-turn-index="${index}">${prompt}${llm}${thinking}</div>`;
   } catch (error) {
     const promptText = turn.prompt?.data?.content || '';
     const llmText = turn.llm?.data?.content || '';
@@ -2487,6 +2514,7 @@ function formatBytes(size){
 function render(run){
   saveCsvScrollPositions();
   statusEl.textContent = run.status + ' / ' + run.stop_reason;
+  statusEl.classList.remove('is-thinking');
   document.getElementById('s-status').textContent = run.status;
   document.getElementById('s-requests').textContent = run.requests;
   document.getElementById('s-steps').textContent = `${run.used_steps}/${run.max_steps}`;
@@ -2544,6 +2572,13 @@ function render(run){
     if(event.kind === 'error' || event.kind === 'parse_error' || event.kind === 'system') {
       if(currentTurn) currentTurn.notes.push(renderTechEvent(event, turns.length));
     }
+  }
+  const lastTurn = turns[turns.length - 1];
+  const isThinking = run.status === 'running' && Boolean(lastTurn?.prompt) && !lastTurn.llm;
+  if(isThinking) {
+    lastTurn.thinking = true;
+    statusEl.classList.add('is-thinking');
+    message.textContent = `Mode: ${run.mode}. Task: ${run.task_id}. Модель размышляет...`;
   }
   eventsEl.innerHTML = turns.length ? turns.map(renderTurn).join('') : '<div class="message">No events yet.</div>';
 applyTrajectoryUiState();
