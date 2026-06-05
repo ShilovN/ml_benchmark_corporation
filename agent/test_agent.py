@@ -22,14 +22,20 @@ from main import (
     response_max_tokens,
 )
 from web_server import (
+    AgentRunManager,
     REPEATED_MAX_ATTEMPTS,
     RunConfig,
     RunState,
     apply_mode_after_results,
     apply_mode_instruction,
+    best_repeated_submission,
     current_fixed_stage,
     extract_commands,
+    handle_successful_submit,
+    prepare_run_workspace,
     record_fixed_stage_attempt,
+    repeated_attempt_workspace_id,
+    should_isolate_llm_history,
     validate_mode_command_batch,
     validate_mode_command,
 )
@@ -540,6 +546,21 @@ class ExecutorTest(unittest.TestCase):
         self.assertEqual(file_result["result"]["returncode"], 0)
         self.assertIn("from file", file_result["result"]["stdout"])
 
+    def test_run_python_blocks_project_files_outside_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_root = Path(tmp_dir)
+            workspace = project_root / "current_run"
+            other_run = project_root / "other_run"
+            workspace.mkdir()
+            other_run.mkdir()
+            (other_run / "submission.csv").write_text("secret", encoding="utf-8")
+            executor = CommandExecutor(AgentContext(workspace=workspace, project_root=project_root))
+
+            result = executor.execute_text('run_python("print(open(\'../other_run/submission.csv\').read())")')
+
+        self.assertEqual(result["result"]["returncode"], 1)
+        self.assertIn("outside isolated workspace", result["result"]["stderr"])
+
     def test_step_budget_exceeded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             executor = CommandExecutor(AgentContext(workspace=Path(tmp_dir), max_steps=1))
@@ -588,6 +609,20 @@ submit("submission.csv")
         self.assertEqual([command.name for command in commands], ["run_python", "submit"])
         self.assertIn("create submission", commands[0].args["code_or_file"])
 
+    def test_extract_commands_ignores_inline_command_mentions(self) -> None:
+        text = 'Мысль: подготовлю решение и потом вызову submit("submission.csv").'
+
+        with self.assertRaisesRegex(ValueError, "No executable command"):
+            extract_commands(text)
+
+    def test_extract_commands_accepts_command_on_own_line(self) -> None:
+        text = '''Мысль: отправляю готовый файл
+submit("submission.csv")'''
+
+        commands = extract_commands(text)
+
+        self.assertEqual([command.name for command in commands], ["submit"])
+
     def test_single_shot_submit_only_is_not_batch_error(self) -> None:
         state = self._state("single-shot")
 
@@ -630,12 +665,121 @@ submit("submission.csv")
             "repeated_attempt_limit",
         )
 
+    def test_repeated_requires_submit_on_every_attempt(self) -> None:
+        state = self._state("repeated")
+        state.requests = 1
+
+        error = validate_mode_command_batch(state, [parse_command('run_python("print(1)")')])
+
+        self.assertIsNotNone(error)
+        self.assertEqual(error["reason"], "repeated_missing_submit")
+
+    def test_repeated_rejects_submit_only(self) -> None:
+        state = self._state("repeated")
+
+        error = validate_mode_command_batch(state, [parse_command('submit("submission.csv")')])
+
+        self.assertIsNotNone(error)
+        self.assertEqual(error["reason"], "repeated_submit_without_solution")
+
+    def test_repeated_accepts_solution_command_before_submit(self) -> None:
+        state = self._state("repeated")
+
+        error = validate_mode_command_batch(
+            state,
+            [parse_command('run_python("print(1)")'), parse_command('submit("submission.csv")')],
+        )
+
+        self.assertIsNone(error)
+
+    def test_repeated_submit_does_not_finish_before_attempt_limit(self) -> None:
+        state = self._state("repeated")
+        state.requests = 1
+        result = {"status": "ok", "command": "submit", "result": {"metric": "mae", "value": 10.0}}
+
+        handle_successful_submit(state, result)
+
+        self.assertFalse(state.submitted)
+        self.assertEqual(state.submission_result, result)
+
+    def test_repeated_best_submission_uses_lower_error_metric(self) -> None:
+        first = {"status": "ok", "command": "submit", "result": {"metric": "mae", "value": 10.0}}
+        second = {"status": "ok", "command": "submit", "result": {"metric": "mae", "value": 7.0}}
+
+        self.assertEqual(best_repeated_submission([first, second]), second)
+
+    def test_repeated_best_submission_uses_higher_score_metric(self) -> None:
+        first = {"status": "ok", "command": "submit", "result": {"metric": "f1_score", "value": 0.72}}
+        second = {"status": "ok", "command": "submit", "result": {"metric": "f1_score", "value": 0.81}}
+
+        self.assertEqual(best_repeated_submission([first, second]), second)
+
     def test_mode_instruction_mentions_current_mode(self) -> None:
         fixed_state = self._state("fixed-transitions")
         repeated_state = self._state("repeated")
 
         self.assertIn("текущий обязательный этап EDA", apply_mode_instruction(fixed_state, "base"))
         self.assertIn(f"попытка 1/{REPEATED_MAX_ATTEMPTS}", apply_mode_instruction(repeated_state, "base"))
+
+    def test_repeated_prompt_requires_current_attempt_submit(self) -> None:
+        state = self._state("repeated")
+        state.requests = 1
+
+        prompt = apply_mode_instruction(state, "base")
+
+        self.assertIn("Ответ только с `Мысль: ...` будет отклонён", prompt)
+        self.assertIn("Обязательный формат ответа", prompt)
+        self.assertIn("run_python", prompt)
+        self.assertIn("не обещай улучшить модель позже", prompt)
+        self.assertIn("Submit-only будет отклонён", prompt)
+        self.assertIn("submit(\"submission.csv\")", prompt)
+        self.assertNotIn("сможешь в следующей попытке", prompt)
+
+    def test_repeated_mode_isolates_llm_history_between_attempts(self) -> None:
+        self.assertTrue(should_isolate_llm_history(self._state("repeated")))
+        self.assertFalse(should_isolate_llm_history(self._state("flexible")))
+
+    def test_repeated_attempts_use_clean_workspaces(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_root = Path(tmp_dir)
+            task_dir = project_root / "tasks" / "toy"
+            task_dir.mkdir(parents=True)
+            (task_dir / "task.json").write_text(
+                json.dumps(
+                    {
+                        "id": "toy",
+                        "metric": "mae",
+                        "column": "target",
+                        "public_files": ["train.csv", "test.csv"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (task_dir / "train.csv").write_text("id,x,target\n1,10,100\n", encoding="utf-8")
+            (task_dir / "test.csv").write_text("id,x\n2,20\n", encoding="utf-8")
+            manager = AgentRunManager(project_root, Path("tasks"), Path("runs"))
+            config = RunConfig(task_id="toy", mode="repeated")
+            first_workspace = prepare_run_workspace(
+                project_root,
+                manager.tasks_dir,
+                manager.run_root,
+                "toy",
+                repeated_attempt_workspace_id("run", 1),
+            )
+            (first_workspace / "solution.py").write_text("old attempt", encoding="utf-8")
+            state = RunState(
+                run_id="run",
+                config=config,
+                workspace=first_workspace,
+                executor=manager._make_executor(config, first_workspace),
+            )
+            state.requests = 1
+
+            manager._prepare_next_repeated_attempt(state)
+
+            self.assertTrue(state.workspace.name.endswith("attempt-2"))
+            self.assertTrue((state.workspace / "train.csv").exists())
+            self.assertFalse((state.workspace / "solution.py").exists())
 
 
 class HintEngineTest(unittest.TestCase):
