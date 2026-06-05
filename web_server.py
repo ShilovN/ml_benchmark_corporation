@@ -27,7 +27,7 @@ from urllib.parse import parse_qs, urlparse
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agent.executor import AgentContext, CommandExecutor
+from agent.executor import AgentContext, CommandExecutor, DEFAULT_TIME_LIMIT_SECONDS
 from agent.llm_client import (
     AVAILABLE_MODELS,
     DEFAULT_MAX_TOKENS,
@@ -104,6 +104,7 @@ class RunConfig:
     mode: str = DEFAULT_MODE
     max_steps: int = 40
     token_limit: int = 120000
+    time_limit_seconds: int = DEFAULT_TIME_LIMIT_SECONDS
     temperature: float = DEFAULT_TEMPERATURE
     max_tokens: int = DEFAULT_MAX_TOKENS
     request_timeout: int = DEFAULT_TIMEOUT
@@ -144,6 +145,8 @@ class RunState:
             "total_tokens": self.total_tokens,
             "used_steps": self.executor.context.used_steps,
             "max_steps": self.config.max_steps,
+            "code_time_limit_seconds": self.config.time_limit_seconds,
+            "elapsed_seconds": round(time.monotonic() - self.executor.context.start_time, 1),
             "submitted": self.submitted,
             "submission_result": self.submission_result,
             "error": self.error,
@@ -203,6 +206,7 @@ class AgentRunManager:
                 task_id=config.task_id,
                 tasks_dir=self.tasks_dir,
                 max_steps=config.max_steps,
+                time_limit_seconds=config.time_limit_seconds,
                 history_file=Path("agent_history.txt"),
                 docker_container=docker_container,
             )
@@ -546,6 +550,11 @@ def make_handler(manager: AgentRunManager) -> type[BaseHTTPRequestHandler]:
                     mode=mode,
                     max_steps=int(payload["max_steps"]) if "max_steps" in payload else 40,
                     token_limit=int(payload["token_limit"]) if "token_limit" in payload else 120000,
+                    time_limit_seconds=(
+                        int(payload["time_limit_seconds"])
+                        if "time_limit_seconds" in payload
+                        else DEFAULT_TIME_LIMIT_SECONDS
+                    ),
                     temperature=float(payload["temperature"]) if "temperature" in payload else DEFAULT_TEMPERATURE,
                     max_tokens=int(payload["max_tokens"]) if "max_tokens" in payload else DEFAULT_MAX_TOKENS,
                     request_timeout=int(payload["request_timeout"]) if "request_timeout" in payload else DEFAULT_TIMEOUT,
@@ -1562,6 +1571,7 @@ def render_agent_page() -> str:
     input, select { border:1px solid var(--border); border-radius:6px; padding:8px; background:white; }
     .field { margin-bottom:14px; }
     .row { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+    .limit-row { grid-template-columns:repeat(3,minmax(0,1fr)); }
     button { border:0; border-radius:6px; background:var(--accent); color:white; font-weight:800; cursor:pointer; padding:0 14px; }
     button.secondary { background:#eef3f8; color:var(--text); border:1px solid var(--border); }
     button:disabled { opacity:.55; cursor:not-allowed; }
@@ -1689,6 +1699,7 @@ __MODEL_OPTIONS__
           <div class="field"><label for="steps">Max steps</label><input id="steps" type="number" value="40" min="1"></div>
           <div class="field"><label for="tokens">Token limit</label><input id="tokens" type="number" value="120000" min="1"></div>
         </div>
+        <div class="field"><label for="timeLimit">Code timeout, sec</label><input id="timeLimit" type="number" value="__DEFAULT_TIME_LIMIT_SECONDS__" min="1"></div>
         <div class="row">
           <button id="start">Start LLM Run</button>
           <button class="secondary" id="stop" disabled>Stop</button>
@@ -2194,7 +2205,7 @@ function renderCommandNote(event){
     show_sample_rows: 'Показываю sample строки',
     run_python: 'Выполняю код',
     get_budget_status: 'Проверяю бюджет шагов',
-    get_remaining_time: 'Проверяю оставшееся время',
+    get_remaining_time: 'Проверяю timeout кода',
     get_trajectory: 'Показываю trajectory',
     get_hints: 'Запрашиваю подсказки',
     submit: 'Отправляю submission'
@@ -2381,7 +2392,8 @@ async function startRun(){
     model: model.value,
     mode: mode.value,
     max_steps: Number(steps.value),
-    token_limit: Number(tokens.value)
+    token_limit: Number(tokens.value),
+    time_limit_seconds: Number(timeLimit.value)
   })});
   const data = await res.json();
   if(data.status !== 'ok'){ message.textContent = data.error || 'Failed to start'; start.disabled=false; stop.disabled=true; return; }
@@ -2548,7 +2560,10 @@ loadTasks();
 </script>
 </body>
 </html>"""
-    return page.replace("__MODEL_OPTIONS__", model_options)
+    return page.replace("__MODEL_OPTIONS__", model_options).replace(
+        "__DEFAULT_TIME_LIMIT_SECONDS__",
+        str(DEFAULT_TIME_LIMIT_SECONDS),
+    )
 
 
 def parse_args() -> argparse.Namespace:

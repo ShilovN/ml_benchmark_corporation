@@ -22,7 +22,7 @@ MAX_RESULT_CHARS = 8000
 MAX_FILE_READ_CHARS = 20000
 MAX_SUBMISSION_SOURCE_CHARS = 20000
 DEFAULT_MAX_STEPS = 100
-DEFAULT_TIME_LIMIT_SECONDS = 3600
+DEFAULT_TIME_LIMIT_SECONDS = 300
 DEFAULT_HISTORY_FILENAME = "agent_history.txt"
 
 
@@ -182,12 +182,14 @@ class CommandExecutor:
         else:
             command = self._python_code_command(code_or_file)
 
+        timeout = max(1, int(self.context.time_limit_seconds))
+        process_timeout = timeout + 5 if self.context.docker_container else timeout
         completed = subprocess.run(
             command,
             cwd=self.context.workspace,
             text=True,
             capture_output=True,
-            timeout=20,
+            timeout=process_timeout,
             env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
         )
         return {
@@ -205,6 +207,8 @@ class CommandExecutor:
                 "-w",
                 "/workspace",
                 self.context.docker_container,
+                "timeout",
+                str(max(1, int(self.context.time_limit_seconds))),
                 "python3",
                 str(Path("/workspace") / relative_path),
             ]
@@ -218,6 +222,8 @@ class CommandExecutor:
                 "-w",
                 "/workspace",
                 self.context.docker_container,
+                "timeout",
+                str(max(1, int(self.context.time_limit_seconds))),
                 "python3",
                 "-c",
                 code,
@@ -232,13 +238,12 @@ class CommandExecutor:
             "remaining_steps": max(0, self.context.max_steps - self.context.used_steps),
         }
 
-    def _get_remaining_time(self, args: dict[str, Any]) -> dict[str, float]:
+    def _get_remaining_time(self, args: dict[str, Any]) -> dict[str, int | None]:
         _ensure_no_args(args)
-        elapsed = time.monotonic() - self.context.start_time
         return {
             "time_limit_seconds": self.context.time_limit_seconds,
-            "elapsed_seconds": round(elapsed, 3),
-            "remaining_seconds": round(max(0.0, self.context.time_limit_seconds - elapsed), 3),
+            "code_time_limit_seconds": self.context.time_limit_seconds,
+            "remaining_seconds": None,
         }
 
     def _get_trajectory(self, args: dict[str, Any]) -> list[dict[str, Any]]:
