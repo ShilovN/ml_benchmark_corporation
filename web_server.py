@@ -132,23 +132,25 @@ class RunState:
     docker_container: str | None = None
     created_container: bool = False
 
-    def public_dict(self) -> dict[str, Any]:
+    def public_dict(self, *, full_events: bool = False) -> dict[str, Any]:
         return {
             "run_id": self.run_id,
             "task_id": self.config.task_id,
+            "model": self.config.model,
             "created_at": self.created_at,
             "mode": self.config.mode,
             "status": self.status,
             "stop_reason": self.stop_reason,
             "requests": self.requests,
             "total_tokens": self.total_tokens,
+            "token_limit": self.config.token_limit,
             "used_steps": self.executor.context.used_steps,
             "max_steps": self.config.max_steps,
             "submitted": self.submitted,
             "submission_result": self.submission_result,
             "error": self.error,
             "docker_container": self.docker_container,
-            "events": self.events[-200:],
+            "events": self.events if full_events else self.events[-200:],
         }
 
 
@@ -459,7 +461,7 @@ class AgentRunManager:
 
 
     def save_run(self, state: RunState) -> None:
-        payload = state.public_dict()
+        payload = state.public_dict(full_events=True)
         path = self._history_path(state.run_id)
         print(f"Saving run history to {path}")
         tmp_path = path.with_suffix(".json.tmp")
@@ -497,6 +499,8 @@ class AgentRunManager:
                 "mode": data.get("mode"),
                 "status": data.get("status"),
                 "stop_reason": data.get("stop_reason"),
+                "token_limit": data.get("token_limit"),
+                "max_steps": data.get("max_steps"),
                 "metric": metric.get("metric"),
                 "value": metric.get("value"),
             })
@@ -511,6 +515,9 @@ def make_handler(manager: AgentRunManager) -> type[BaseHTTPRequestHandler]:
             parsed = urlparse(self.path)
             if parsed.path == "/":
                 self._send_html(render_agent_page())
+                return
+            if parsed.path == "/history":
+                self._send_html(render_history_page())
                 return
             if parsed.path == "/api/tasks":
                 self._send_json({"status": "ok", "tasks": manager.list_tasks()})
@@ -530,6 +537,9 @@ def make_handler(manager: AgentRunManager) -> type[BaseHTTPRequestHandler]:
                         HTTPStatus.BAD_REQUEST,
                     )
                 return
+            if parsed.path == "/api/runs":
+                self._send_json({"status": "ok", "runs": manager.list_saved_runs()})
+                return
             if parsed.path == "/api/runs/latest":
                 run = manager.latest_run()
                 self._send_json({"status": "ok", "run": run.public_dict() if run else None})
@@ -538,7 +548,12 @@ def make_handler(manager: AgentRunManager) -> type[BaseHTTPRequestHandler]:
                 parts = parsed.path.strip("/").split("/")
                 run_id = parts[2] if len(parts) >= 3 else ""
                 run = manager.get_run(run_id)
+
                 if not run:
+                    saved_run = manager.load_saved_run(run_id)
+                    if saved_run and len(parts) == 3:
+                        self._send_json({"status": "ok", "run": saved_run})
+                        return
                     self._send_json({"status": "error", "error": "Run not found"}, HTTPStatus.NOT_FOUND)
                     return
                 if len(parts) == 4 and parts[3] == "files":
@@ -599,8 +614,16 @@ def make_handler(manager: AgentRunManager) -> type[BaseHTTPRequestHandler]:
                     request_timeout=int(payload["request_timeout"]) if "request_timeout" in payload else DEFAULT_TIMEOUT,
                 )
                 try:
+                    print("=== ПОЛУЧЕННЫЙ КОНФИГУРАЦИОННЫЙ ЗАПРОС ===")
+                    print(config) 
+                    print("=========================================")
                     run = manager.start_run(config)
                 except subprocess.CalledProcessError as exc:
+                    print("!!!!!!!! ОШИБКА ЗАПУСКА DOCKER-КОНТЕЙНЕРА РАННЕРА !!!!!!!!")
+                    print("КОМАНДА:", exc.cmd)
+                    print("ВЫВОД (STDOUT):", exc.stdout)
+                    print("ОШИБКА (STDERR):", exc.stderr)
+                    print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
                     self._send_json(
                         {
                             "status": "error",
@@ -1574,6 +1597,232 @@ def _first_query_value(query: str, name: str) -> str | None:
     values = parse_qs(query).get(name)
     return values[0] if values else None
 
+def render_history_page() -> str:
+    return r"""<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>История запусков</title>
+  <style>
+    :root { --bg:#f5f7fa; --surface:#fff; --border:#d8e0ea; --text:#152033; --muted:#667085; --accent:#155eef; --bad:#b42318; }
+    body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:var(--bg); color:var(--text); }
+    main { max-width:1380px; margin:0 auto; padding:28px 20px 44px; }
+    header { display:flex; justify-content:space-between; gap:16px; align-items:flex-start; margin-bottom:20px; }
+    h1 { margin:0 0 8px; font-size:30px; }
+    h2 { margin:0 0 14px; font-size:18px; }
+    p { margin:0; color:var(--muted); }
+    a, button { font:inherit; }
+    .back { display:inline-flex; align-items:center; min-height:36px; padding:0 12px; border:1px solid var(--border); border-radius:6px; background:white; color:var(--accent); font-weight:800; text-decoration:none; }
+    .layout { display:grid; grid-template-columns: minmax(420px, 560px) minmax(0, 1fr); gap:18px; align-items:start; }
+    section { background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:18px; min-width:0; }
+    table { width:100%; border-collapse:collapse; font-size:14px; }
+    th, td { border-bottom:1px solid var(--border); padding:9px 8px; text-align:left; vertical-align:top; }
+    th { color:var(--muted); background:#f8fafc; font-weight:800; }
+    tr.run-row { cursor:pointer; }
+    tr.run-row:hover { background:#f8fafc; }
+    tr.run-row.selected { background:#eef4ff; }
+    .mono { font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; }
+    .muted { color:var(--muted); }
+    .message { border-radius:8px; padding:12px; background:#eef3f8; color:var(--muted); }
+    .error { color:var(--bad); background:#fef3f2; border:1px solid #fecdca; }
+    .summary { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-bottom:14px; }
+    .card { border:1px solid var(--border); border-radius:8px; padding:10px; background:#f8fafc; min-width:0; }
+    .card span { display:block; color:var(--muted); font-size:12px; font-weight:800; margin-bottom:4px; }
+    .card strong { display:block; overflow-wrap:anywhere; }
+    .conversation { display:grid; gap:12px; max-height:76vh; overflow:auto; padding-right:4px; }
+    .event { border:1px solid var(--border); border-radius:10px; padding:12px; background:white; }
+    .event.prompt { background:#effdf7; border-color:#c8e7da; }
+    .event.llm { background:#f8fafc; }
+    .event.command { border-left:4px solid #c2410c; }
+    .event.result { border-left:4px solid #067647; }
+    .event.error, .event.parse_error { border-left:4px solid var(--bad); }
+    .event-head { display:flex; justify-content:space-between; gap:10px; color:var(--muted); font-size:12px; margin-bottom:8px; }
+    .event-title { font-weight:900; margin-bottom:8px; }
+    pre { box-sizing:border-box; max-width:100%; white-space:pre-wrap; overflow:auto; margin:0; padding:10px; border-radius:6px; background:#111827; color:#f9fafb; font-size:13px; line-height:1.45; }
+    @media (max-width:980px) { .layout { display:block; } section { margin-bottom:16px; } .summary { grid-template-columns:1fr 1fr; } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>История запусков</h1>
+      <p>Список сохраненных LLM runs и полный разговор по выбранному запуску.</p>
+    </div>
+    <a class="back" href="/">Назад к запуску</a>
+  </header>
+
+  <div class="layout">
+    <section>
+      <h2>Запуски</h2>
+      <div id="runs"><div class="message">Загрузка истории...</div></div>
+    </section>
+
+    <section>
+      <h2>Разговор с LLM</h2>
+      <div id="details"><div class="message">Выбери запуск слева.</div></div>
+    </section>
+  </div>
+</main>
+
+<script>
+const runsEl = document.getElementById('runs');
+const detailsEl = document.getElementById('details');
+let selectedRunId = null;
+
+function esc(value) {
+  return String(value ?? '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#039;');
+}
+
+function short(value, fallback='-') {
+  if (value === null || value === undefined || value === '') return fallback;
+  return String(value);
+}
+
+function metricText(run) {
+  if (!run.metric) return '-';
+  if (run.value === null || run.value === undefined) return run.metric;
+  const value = Number(run.value);
+  const rendered = Number.isFinite(value) ? value.toLocaleString(undefined, {maximumFractionDigits: 8}) : String(run.value);
+  return `${run.metric}: ${rendered}`;
+}
+
+function formatDate(value) {
+  if (!value) return '-';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+}
+
+async function loadRuns() {
+  const response = await fetch('/api/runs');
+  const payload = await response.json();
+  if (payload.status !== 'ok') {
+    runsEl.innerHTML = `<div class="message error">${esc(payload.error || 'Не удалось загрузить историю')}</div>`;
+    return;
+  }
+
+  const runs = payload.runs || [];
+  if (!runs.length) {
+    runsEl.innerHTML = '<div class="message">История запусков пока пустая.</div>';
+    return;
+  }
+
+  runsEl.innerHTML = `
+    <table>
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Run</th>
+          <th>Модель</th>
+          <th>Лимиты</th>
+          <th>Metric</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${runs.map((run, index) => `
+          <tr class="run-row ${run.run_id === selectedRunId ? 'selected' : ''}" data-run-id="${esc(run.run_id)}">
+            <td>${index + 1}</td>
+            <td>
+              <div class="mono">${esc(run.run_id)}</div>
+              <div class="muted">${esc(formatDate(run.created_at))}</div>
+              <div class="muted">${esc(short(run.task_id))} / ${esc(short(run.mode))}</div>
+            </td>
+            <td>${esc(short(run.model))}</td>
+            <td>
+              <div>tokens: ${esc(short(run.token_limit))}</div>
+              <div>steps: ${esc(short(run.max_steps))}</div>
+            </td>
+            <td>${esc(metricText(run))}</td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
+  `;
+
+  runsEl.querySelectorAll('[data-run-id]').forEach((row) => {
+    row.addEventListener('click', () => openRun(row.dataset.runId));
+  });
+}
+
+async function openRun(runId) {
+  if (!runId) return;
+  selectedRunId = runId;
+  detailsEl.innerHTML = '<div class="message">Загрузка запуска...</div>';
+  await loadRuns();
+
+  const response = await fetch(`/api/runs/${encodeURIComponent(runId)}`);
+  const payload = await response.json();
+  if (payload.status !== 'ok') {
+    detailsEl.innerHTML = `<div class="message error">${esc(payload.error || 'Запуск не найден')}</div>`;
+    return;
+  }
+
+  renderRun(payload.run);
+}
+
+function renderRun(run) {
+  const submission = run.submission_result || {};
+  const result = submission.result || {};
+  const events = run.events || [];
+
+  detailsEl.innerHTML = `
+    <div class="summary">
+      <div class="card"><span>Run</span><strong class="mono">${esc(run.run_id)}</strong></div>
+      <div class="card"><span>Model</span><strong>${esc(short(run.model))}</strong></div>
+      <div class="card"><span>Tokens</span><strong>${esc(short(run.total_tokens))} / ${esc(short(run.token_limit))}</strong></div>
+      <div class="card"><span>Steps</span><strong>${esc(short(run.used_steps))} / ${esc(short(run.max_steps))}</strong></div>
+      <div class="card"><span>Status</span><strong>${esc(short(run.status))}</strong></div>
+      <div class="card"><span>Stop reason</span><strong>${esc(short(run.stop_reason))}</strong></div>
+      <div class="card"><span>Metric</span><strong>${esc(short(result.metric))}</strong></div>
+      <div class="card"><span>Value</span><strong>${esc(short(result.value))}</strong></div>
+    </div>
+    <div class="conversation">
+      ${events.length ? events.map(renderEvent).join('') : '<div class="message">В этом запуске нет events.</div>'}
+    </div>
+  `;
+}
+
+function renderEvent(event) {
+  const kind = short(event.kind, 'event');
+  const title = short(event.title, kind);
+  const time = formatDate(event.time);
+  const data = event.data || {};
+  let content = '';
+
+  if (kind === 'prompt' || kind === 'llm') {
+    content = data.content || '';
+  } else if (kind === 'command') {
+    content = JSON.stringify(data.args || {}, null, 2);
+  } else if (kind === 'result') {
+    content = JSON.stringify(data.result || data.error || data, null, 2);
+  } else if (kind === 'feedback') {
+    content = JSON.stringify(data.hints || data, null, 2);
+  } else {
+    content = JSON.stringify(data, null, 2);
+  }
+
+  return `
+    <div class="event ${esc(kind)}">
+      <div class="event-head">
+        <span>${esc(kind)}</span>
+        <span>${esc(time)}</span>
+      </div>
+      <div class="event-title">${esc(title)}</div>
+      <pre>${esc(content)}</pre>
+    </div>
+  `;
+}
+
+loadRuns();
+</script>
+</body>
+</html>"""
 
 def render_agent_page() -> str:
     model_options = "\n".join(
@@ -1741,6 +1990,9 @@ __MODEL_OPTIONS__
           <button id="start">Start LLM Run</button>
           <button class="secondary" id="stop" disabled>Stop</button>
         </div>
+        <div class="row" style="margin-top:10px;">
+          <button class="secondary" id="history-button" type="button">История запусков</button>
+        </div>
         <div class="message" id="message">Готово к запуску. Нужен доступ к OpenAI-compatible LLM endpoint.</div>
       </section>
       <section>
@@ -1785,6 +2037,7 @@ const steps = document.getElementById('steps');
 const tokens = document.getElementById('tokens');
 const start = document.getElementById('start');
 const stop = document.getElementById('stop');
+const historyButton = document.getElementById('history-button');
 const message = document.getElementById('message');
 const statusEl = document.getElementById('status');
 const eventsEl = document.getElementById('events');
@@ -2586,6 +2839,9 @@ applyTrajectoryUiState();
 }
 start.addEventListener('click', startRun);
 stop.addEventListener('click', stopRun);
+historyButton.addEventListener('click', () => {
+  window.location.href = '/history';
+});
 fileListEl.addEventListener('click', (event) => {
   const button = event.target.closest('[data-file-view]');
   if(!button) return;
