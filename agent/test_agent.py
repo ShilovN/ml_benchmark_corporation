@@ -617,6 +617,20 @@ class ExecutorTest(unittest.TestCase):
         self.assertEqual(file_result["result"]["returncode"], 0)
         self.assertIn("from file", file_result["result"]["stdout"])
 
+    @patch("agent.executor.subprocess.run")
+    def test_run_python_uses_configured_code_timeout(self, run_mock: Mock) -> None:
+        run_mock.return_value = Mock(returncode=0, stdout="ok", stderr="")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            executor = CommandExecutor(
+                AgentContext(workspace=Path(tmp_dir), time_limit_seconds=123)
+            )
+
+            result = executor.execute_text('run_python("print(1)")')
+
+        self.assertEqual(result["status"], "ok")
+        timeout = run_mock.call_args.kwargs["timeout"]
+        self.assertEqual(timeout, 123)
+
     def test_step_budget_exceeded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             executor = CommandExecutor(AgentContext(workspace=Path(tmp_dir), max_steps=1))
