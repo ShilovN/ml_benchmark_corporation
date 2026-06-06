@@ -88,8 +88,9 @@ load_dataset("train.csv")
 
         self.assertEqual(extract_command_text(text), 'read_file("checker/README.md")')
 
-    def test_extract_command_after_short_thought(self) -> None:
-        text = """Мысль: Посмотрю, какие файлы есть в проекте.
+    def test_extract_command_after_stage_and_short_comment(self) -> None:
+        text = """EDA
+Посмотрю, какие файлы есть в проекте.
 list_files(".")"""
 
         command = parse_model_response(text)
@@ -792,9 +793,16 @@ submit("submission.csv")'''
 
     def test_mode_instruction_mentions_current_mode(self) -> None:
         fixed_state = self._state("fixed-transitions")
+        flexible_state = self._state("flexible")
         repeated_state = self._state("repeated")
 
-        self.assertIn("текущий обязательный этап EDA", apply_mode_instruction(fixed_state, "base"))
+        fixed_prompt = apply_mode_instruction(fixed_state, "base")
+        flexible_prompt = apply_mode_instruction(flexible_state, "base")
+
+        self.assertIn("текущий обязательный этап EDA", fixed_prompt)
+        self.assertIn("Первая строка ответа должна быть `EDA`", fixed_prompt)
+        self.assertIn("Режим flexible", flexible_prompt)
+        self.assertIn("Самостоятельно выбери актуальный этап", flexible_prompt)
         self.assertIn(f"попытка 1/{REPEATED_MAX_ATTEMPTS}", apply_mode_instruction(repeated_state, "base"))
 
     def test_repeated_prompt_requires_current_attempt_submit(self) -> None:
