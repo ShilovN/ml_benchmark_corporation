@@ -6,6 +6,7 @@ import csv
 import json
 import os
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -20,9 +21,122 @@ from .parser import ParsedCommand, parse_command, parse_model_response
 
 MAX_RESULT_CHARS = 8000
 MAX_FILE_READ_CHARS = 20000
+MAX_SUBMISSION_SOURCE_CHARS = 20000
 DEFAULT_MAX_STEPS = 100
-DEFAULT_TIME_LIMIT_SECONDS = 3600
+DEFAULT_TIME_LIMIT_SECONDS = 300
 DEFAULT_HISTORY_FILENAME = "agent_history.txt"
+PYTHON_GUARD_DIR = Path(tempfile.gettempdir()) / "ml_benchmark_python_guard"
+PYTHON_GUARD_CODE = r'''
+"""Runtime guard for agent run_python commands."""
+
+from __future__ import annotations
+
+import builtins
+import os
+from pathlib import Path
+
+
+WORKSPACE = Path(os.environ["AGENT_WORKSPACE"]).resolve()
+PROJECT_ROOT = Path(os.environ.get("AGENT_PROJECT_ROOT") or WORKSPACE.parent).resolve()
+
+
+def _resolve_candidate(value):
+    if isinstance(value, int):
+        return None
+    try:
+        path = Path(value)
+    except TypeError:
+        return None
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    try:
+        return path.resolve()
+    except Exception:
+        return path.absolute()
+
+
+def _is_inside(path, root):
+    return path == root or root in path.parents
+
+
+def _check_path(value):
+    path = _resolve_candidate(value)
+    if path is None:
+        return
+    if _is_inside(path, PROJECT_ROOT) and not _is_inside(path, WORKSPACE):
+        raise PermissionError(
+            f"Access outside isolated workspace is blocked: {path}"
+        )
+
+
+_original_open = builtins.open
+
+
+def guarded_open(file, *args, **kwargs):
+    _check_path(file)
+    return _original_open(file, *args, **kwargs)
+
+
+builtins.open = guarded_open
+
+
+def _wrap_os_path_function(name):
+    original = getattr(os, name, None)
+    if original is None:
+        return
+
+    def wrapper(path, *args, **kwargs):
+        _check_path(path)
+        return original(path, *args, **kwargs)
+
+    setattr(os, name, wrapper)
+
+
+for _name in (
+    "access",
+    "chmod",
+    "chown",
+    "lchown",
+    "listdir",
+    "lstat",
+    "mkdir",
+    "makedirs",
+    "remove",
+    "rmdir",
+    "scandir",
+    "stat",
+    "unlink",
+):
+    _wrap_os_path_function(_name)
+
+
+_original_os_open = os.open
+
+
+def guarded_os_open(path, *args, **kwargs):
+    _check_path(path)
+    return _original_os_open(path, *args, **kwargs)
+
+
+os.open = guarded_os_open
+
+
+def _wrap_os_two_path_function(name):
+    original = getattr(os, name, None)
+    if original is None:
+        return
+
+    def wrapper(src, dst, *args, **kwargs):
+        _check_path(src)
+        _check_path(dst)
+        return original(src, dst, *args, **kwargs)
+
+    setattr(os, name, wrapper)
+
+
+for _name in ("link", "rename", "replace", "symlink"):
+    _wrap_os_two_path_function(_name)
+'''
 
 
 @dataclass
@@ -35,6 +149,7 @@ class DatasetState:
 @dataclass
 class AgentContext:
     workspace: Path
+    project_root: Path | None = None
     task_id: str = "salary_prediction"
     tasks_dir: Path = Path("checker/tasks")
     max_steps: int = DEFAULT_MAX_STEPS
@@ -181,12 +296,14 @@ class CommandExecutor:
         else:
             command = self._python_code_command(code_or_file)
 
+        timeout = max(1, int(self.context.time_limit_seconds))
+        process_timeout = timeout + 5 if self.context.docker_container else timeout
         completed = subprocess.run(
             command,
             cwd=self.context.workspace,
             text=True,
             capture_output=True,
-            timeout=20,
+            timeout=process_timeout,
             env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
         )
         return {
@@ -204,6 +321,8 @@ class CommandExecutor:
                 "-w",
                 "/workspace",
                 self.context.docker_container,
+                "timeout",
+                str(max(1, int(self.context.time_limit_seconds))),
                 "python3",
                 str(Path("/workspace") / relative_path),
             ]
@@ -217,11 +336,28 @@ class CommandExecutor:
                 "-w",
                 "/workspace",
                 self.context.docker_container,
+                "timeout",
+                str(max(1, int(self.context.time_limit_seconds))),
                 "python3",
                 "-c",
                 code,
             ]
         return ["python3", "-c", code]
+
+    def _python_env(self) -> dict[str, str]:
+        guard_dir = ensure_python_guard_dir()
+        existing_pythonpath = os.environ.get("PYTHONPATH")
+        pythonpath = str(guard_dir)
+        if existing_pythonpath:
+            pythonpath = pythonpath + os.pathsep + existing_pythonpath
+        project_root = self.context.project_root or self.context.workspace.parent
+        return {
+            **os.environ,
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPATH": pythonpath,
+            "AGENT_WORKSPACE": str(self.context.workspace.resolve()),
+            "AGENT_PROJECT_ROOT": str(project_root.resolve()),
+        }
 
     def _get_budget_status(self, args: dict[str, Any]) -> dict[str, int]:
         _ensure_no_args(args)
@@ -231,13 +367,12 @@ class CommandExecutor:
             "remaining_steps": max(0, self.context.max_steps - self.context.used_steps),
         }
 
-    def _get_remaining_time(self, args: dict[str, Any]) -> dict[str, float]:
+    def _get_remaining_time(self, args: dict[str, Any]) -> dict[str, int | None]:
         _ensure_no_args(args)
-        elapsed = time.monotonic() - self.context.start_time
         return {
             "time_limit_seconds": self.context.time_limit_seconds,
-            "elapsed_seconds": round(elapsed, 3),
-            "remaining_seconds": round(max(0.0, self.context.time_limit_seconds - elapsed), 3),
+            "code_time_limit_seconds": self.context.time_limit_seconds,
+            "remaining_seconds": None,
         }
 
     def _get_trajectory(self, args: dict[str, Any]) -> list[dict[str, Any]]:
@@ -252,7 +387,7 @@ class CommandExecutor:
         submission_path = self._resolve_path(_required_str(args, "file"))
         task_config = self._load_task_config(self.context.task_id)
         answer_path = task_config["task_dir"] / task_config["answer_file"]
-        return compute_metric_details(
+        result = compute_metric_details(
             answer_path,
             submission_path,
             task_config["metric"],
@@ -261,6 +396,10 @@ class CommandExecutor:
             pred_column=task_config.get("pred_column"),
             id_column=task_config.get("id_column"),
         )
+        source = self._submission_source(submission_path)
+        if source:
+            result["submission_source"] = source
+        return result
 
     def _load_task_config(self, task_id: str) -> dict[str, Any]:
         tasks_dir = self.context.tasks_dir.resolve()
@@ -323,6 +462,83 @@ class CommandExecutor:
             tasks_dir=self.context.tasks_dir,
         ).build_feedback()
 
+    def _submission_source(self, submission_path: Path) -> dict[str, Any] | None:
+        submission_name = submission_path.name
+        for record in reversed(self.context.trajectory):
+            if record.get("status") != "ok":
+                continue
+            command = str(record.get("command") or "")
+            args = record.get("args")
+            if not isinstance(args, dict):
+                continue
+
+            if command == "run_python":
+                source = self._run_python_source(args, submission_name)
+                if source:
+                    return source
+
+            if command in {"write_file", "edit_file"}:
+                source = self._python_file_source(args, submission_name, command)
+                if source:
+                    return source
+        return None
+
+    def _run_python_source(self, args: dict[str, Any], submission_name: str) -> dict[str, Any] | None:
+        code_or_file = args.get("code_or_file")
+        if not isinstance(code_or_file, str):
+            return None
+
+        candidate = self._maybe_workspace_path(code_or_file)
+        if candidate and candidate.exists() and candidate.is_file():
+            content = self._read_submission_source_file(candidate)
+            if content and _looks_like_submission_code(content, submission_name):
+                return {
+                    "kind": "python_file",
+                    "path": self._display_path(candidate),
+                    "content": content,
+                    "truncated": len(content) >= MAX_SUBMISSION_SOURCE_CHARS,
+                }
+            return None
+
+        if _looks_like_submission_code(code_or_file, submission_name):
+            truncated = len(code_or_file) > MAX_SUBMISSION_SOURCE_CHARS
+            return {
+                "kind": "python_inline",
+                "path": None,
+                "content": code_or_file[:MAX_SUBMISSION_SOURCE_CHARS],
+                "truncated": truncated,
+            }
+        return None
+
+    def _python_file_source(
+        self,
+        args: dict[str, Any],
+        submission_name: str,
+        command: str,
+    ) -> dict[str, Any] | None:
+        path_value = args.get("path")
+        if not isinstance(path_value, str):
+            return None
+        path = self._maybe_workspace_path(path_value)
+        if not path or path.suffix.lower() != ".py" or not path.exists():
+            return None
+        content = self._read_submission_source_file(path)
+        if not content or not _looks_like_submission_code(content, submission_name):
+            return None
+        return {
+            "kind": command,
+            "path": self._display_path(path),
+            "content": content,
+            "truncated": len(content) >= MAX_SUBMISSION_SOURCE_CHARS,
+        }
+
+    def _read_submission_source_file(self, path: Path) -> str:
+        try:
+            content = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return ""
+        return content[:MAX_SUBMISSION_SOURCE_CHARS]
+
     def _error(self, command: ParsedCommand, error: str, started_at: float) -> dict[str, Any]:
         return {
             "status": "error",
@@ -333,6 +549,14 @@ class CommandExecutor:
 
     def _elapsed_ms(self, started_at: float) -> float:
         return round((time.perf_counter() - started_at) * 1000, 3)
+
+
+def ensure_python_guard_dir() -> Path:
+    PYTHON_GUARD_DIR.mkdir(parents=True, exist_ok=True)
+    guard_path = PYTHON_GUARD_DIR / "sitecustomize.py"
+    if not guard_path.exists() or guard_path.read_text(encoding="utf-8") != PYTHON_GUARD_CODE:
+        guard_path.write_text(PYTHON_GUARD_CODE, encoding="utf-8")
+    return PYTHON_GUARD_DIR
 
 
 def _required_str(args: dict[str, Any], name: str) -> str:
@@ -371,6 +595,20 @@ def _parse_edit_diff(diff: Any) -> tuple[str, str]:
     if not isinstance(old, str) or not isinstance(new, str):
         raise ValueError('edit_file diff must contain string fields "old" and "new"')
     return old, new
+
+
+def _looks_like_submission_code(code: str, submission_name: str) -> bool:
+    lowered = code.lower()
+    has_submission_file = submission_name.lower() in lowered or "submission.csv" in lowered
+    has_csv_writer = any(
+        marker in lowered
+        for marker in {
+            "to_csv(",
+            "csv.writer",
+            "writerow(",
+        }
+    )
+    return has_submission_file and has_csv_writer
 
 
 def _trajectory_record(command: ParsedCommand, result: dict[str, Any]) -> dict[str, Any]:

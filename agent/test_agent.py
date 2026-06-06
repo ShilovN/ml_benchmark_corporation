@@ -22,15 +22,27 @@ from main import (
     response_max_tokens,
 )
 from web_server import (
+    AgentRunManager,
     REPEATED_MAX_ATTEMPTS,
     RunConfig,
     RunState,
     apply_mode_after_results,
     apply_mode_instruction,
+    best_repeated_submission,
     current_fixed_stage,
+    extract_commands,
     extract_reported_stage,
+    handle_successful_submit,
+    list_workspace_files,
+    prepare_run_workspace,
+    record_fixed_stage_attempt,
+    repeated_attempt_workspace_id,
+    resolve_workspace_file,
+    should_isolate_llm_history,
     validate_mode_command,
+    validate_mode_command_batch,
     validate_reported_stage,
+    workspace_file_preview,
 )
 
 
@@ -145,8 +157,10 @@ class ExecutorTest(unittest.TestCase):
             {"status": "ok", "command": "read_file", "result": {"content": "hello"}},
         ]
         feedback = {"hints": [{"stage": "EDA", "message": "hint"}]}
+        stats = BenchmarkStats()
+        stats.requests = 2
 
-        prompt = build_followup_prompt(command_results, BenchmarkStats(), args, feedback)
+        prompt = build_followup_prompt(command_results, stats, args, feedback)
 
         self.assertIn("Результаты команд:", prompt)
         self.assertIn("1. write_file: ok", prompt)
@@ -155,6 +169,19 @@ class ExecutorTest(unittest.TestCase):
         self.assertIn("- EDA: hint", prompt)
         self.assertNotIn('"command_results"', prompt)
         self.assertNotIn('"feedback"', prompt)
+
+    def test_followup_prompt_skips_feedback_in_first_message(self) -> None:
+        args = argparse.Namespace(token_limit=None, max_steps=100, time_limit_seconds=3600)
+        command_results = [{"status": "ok", "command": "read_file", "result": {"content": "hello"}}]
+        feedback = {"hints": [{"stage": "EDA", "message": "hint"}]}
+        stats = BenchmarkStats()
+        stats.requests = 1
+
+        prompt = build_followup_prompt(command_results, stats, args, feedback)
+
+        self.assertIn("1. read_file: ok", prompt)
+        self.assertNotIn("Подсказки:", prompt)
+        self.assertNotIn("- EDA: hint", prompt)
 
     def test_followup_prompt_contains_remaining_budget(self) -> None:
         args = argparse.Namespace(token_limit=1000, max_steps=10, time_limit_seconds=3600)
@@ -334,10 +361,79 @@ class ExecutorTest(unittest.TestCase):
             result = executor.execute_text("get_hints()")
 
         messages = [hint["message"] for hint in result["result"]["hints"]]
-        self.assertTrue(any("пропус" in message for message in messages))
         self.assertTrue(any("повтор" in message for message in messages))
-        self.assertTrue(any("модель" in message for message in messages))
-        self.assertTrue(any("отправ" in message for message in messages))
+        self.assertFalse(any("пропус" in message for message in messages))
+        self.assertFalse(any("распределение целевой" in message for message in messages))
+        self.assertEqual({hint["stage"] for hint in result["result"]["hints"]}, {"EDA"})
+
+    def test_get_hints_returns_only_first_incomplete_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            task_dir = workspace / "checker" / "tasks" / "toy"
+            task_dir.mkdir(parents=True)
+            (task_dir / "task.json").write_text(
+                json.dumps(
+                    {
+                        "id": "toy",
+                        "metric": "mae",
+                        "answer_file": "answers.csv",
+                        "column": "salary",
+                        "public_files": ["train.csv", "test.csv"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (task_dir / "train.csv").write_text(
+                "id,feature,salary\n1,10,100\n2,10,120\n",
+                encoding="utf-8",
+            )
+            (task_dir / "test.csv").write_text("id,feature,salary\n3,12,130\n", encoding="utf-8")
+            engine = HintEngine(workspace=workspace, task_id="toy", tasks_dir=Path("checker/tasks"))
+
+            feedback = engine.build_feedback()
+
+        self.assertEqual({hint["stage"] for hint in feedback["hints"]}, {"EDA"})
+        self.assertTrue(any("целевая переменная" in hint["message"] for hint in feedback["hints"]))
+
+    def test_get_hints_falls_through_to_next_stage_when_previous_is_clear(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            task_dir = workspace / "checker" / "tasks" / "toy"
+            task_dir.mkdir(parents=True)
+            (task_dir / "task.json").write_text(
+                json.dumps(
+                    {
+                        "id": "toy",
+                        "metric": "mae",
+                        "answer_file": "answers.csv",
+                        "column": "salary",
+                        "public_files": ["train.csv", "test.csv"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (task_dir / "train.csv").write_text(
+                "id,feature_a,feature_b,salary\n1,10,10,100\n2,20,20,120\n",
+                encoding="utf-8",
+            )
+            (task_dir / "test.csv").write_text("id,feature_a,feature_b\n3,12,12\n", encoding="utf-8")
+            (workspace / "agent_history.txt").write_text(
+                "\n".join(
+                    [
+                        json.dumps({"command": "read_file", "args": {"path": "train.csv"}, "status": "ok"}),
+                        json.dumps({"command": "read_file", "args": {"path": "test.csv"}, "status": "ok"}),
+                        json.dumps({"command": "show_dataset_info", "args": {}, "status": "ok"}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            engine = HintEngine(workspace=workspace, task_id="toy", tasks_dir=Path("checker/tasks"))
+
+            feedback = engine.build_feedback()
+
+        self.assertEqual({hint["stage"] for hint in feedback["hints"]}, {"Feature engineering"})
+        self.assertTrue(any("дублирующих" in hint["message"] for hint in feedback["hints"]))
 
     def test_get_trajectory_reads_history_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -428,6 +524,80 @@ class ExecutorTest(unittest.TestCase):
         self.assertEqual(result["result"]["metric"], "mae")
         self.assertEqual(result["result"]["value"], 0.0)
 
+    def test_submit_includes_submission_source_code(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            tasks_dir = workspace / "checker" / "tasks" / "toy"
+            tasks_dir.mkdir(parents=True)
+            (tasks_dir / "task.json").write_text(
+                json.dumps(
+                    {
+                        "id": "toy",
+                        "metric": "mae",
+                        "answer_file": "answers.csv",
+                        "id_column": "id",
+                        "column": "target",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (tasks_dir / "answers.csv").write_text("id,target\n1,10\n2,20\n", encoding="utf-8")
+            executor = CommandExecutor(
+                AgentContext(workspace=workspace, task_id="toy", tasks_dir=workspace / "checker" / "tasks")
+            )
+            code = (
+                "import csv\n"
+                "with open('submission.csv', 'w', newline='') as file:\n"
+                "    writer = csv.writer(file)\n"
+                "    writer.writerow(['id', 'target'])\n"
+                "    writer.writerow([1, 10])\n"
+                "    writer.writerow([2, 20])\n"
+            )
+
+            write_result = executor.execute_text(f'write_file("solution.py", {code!r})')
+            run_result = executor.execute_text('run_python("solution.py")')
+            submit_result = executor.execute_text('submit("submission.csv")')
+
+        source = submit_result["result"]["submission_source"]
+        self.assertEqual(write_result["status"], "ok")
+        self.assertEqual(run_result["status"], "ok")
+        self.assertEqual(submit_result["status"], "ok")
+        self.assertEqual(source["path"], "solution.py")
+        self.assertEqual(source["kind"], "python_file")
+        self.assertIn("csv.writer", source["content"])
+        self.assertIn("submission.csv", source["content"])
+
+    def test_submit_source_requires_submission_file_and_csv_writer_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            tasks_dir = workspace / "checker" / "tasks" / "toy"
+            tasks_dir.mkdir(parents=True)
+            (tasks_dir / "task.json").write_text(
+                json.dumps(
+                    {
+                        "id": "toy",
+                        "metric": "mae",
+                        "answer_file": "answers.csv",
+                        "id_column": "id",
+                        "column": "target",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (tasks_dir / "answers.csv").write_text("id,target\n1,10\n2,20\n", encoding="utf-8")
+            executor = CommandExecutor(
+                AgentContext(workspace=workspace, task_id="toy", tasks_dir=workspace / "checker" / "tasks")
+            )
+            unrelated_code = "print('submission.csv exists elsewhere')\n"
+
+            executor.execute_text(f'write_file("notes.py", {unrelated_code!r})')
+            executor.execute_text('run_python("notes.py")')
+            (workspace / "submission.csv").write_text("id,target\n1,10\n2,20\n", encoding="utf-8")
+            submit_result = executor.execute_text('submit("submission.csv")')
+
+        self.assertEqual(submit_result["status"], "ok")
+        self.assertNotIn("submission_source", submit_result["result"])
+
     def test_edit_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             workspace = Path(tmp_dir)
@@ -455,6 +625,20 @@ class ExecutorTest(unittest.TestCase):
         self.assertIn("5", inline_result["result"]["stdout"])
         self.assertEqual(file_result["result"]["returncode"], 0)
         self.assertIn("from file", file_result["result"]["stdout"])
+
+    @patch("agent.executor.subprocess.run")
+    def test_run_python_uses_configured_code_timeout(self, run_mock: Mock) -> None:
+        run_mock.return_value = Mock(returncode=0, stdout="ok", stderr="")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            executor = CommandExecutor(
+                AgentContext(workspace=Path(tmp_dir), time_limit_seconds=123)
+            )
+
+            result = executor.execute_text('run_python("print(1)")')
+
+        self.assertEqual(result["status"], "ok")
+        timeout = run_mock.call_args.kwargs["timeout"]
+        self.assertEqual(timeout, 123)
 
     def test_step_budget_exceeded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -490,16 +674,62 @@ class WebServerModeTest(unittest.TestCase):
         self.assertIn("not allowed during EDA", error["error"])
         self.assertIsNone(allowed)
 
+    def test_extract_commands_accepts_single_shot_fenced_batch(self) -> None:
+        text = '''Мысль: делаю решение
+```command
+run_python("""
+print("create submission")
+""")
+submit("submission.csv")
+```'''
+
+        commands = extract_commands(text)
+
+        self.assertEqual([command.name for command in commands], ["run_python", "submit"])
+        self.assertIn("create submission", commands[0].args["code_or_file"])
+
+    def test_extract_commands_ignores_inline_command_mentions(self) -> None:
+        text = 'Мысль: подготовлю решение и потом вызову submit("submission.csv").'
+
+        with self.assertRaisesRegex(ValueError, "No executable command"):
+            extract_commands(text)
+
+    def test_extract_commands_accepts_command_on_own_line(self) -> None:
+        text = '''Мысль: отправляю готовый файл
+submit("submission.csv")'''
+
+        commands = extract_commands(text)
+
+        self.assertEqual([command.name for command in commands], ["submit"])
+
+    def test_single_shot_submit_only_is_not_batch_error(self) -> None:
+        state = self._state("single-shot")
+
+        error = validate_mode_command_batch(state, [parse_command('submit("submission.csv")')])
+
+        self.assertIsNone(error)
+
     def test_fixed_transitions_advances_stages_and_finishes_after_train(self) -> None:
         state = self._state("fixed-transitions")
 
         self.assertEqual(current_fixed_stage(state), "EDA")
+        for _ in range(2):
+            record_fixed_stage_attempt(state)
+            self.assertIsNone(apply_mode_after_results(state, [{"status": "ok", "command": "read_file"}]))
+            self.assertEqual(current_fixed_stage(state), "EDA")
+        record_fixed_stage_attempt(state)
         self.assertIsNone(apply_mode_after_results(state, [{"status": "ok", "command": "read_file"}]))
         self.assertEqual(current_fixed_stage(state), "FEATURES")
         self.assertIsNone(apply_mode_after_results(state, [{"status": "error", "command": "write_file"}]))
         self.assertEqual(current_fixed_stage(state), "FEATURES")
+        for _ in range(4):
+            record_fixed_stage_attempt(state)
+            self.assertIsNone(apply_mode_after_results(state, [{"status": "ok", "command": "write_file"}]))
+            self.assertEqual(current_fixed_stage(state), "FEATURES")
+        record_fixed_stage_attempt(state)
         self.assertIsNone(apply_mode_after_results(state, [{"status": "ok", "command": "write_file"}]))
         self.assertEqual(current_fixed_stage(state), "TRAIN")
+        record_fixed_stage_attempt(state)
         self.assertEqual(
             apply_mode_after_results(state, [{"status": "ok", "command": "run_python"}]),
             "fixed_transitions_finished",
@@ -513,6 +743,55 @@ class WebServerModeTest(unittest.TestCase):
             apply_mode_after_results(state, [{"status": "ok", "command": "read_file"}]),
             "repeated_attempt_limit",
         )
+
+    def test_repeated_requires_submit_on_every_attempt(self) -> None:
+        state = self._state("repeated")
+        state.requests = 1
+
+        error = validate_mode_command_batch(state, [parse_command('run_python("print(1)")')])
+
+        self.assertIsNotNone(error)
+        self.assertEqual(error["reason"], "repeated_missing_submit")
+
+    def test_repeated_rejects_submit_only(self) -> None:
+        state = self._state("repeated")
+
+        error = validate_mode_command_batch(state, [parse_command('submit("submission.csv")')])
+
+        self.assertIsNotNone(error)
+        self.assertEqual(error["reason"], "repeated_submit_without_solution")
+
+    def test_repeated_accepts_solution_command_before_submit(self) -> None:
+        state = self._state("repeated")
+
+        error = validate_mode_command_batch(
+            state,
+            [parse_command('run_python("print(1)")'), parse_command('submit("submission.csv")')],
+        )
+
+        self.assertIsNone(error)
+
+    def test_repeated_submit_does_not_finish_before_attempt_limit(self) -> None:
+        state = self._state("repeated")
+        state.requests = 1
+        result = {"status": "ok", "command": "submit", "result": {"metric": "mae", "value": 10.0}}
+
+        handle_successful_submit(state, result)
+
+        self.assertFalse(state.submitted)
+        self.assertEqual(state.submission_result, result)
+
+    def test_repeated_best_submission_uses_lower_error_metric(self) -> None:
+        first = {"status": "ok", "command": "submit", "result": {"metric": "mae", "value": 10.0}}
+        second = {"status": "ok", "command": "submit", "result": {"metric": "mae", "value": 7.0}}
+
+        self.assertEqual(best_repeated_submission([first, second]), second)
+
+    def test_repeated_best_submission_uses_higher_score_metric(self) -> None:
+        first = {"status": "ok", "command": "submit", "result": {"metric": "f1_score", "value": 0.72}}
+        second = {"status": "ok", "command": "submit", "result": {"metric": "f1_score", "value": 0.81}}
+
+        self.assertEqual(best_repeated_submission([first, second]), second)
 
     def test_mode_instruction_does_not_reveal_fixed_stage(self) -> None:
         fixed_state = self._state("fixed-transitions")
@@ -553,6 +832,99 @@ class WebServerModeTest(unittest.TestCase):
 
         self.assertIsNotNone(error)
         self.assertIn("Первая непустая строка", error["error"])
+    def test_repeated_prompt_requires_current_attempt_submit(self) -> None:
+        state = self._state("repeated")
+        state.requests = 1
+
+        prompt = apply_mode_instruction(state, "base")
+
+        self.assertIn("Ответ только с `Мысль: ...` будет отклонён", prompt)
+        self.assertIn("Обязательный формат ответа", prompt)
+        self.assertIn("run_python", prompt)
+        self.assertIn("не обещай улучшить модель позже", prompt)
+        self.assertIn("Submit-only будет отклонён", prompt)
+        self.assertIn("submit(\"submission.csv\")", prompt)
+        self.assertNotIn("сможешь в следующей попытке", prompt)
+
+    def test_repeated_mode_isolates_llm_history_between_attempts(self) -> None:
+        self.assertTrue(should_isolate_llm_history(self._state("repeated")))
+        self.assertFalse(should_isolate_llm_history(self._state("flexible")))
+
+    def test_repeated_attempts_use_clean_workspaces(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_root = Path(tmp_dir)
+            task_dir = project_root / "tasks" / "toy"
+            task_dir.mkdir(parents=True)
+            (task_dir / "task.json").write_text(
+                json.dumps(
+                    {
+                        "id": "toy",
+                        "metric": "mae",
+                        "column": "target",
+                        "public_files": ["train.csv", "test.csv"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (task_dir / "train.csv").write_text("id,x,target\n1,10,100\n", encoding="utf-8")
+            (task_dir / "test.csv").write_text("id,x\n2,20\n", encoding="utf-8")
+            manager = AgentRunManager(project_root, Path("tasks"), Path("runs"), use_docker=False)
+            config = RunConfig(task_id="toy", mode="repeated")
+            first_workspace = prepare_run_workspace(
+                project_root,
+                manager.tasks_dir,
+                manager.run_root,
+                "toy",
+                repeated_attempt_workspace_id("run", 1),
+            )
+            (first_workspace / "solution.py").write_text("old attempt", encoding="utf-8")
+            executor, docker_container, created_container = manager._make_executor(
+                config, first_workspace, repeated_attempt_workspace_id("run", 1)
+            )
+            state = RunState(
+                run_id="run",
+                config=config,
+                workspace=first_workspace,
+                executor=executor,
+                docker_container=docker_container,
+                created_container=created_container,
+            )
+            state.requests = 1
+
+            manager._prepare_next_repeated_attempt(state)
+
+            self.assertTrue(state.workspace.name.endswith("attempt-2"))
+            self.assertTrue((state.workspace / "train.csv").exists())
+            self.assertFalse((state.workspace / "solution.py").exists())
+
+
+class WebServerFileBrowserTest(unittest.TestCase):
+    def test_workspace_file_listing_and_preview(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            (workspace / "solution.py").write_text("print('ok')\n", encoding="utf-8")
+            (workspace / "model.bin").write_bytes(b"\x00\x01")
+
+            files = list_workspace_files(workspace)
+            preview = workspace_file_preview(workspace, "solution.py")
+
+        by_path = {item["path"]: item for item in files}
+        self.assertTrue(by_path["solution.py"]["previewable"])
+        self.assertFalse(by_path["model.bin"]["previewable"])
+        self.assertEqual(preview["path"], "solution.py")
+        self.assertEqual(preview["content"], "print('ok')\n")
+
+    def test_workspace_file_resolution_rejects_paths_outside_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            (workspace / "inside.txt").write_text("ok", encoding="utf-8")
+
+            resolved = resolve_workspace_file(workspace, "inside.txt")
+
+            with self.assertRaisesRegex(ValueError, "outside workspace"):
+                resolve_workspace_file(workspace, "../outside.txt")
+
+        self.assertEqual(resolved.name, "inside.txt")
 
 
 class HintEngineTest(unittest.TestCase):
@@ -589,14 +961,111 @@ class HintEngineTest(unittest.TestCase):
                 "id,x,target\n1,10,100\n2,20,200\n3,30,300\n",
                 encoding="utf-8",
             )
+            (workspace / "test.csv").write_text("id,x\n4,40\n", encoding="utf-8")
             (workspace / "leaky.csv").write_text("id,target\n1,100\n", encoding="utf-8")
             (workspace / "metrics.json").write_text('{"mae": 0.1}', encoding="utf-8")
+            (workspace / "agent_history.txt").write_text(
+                "\n".join(
+                    [
+                        json.dumps({"command": "read_file", "args": {"path": "train.csv"}, "status": "ok"}),
+                        json.dumps({"command": "read_file", "args": {"path": "test.csv"}, "status": "ok"}),
+                        json.dumps({"command": "show_dataset_info", "args": {}, "status": "ok"}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
 
             feedback = HintEngine(workspace, "toy", workspace / "tasks").build_feedback()
 
         messages = [hint["message"] for hint in feedback["hints"]]
         self.assertTrue(any("утеч" in message for message in messages))
         self.assertFalse(any("валидац" in message for message in messages))
+
+    def test_build_feedback_requires_dataset_inspection_before_feature_work(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            task_dir = workspace / "tasks" / "toy"
+            task_dir.mkdir(parents=True)
+            (task_dir / "task.json").write_text(
+                json.dumps({"id": "toy", "metric": "mae", "column": "target"}),
+                encoding="utf-8",
+            )
+            (workspace / "train.csv").write_text("id,city,target\n1,msk,10\n2,spb,20\n", encoding="utf-8")
+            (workspace / "test.csv").write_text("id,city\n3,kzn\n", encoding="utf-8")
+
+            feedback = HintEngine(workspace, "toy", workspace / "tasks").build_feedback()
+
+        self.assertEqual({hint["stage"] for hint in feedback["hints"]}, {"EDA"})
+        self.assertTrue(any("сводк" in hint["message"] for hint in feedback["hints"]))
+
+    def test_build_feedback_detects_shared_preprocessing_issue_after_eda(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            task_dir = workspace / "tasks" / "toy"
+            task_dir.mkdir(parents=True)
+            (task_dir / "task.json").write_text(
+                json.dumps({"id": "toy", "metric": "mae", "column": "target"}),
+                encoding="utf-8",
+            )
+            (workspace / "train.csv").write_text(
+                "sample_id,city,target\n1,msk,10\n2,spb,20\n3,kzn,30\n",
+                encoding="utf-8",
+            )
+            (workspace / "test.csv").write_text("sample_id,city\n4,ekb\n", encoding="utf-8")
+            (workspace / "agent_history.txt").write_text(
+                "\n".join(
+                    [
+                        json.dumps({"command": "read_file", "args": {"path": "train.csv"}, "status": "ok"}),
+                        json.dumps({"command": "read_file", "args": {"path": "test.csv"}, "status": "ok"}),
+                        json.dumps({"command": "show_dataset_info", "args": {}, "status": "ok"}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            feedback = HintEngine(workspace, "toy", workspace / "tasks").build_feedback()
+
+        self.assertEqual({hint["stage"] for hint in feedback["hints"]}, {"Feature engineering"})
+        self.assertTrue(any("предобработка" in hint["message"] for hint in feedback["hints"]))
+
+    def test_build_feedback_adds_next_stage_after_three_repeats(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            task_dir = workspace / "tasks" / "toy"
+            task_dir.mkdir(parents=True)
+            (task_dir / "task.json").write_text(
+                json.dumps({"id": "toy", "metric": "mae", "column": "target"}),
+                encoding="utf-8",
+            )
+            (workspace / "train.csv").write_text(
+                "id,feature,target\n1,foo,100\n1,foo,100\n2,bar,200\n",
+                encoding="utf-8",
+            )
+            (workspace / "test.csv").write_text("id,feature\n3,baz\n", encoding="utf-8")
+            (workspace / "agent_history.txt").write_text(
+                "\n".join(
+                    [
+                        json.dumps({"command": "read_file", "args": {"path": "train.csv"}, "status": "ok"}),
+                        json.dumps({"command": "read_file", "args": {"path": "test.csv"}, "status": "ok"}),
+                        json.dumps({"command": "show_dataset_info", "args": {}, "status": "ok"}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            engine = HintEngine(workspace, "toy", workspace / "tasks")
+
+            first = engine.build_feedback()
+            second = engine.build_feedback()
+            third = engine.build_feedback()
+
+        self.assertEqual({hint["stage"] for hint in first["hints"]}, {"EDA"})
+        self.assertEqual({hint["stage"] for hint in second["hints"]}, {"EDA"})
+        self.assertEqual({hint["stage"] for hint in third["hints"]}, {"EDA", "Feature engineering"})
+        self.assertTrue(any("повторяющихся" in hint["message"] for hint in third["hints"]))
+        self.assertTrue(any("утечки" in hint["message"] or "дублирующих" in hint["message"] for hint in third["hints"]))
 
 
 class LlmClientTest(unittest.TestCase):
