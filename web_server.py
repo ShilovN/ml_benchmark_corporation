@@ -151,6 +151,7 @@ class RunState:
     final_submit_requested: bool = False
     fixed_stage_index: int = 0
     fixed_stage_attempts: dict[str, int] = field(default_factory=dict)
+    fixed_stage_violations: list[dict[str, Any]] = field(default_factory=list)
     docker_container: str | None = None
     created_container: bool = False
 
@@ -359,6 +360,11 @@ class AgentRunManager:
                     history.append({"role": "user", "content": user_message})
                     history.append({"role": "assistant", "content": assistant_text})
 
+                stage_violation = detect_fixed_stage_violation(state, assistant_text)
+                if stage_violation:
+                    state.fixed_stage_violations.append(stage_violation)
+                    add_event(state, "validation", "Fixed-transition stage violation", stage_violation)
+
                 try:
                     commands = extract_commands(assistant_text)
                 except ValueError as exc:
@@ -405,6 +411,8 @@ class AgentRunManager:
                         result = validation_error
                     else:
                         result = state.executor.execute(command)
+                    if command.name == "submit" and result["status"] == "ok":
+                        result = zero_fixed_transition_result_if_needed(state, result)
                     results.append(result)
                     add_event(state, "result", f"{command.name}: {result['status']}", result)
                     if command.name == "submit" and result["status"] == "ok":
@@ -966,6 +974,83 @@ def current_fixed_stage_attempt(state: RunState) -> int:
 def record_fixed_stage_attempt(state: RunState) -> None:
     stage = current_fixed_stage(state)
     state.fixed_stage_attempts[stage] = current_fixed_stage_attempt(state) + 1
+
+
+def detect_fixed_stage_violation(state: RunState, response_text: str) -> dict[str, Any] | None:
+    if state.config.mode != "fixed-transitions":
+        return None
+    declared_stage = declared_fixed_stage(response_text)
+    expected_stage = current_fixed_stage(state)
+    if declared_stage is None or declared_stage == expected_stage:
+        return None
+    return {
+        "reason": "fixed_stage_early_transition",
+        "error": (
+            f"Model declared stage {declared_stage}, but fixed-transitions currently requires {expected_stage}. "
+            "Final score will be reset to 0.0."
+        ),
+        "declared_stage": declared_stage,
+        "expected_stage": expected_stage,
+        "request": state.requests,
+    }
+
+
+def zero_fixed_transition_result_if_needed(state: RunState, result: dict[str, Any]) -> dict[str, Any]:
+    if state.config.mode != "fixed-transitions" or not state.fixed_stage_violations:
+        return result
+    details = result.get("result")
+    if not isinstance(details, dict):
+        return result
+
+    zeroed = dict(result)
+    zeroed_details = dict(details)
+    raw_value = zeroed_details.get("value")
+    zeroed_details["raw_value"] = raw_value
+    zeroed_details["value"] = 0.0
+    zeroed_details["score_zeroed"] = True
+    zeroed_details["zero_reason"] = "fixed_transition_early_stage"
+    zeroed_details["stage_violations"] = state.fixed_stage_violations
+    zeroed["result"] = zeroed_details
+    add_event(
+        state,
+        "validation",
+        "Fixed-transition score zeroed",
+        {
+            "raw_value": raw_value,
+            "value": 0.0,
+            "violations": state.fixed_stage_violations,
+        },
+    )
+    return zeroed
+
+
+def declared_fixed_stage(response_text: str) -> str | None:
+    stage_area = response_text.split("```", 1)[0].lower()
+    lines = [line.strip() for line in stage_area.splitlines()[:8] if line.strip()]
+    for line in lines:
+        stage = fixed_stage_from_text(line)
+        if stage:
+            return stage
+    return None
+
+
+def fixed_stage_from_text(text: str) -> str | None:
+    normalized = text.strip().lower().rstrip(":.,;")
+    if normalized in {"eda", "эда"}:
+        return "EDA"
+    if normalized in {"features", "feature", "feature engineering", "фичи", "признаки"}:
+        return "FEATURES"
+    if normalized in {"train", "training", "обучение", "submit", "submission"}:
+        return "TRAIN"
+    if "этап" not in normalized and "stage" not in normalized and "сейчас" not in normalized:
+        return None
+    if "eda" in normalized or "анализ данных" in normalized or "развед" in normalized:
+        return "EDA"
+    if "features" in normalized or "feature engineering" in normalized or "признак" in normalized or "фич" in normalized:
+        return "FEATURES"
+    if "train" in normalized or "обуч" in normalized or "submission" in normalized or "submit" in normalized:
+        return "TRAIN"
+    return None
 
 
 def validate_mode_command(state: RunState, command: ParsedCommand) -> dict[str, Any] | None:

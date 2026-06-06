@@ -30,6 +30,7 @@ from web_server import (
     apply_mode_instruction,
     best_repeated_submission,
     current_fixed_stage,
+    detect_fixed_stage_violation,
     extract_commands,
     handle_successful_submit,
     prepare_run_workspace,
@@ -41,6 +42,7 @@ from web_server import (
     resolve_workspace_file,
     validate_mode_command,
     workspace_file_preview,
+    zero_fixed_transition_result_if_needed,
 )
 
 
@@ -805,6 +807,27 @@ submit("submission.csv")'''
         self.assertIn("Самостоятельно выбери актуальный этап", flexible_prompt)
         self.assertIn(f"попытка 1/{REPEATED_MAX_ATTEMPTS}", apply_mode_instruction(repeated_state, "base"))
 
+    def test_fixed_transition_early_stage_zeroes_submit_result(self) -> None:
+        state = self._state("fixed-transitions")
+        violation = detect_fixed_stage_violation(state, 'FEATURES\nrun_python("print(1)")')
+
+        self.assertIsNotNone(violation)
+        state.fixed_stage_violations.append(violation)
+        result = {"status": "ok", "command": "submit", "result": {"metric": "f1_score", "value": 0.71}}
+        zeroed = zero_fixed_transition_result_if_needed(state, result)
+
+        self.assertEqual(zeroed["result"]["raw_value"], 0.71)
+        self.assertEqual(zeroed["result"]["value"], 0.0)
+        self.assertTrue(zeroed["result"]["score_zeroed"])
+        self.assertEqual(zeroed["result"]["stage_violations"][0]["declared_stage"], "FEATURES")
+        self.assertEqual(zeroed["result"]["stage_violations"][0]["expected_stage"], "EDA")
+
+    def test_fixed_transition_current_stage_does_not_zero_result(self) -> None:
+        state = self._state("fixed-transitions")
+
+        self.assertIsNone(detect_fixed_stage_violation(state, 'EDA\nread_file("train.csv")'))
+        self.assertIsNone(detect_fixed_stage_violation(state, 'read_file("train.csv")'))
+
     def test_repeated_prompt_requires_current_attempt_submit(self) -> None:
         state = self._state("repeated")
         state.requests = 1
@@ -841,7 +864,7 @@ submit("submission.csv")'''
             )
             (task_dir / "train.csv").write_text("id,x,target\n1,10,100\n", encoding="utf-8")
             (task_dir / "test.csv").write_text("id,x\n2,20\n", encoding="utf-8")
-            manager = AgentRunManager(project_root, Path("tasks"), Path("runs"))
+            manager = AgentRunManager(project_root, Path("tasks"), Path("runs"), use_docker=False)
             config = RunConfig(task_id="toy", mode="repeated")
             first_workspace = prepare_run_workspace(
                 project_root,
@@ -855,7 +878,7 @@ submit("submission.csv")'''
                 run_id="run",
                 config=config,
                 workspace=first_workspace,
-                executor=manager._make_executor(config, first_workspace),
+                executor=manager._make_executor(config, first_workspace, repeated_attempt_workspace_id("run", 1))[0],
             )
             state.requests = 1
 
