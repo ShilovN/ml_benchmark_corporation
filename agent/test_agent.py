@@ -673,7 +673,7 @@ class WebServerModeTest(unittest.TestCase):
         self.assertIsNone(allowed)
 
     def test_extract_commands_accepts_single_shot_fenced_batch(self) -> None:
-        text = '''Мысль: делаю решение
+        text = '''Делаю решение
 ```command
 run_python("""
 print("create submission")
@@ -687,13 +687,13 @@ submit("submission.csv")
         self.assertIn("create submission", commands[0].args["code_or_file"])
 
     def test_extract_commands_ignores_inline_command_mentions(self) -> None:
-        text = 'Мысль: подготовлю решение и потом вызову submit("submission.csv").'
+        text = 'Подготовлю решение и потом вызову submit("submission.csv").'
 
         with self.assertRaisesRegex(ValueError, "No executable command"):
             extract_commands(text)
 
     def test_extract_commands_accepts_command_on_own_line(self) -> None:
-        text = '''Мысль: отправляю готовый файл
+        text = '''Отправляю готовый файл
 submit("submission.csv")'''
 
         commands = extract_commands(text)
@@ -811,7 +811,7 @@ submit("submission.csv")'''
 
         prompt = apply_mode_instruction(state, "base")
 
-        self.assertIn("Ответ только с `Мысль: ...` будет отклонён", prompt)
+        self.assertIn("Ответ только с коротким комментарием будет отклонён", prompt)
         self.assertIn("Обязательный формат ответа", prompt)
         self.assertIn("run_python", prompt)
         self.assertIn("не обещай улучшить модель позже", prompt)
