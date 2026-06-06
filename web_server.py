@@ -155,26 +155,31 @@ class RunState:
     docker_container: str | None = None
     created_container: bool = False
 
-    def public_dict(self) -> dict[str, Any]:
-        return {
+    def public_dict(self, *, include_events: bool = True) -> dict[str, Any]:
+        payload = {
             "run_id": self.run_id,
             "task_id": self.config.task_id,
+            "model": self.config.model,
             "created_at": self.created_at,
             "mode": self.config.mode,
             "status": self.status,
             "stop_reason": self.stop_reason,
             "requests": self.requests,
             "total_tokens": self.total_tokens,
+            "token_limit": self.config.token_limit,
             "used_steps": self.executor.context.used_steps,
             "max_steps": self.config.max_steps,
             "code_time_limit_seconds": self.config.time_limit_seconds,
             "elapsed_seconds": round(time.monotonic() - self.executor.context.start_time, 1),
             "submitted": self.submitted,
             "submission_result": self.submission_result,
+            "submission_metric": summarize_submission_metric(self.submission_result),
             "error": self.error,
             "docker_container": self.docker_container,
-            "events": self.events[-200:],
         }
+        if include_events:
+            payload["events"] = self.events
+        return payload
 
 
 class AgentRunManager:
@@ -257,6 +262,13 @@ class AgentRunManager:
     def get_run(self, run_id: str) -> RunState | None:
         with self.lock:
             return self.runs.get(run_id)
+
+    def list_runs(self) -> list[dict[str, Any]]:
+        with self.lock:
+            return [
+                run.public_dict(include_events=False)
+                for run in reversed(list(self.runs.values()))
+            ]
 
     def latest_run(self) -> RunState | None:
         with self.lock:
@@ -563,7 +575,7 @@ def make_handler(manager: AgentRunManager) -> type[BaseHTTPRequestHandler]:
 
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
-            if parsed.path == "/":
+            if parsed.path == "/" or parsed.path == "/runs" or parsed.path.startswith("/runs/"):
                 self._send_html(render_agent_page())
                 return
             if parsed.path == "/api/tasks":
@@ -587,6 +599,9 @@ def make_handler(manager: AgentRunManager) -> type[BaseHTTPRequestHandler]:
             if parsed.path == "/api/runs/latest":
                 run = manager.latest_run()
                 self._send_json({"status": "ok", "run": run.public_dict() if run else None})
+                return
+            if parsed.path == "/api/runs":
+                self._send_json({"status": "ok", "runs": manager.list_runs()})
                 return
             if parsed.path.startswith("/api/runs/"):
                 parts = parsed.path.strip("/").split("/")
@@ -871,7 +886,7 @@ def mode_instruction(state: RunState) -> str:
             "В single-shot разрешены только продуктивные команды: write_file, run_python, submit. "
             "Ответ без submit(\"submission.csv\") будет отклонен.\n"
             "Лучший формат для длинного кода:\n"
-            "Мысль: делаю полный быстрый пайплайн и отправляю решение\n"
+            "Делаю полный быстрый пайплайн и отправляю решение\n"
             "```command\n"
             "run_python(\"\"\"\n"
             "<полный python-код: читает train.csv/test.csv, обучает или строит baseline, создает submission.csv и печатает проверку формата>\n"
@@ -887,11 +902,11 @@ def mode_instruction(state: RunState) -> str:
         stage_note = (
             "Каждая repeated-попытка является полноценным single-shot решением: "
             "в текущем ответе создай или запусти решение, сформируй submission.csv и обязательно вызови submit(\"submission.csv\"). "
-            "Ответ только с `Мысль: ...` будет отклонён. Submit-only будет отклонён: система не создаёт baseline вместо тебя. "
+            "Ответ только с коротким комментарием будет отклонён. Submit-only будет отклонён: система не создаёт baseline вместо тебя. "
             "Это отдельный чистый чат и отдельный чистый workspace; у тебя нет доступа к прошлым попыткам, их файлам, ответам и результатам. "
             "Не пиши планы на будущие попытки и не обещай улучшить модель позже.\n"
             "Обязательный формат ответа:\n"
-            "Мысль: делаю полный пайплайн и отправляю решение\n"
+            "Делаю полный пайплайн и отправляю решение\n"
             "```command\n"
             "run_python(\"\"\"\n"
             "<python-код: читает train.csv/test.csv, обучает или строит baseline, создает submission.csv>\n"
@@ -1260,6 +1275,25 @@ def submission_metric_value(item: dict[str, Any]) -> float | None:
     return number
 
 
+def summarize_submission_metric(item: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not item:
+        return None
+    details = item.get("result")
+    if isinstance(details, dict):
+        return {
+            "status": item.get("status"),
+            "metric": details.get("metric"),
+            "value": details.get("value"),
+            "rows_checked": details.get("rows_checked"),
+        }
+    return {
+        "status": item.get("status"),
+        "metric": item.get("metric"),
+        "value": item.get("value"),
+        "rows_checked": item.get("rows_checked"),
+    }
+
+
 def is_lower_better_metric(metric_name: str) -> bool:
     metric = metric_name.strip().lower().replace("-", "_")
     if metric in HIGHER_IS_BETTER_METRICS:
@@ -1310,7 +1344,7 @@ def build_batch_error_prompt(batch_error: dict[str, Any]) -> str:
     return (
         "Предыдущий ответ не подходит для текущего режима.\n"
         f"Ошибка: {batch_error.get('error', 'invalid command batch')}\n"
-        "Верни короткую строку `Мысль: ...`, затем команды, которые реально продвигают решение. "
+        "Верни короткую строку комментария без вводного слова, затем команды, которые реально продвигают решение. "
         "Если это последняя попытка, создай/проверь submission.csv и вызови submit(\"submission.csv\")."
     )
 
@@ -1325,11 +1359,11 @@ def build_followup_prompt(results: list[dict[str, Any]], feedback: dict[str, Any
         opener = repeated_followup_opener(state)
     elif state.config.mode == "flexible" and not is_finalization_phase(state):
         opener = (
-            "Продолжай улучшать решение. Верни короткую строку `Мысль: ...`, затем следующую команду или команды. "
+            "Продолжай улучшать решение. Верни короткую строку комментария без вводного слова, затем следующую команду или команды. "
             "Не вызывай submit рано: сначала используй итерации на проверку данных, признаки, валидацию и улучшение модели."
         )
     else:
-        opener = "Продолжай решение. Верни короткую строку `Мысль: ...`, затем следующую команду или команды."
+        opener = "Продолжай решение. Верни короткую строку комментария без вводного слова, затем следующую команду или команды."
     lines = [
         opener,
         "",
@@ -1361,7 +1395,7 @@ def repeated_followup_opener(state: RunState) -> str:
         "Это независимый чистый single-shot запуск без доступа к предыдущим попыткам. "
         "Не описывай, что улучшишь модель потом. В этом же ответе сделай конкретную попытку решения. "
         "Submit-only не засчитывается, сначала создай submission.csv сам. "
-        "Верни короткую строку `Мысль: ...`, затем полный single-shot набор команд: "
+        "Верни короткую строку комментария без вводного слова, затем полный single-shot набор команд: "
         "создай/запусти решение, создай submission.csv и обязательно заверши ответ командой submit(\"submission.csv\")."
     )
 
@@ -1374,17 +1408,17 @@ def fixed_transition_followup_opener(state: RunState) -> str:
     if stage == "EDA":
         return (
             f"Продолжай fixed-transitions этап EDA. {progress} "
-            "Верни короткую строку `Мысль: ...`, затем команды для более глубокого анализа данных. "
+            "Верни короткую строку комментария без вводного слова, затем команды для более глубокого анализа данных. "
             "Переход к FEATURES произойдет только после минимального числа EDA-итераций."
         )
     if stage == "FEATURES":
         return (
             f"Продолжай fixed-transitions этап FEATURES. {progress} "
-            "Верни короткую строку `Мысль: ...`, затем продуктивные команды "
+            "Верни короткую строку комментария без вводного слова, затем продуктивные команды "
             "write_file, edit_file или run_python для признаков, preprocessing или скриптов решения."
         )
     return (
-        "Продолжай fixed-transitions этап TRAIN. Верни короткую строку `Мысль: ...`, затем команды, которые создают/проверяют "
+        "Продолжай fixed-transitions этап TRAIN. Верни короткую строку комментария без вводного слова, затем команды, которые создают/проверяют "
         "submission.csv, и обязательно вызови submit(\"submission.csv\"). Без собственного submit этап TRAIN не завершится."
     )
 
@@ -1826,6 +1860,9 @@ def render_agent_page() -> str:
     button { border:0; border-radius:6px; background:var(--accent); color:white; font-weight:800; cursor:pointer; padding:0 14px; }
     button.secondary { background:#eef3f8; color:var(--text); border:1px solid var(--border); }
     button:disabled { opacity:.55; cursor:not-allowed; }
+    a.button-link { box-sizing:border-box; display:inline-flex; width:100%; min-height:40px; align-items:center; justify-content:center; border-radius:6px; background:#eef3f8; color:var(--text); border:1px solid var(--border); font-weight:800; text-decoration:none; padding:0 14px; }
+    .top-action { margin-bottom:12px; }
+    .hidden { display:none !important; }
     .status { display:inline-flex; min-height:32px; align-items:center; padding:0 12px; border-radius:999px; border:1px solid var(--border); background:white; color:var(--muted); }
     .status.is-thinking { color:var(--accent); border-color:#b9cdfd; background:#eff4ff; }
     .status.is-thinking::before { content:""; width:8px; height:8px; margin-right:8px; border-radius:50%; background:var(--accent); animation:thinking-pulse 1s ease-in-out infinite; }
@@ -1910,6 +1947,14 @@ def render_agent_page() -> str:
     .submission-source summary { cursor:pointer; font-weight:800; color:var(--text); overflow-wrap:anywhere; }
     .submission-source pre { box-sizing:border-box; width:100%; max-width:100%; min-width:0; margin:10px 0 0; background:#111827; color:#f9fafb; border-radius:6px; padding:12px; max-height:360px; overflow:auto; font-size:13px; line-height:1.45; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; }
     .message { border-radius:8px; padding:12px; background:#eef3f8; color:var(--muted); margin-top:12px; }
+    .run-list { display:grid; gap:10px; }
+    .run-item { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:12px; align-items:start; border:1px solid var(--border); border-radius:8px; background:#fff; padding:14px; color:inherit; text-decoration:none; }
+    .run-item:hover { border-color:#b9cdfd; background:#f8fbff; }
+    .run-title { font-weight:900; color:var(--text); overflow-wrap:anywhere; }
+    .run-meta { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; color:var(--muted); font-size:13px; }
+    .run-pill { display:inline-flex; min-height:24px; align-items:center; border:1px solid var(--border); border-radius:999px; background:#f8fafc; padding:0 8px; font-weight:700; }
+    .run-score { text-align:right; color:var(--muted); font-size:13px; min-width:120px; }
+    .run-score strong { display:block; color:var(--text); font-size:18px; margin-top:3px; overflow-wrap:anywhere; }
     .file-panel { display:grid; gap:10px; }
     .file-list { display:grid; gap:6px; max-height:240px; overflow:auto; padding-right:2px; }
     .file-row { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px; align-items:center; border:1px solid var(--border); border-radius:6px; background:#f8fafc; padding:8px; }
@@ -1937,8 +1982,17 @@ def render_agent_page() -> str:
     </div>
     <div class="status" id="status">Idle</div>
   </header>
-  <div class="layout">
+  <div id="runs-page" class="hidden">
+    <section>
+      <h2>Список запусков</h2>
+      <div class="run-list" id="run-list"><div class="message">Загрузка запусков...</div></div>
+    </section>
+  </div>
+  <div class="layout" id="runner-page">
     <aside>
+      <div class="top-action">
+        <a class="button-link" href="/runs">Список запусков</a>
+      </div>
       <section>
         <h2>Run Settings</h2>
         <div class="field"><label for="task">Task</label><select id="task"></select></div>
@@ -2008,6 +2062,7 @@ const model = document.getElementById('model');
 const mode = document.getElementById('mode');
 const steps = document.getElementById('steps');
 const tokens = document.getElementById('tokens');
+const timeLimit = document.getElementById('timeLimit');
 const start = document.getElementById('start');
 const stop = document.getElementById('stop');
 const message = document.getElementById('message');
@@ -2015,6 +2070,9 @@ const statusEl = document.getElementById('status');
 const eventsEl = document.getElementById('events');
 const fileListEl = document.getElementById('file-list');
 const filePreviewEl = document.getElementById('file-preview');
+const runnerPage = document.getElementById('runner-page');
+const runsPage = document.getElementById('runs-page');
+const runListEl = document.getElementById('run-list');
 function truncateText(value, limit=180){
   const text = cleanText(value).replace(/\\s+/g, ' ');
   return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
@@ -2516,7 +2574,7 @@ function eventMainText(event){
 function eventBodyHtml(event){
   const data = event.data || {};
   if(event.kind === 'prompt') return renderPromptHtml(data.content || '', false);
-  if(event.kind === 'llm') return `<div class="chat-body structured">${renderMarkdownish(data.content || '')}</div>`;
+  if(event.kind === 'llm') return `<div class="chat-body structured">${renderMarkdownish(data.content || '', {strip:false})}</div>`;
   if(event.kind === 'result') {
     if(data.command === 'submit') return renderSubmissionHtml(data);
     return '';
@@ -2567,7 +2625,7 @@ function renderTurn(turn, index){
           <div class="chat-avatar">LLM</div>
           <div class="bubble">
             <div class="chat-title">LLM</div>
-            <div class="chat-body structured">${renderMarkdownish(llmText)}</div>
+            <div class="chat-body structured">${renderMarkdownish(llmText, {strip:false})}</div>
             ${turn.notes.length ? `<div class="command-notes">${turn.notes.join('')}</div>` : ''}
           </div>
         </div>
@@ -2664,6 +2722,66 @@ function eventLabel(kind){
   };
   return labels[kind] || kind;
 }
+function routeRunId(){
+  const match = window.location.pathname.match(/^\/runs\/([^/]+)$/);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+function showRunsPage(){
+  runnerPage.classList.add('hidden');
+  runsPage.classList.remove('hidden');
+  statusEl.textContent = 'Run list';
+  loadRuns();
+}
+function showRunnerPage(runId=null){
+  runsPage.classList.add('hidden');
+  runnerPage.classList.remove('hidden');
+  if(runId) {
+    currentRun = runId;
+    start.disabled = false;
+    stop.disabled = false;
+    poll();
+    if(timer) clearInterval(timer);
+    timer = setInterval(poll, 1500);
+  }
+}
+async function loadRuns(){
+  const res = await fetch('/api/runs');
+  const data = await res.json();
+  if(data.status !== 'ok') {
+    runListEl.innerHTML = `<div class="message error">${esc(data.error || 'Failed to load runs')}</div>`;
+    return;
+  }
+  renderRunList(data.runs || []);
+}
+function renderRunList(runs){
+  if(!runs.length) {
+    runListEl.innerHTML = '<div class="message">Запусков пока нет.</div>';
+    return;
+  }
+  runListEl.innerHTML = runs.map(run => {
+    const metric = run.submission_metric || {};
+    const metricName = metric.metric || 'submission';
+    const metricValue = metric.value ?? '-';
+    const created = run.created_at ? new Date(run.created_at).toLocaleString() : '-';
+    return `
+      <a class="run-item" href="/runs/${encodeURIComponent(run.run_id)}">
+        <div>
+          <div class="run-title">${esc(run.task_id)} · ${esc(run.run_id)}</div>
+          <div class="run-meta">
+            <span class="run-pill">${esc(run.status)} / ${esc(run.stop_reason)}</span>
+            <span class="run-pill">model: ${esc(run.model || '-')}</span>
+            <span class="run-pill">tokens: ${esc(run.total_tokens || 0)}/${esc(run.token_limit || '-')}</span>
+            <span class="run-pill">steps: ${esc(run.used_steps || 0)}/${esc(run.max_steps || '-')}</span>
+            <span class="run-pill">${esc(created)}</span>
+          </div>
+        </div>
+        <div class="run-score">
+          ${esc(metricName)}
+          <strong>${esc(metricValue)}</strong>
+        </div>
+      </a>`;
+  }).join('');
+}
 async function loadTasks(){
   const res = await fetch('/api/tasks');
   const data = await res.json();
@@ -2684,6 +2802,9 @@ async function startRun(){
   const data = await res.json();
   if(data.status !== 'ok'){ message.textContent = data.error || 'Failed to start'; start.disabled=false; stop.disabled=true; return; }
   currentRun = data.run.run_id;
+  if(window.location.pathname !== `/runs/${currentRun}`) {
+    history.pushState(null, '', `/runs/${currentRun}`);
+  }
   poll();
   timer = setInterval(poll, 1500);
 }
@@ -2853,6 +2974,11 @@ fileListEl.addEventListener('click', (event) => {
 });
 setupCodeToggles();
 loadTasks();
+if(window.location.pathname === '/runs') {
+  showRunsPage();
+} else {
+  showRunnerPage(routeRunId());
+}
 </script>
 </body>
 </html>"""

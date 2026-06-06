@@ -34,6 +34,7 @@ from web_server import (
     extract_commands,
     extract_reported_stage,
     handle_successful_submit,
+    list_workspace_files,
     prepare_run_workspace,
     record_fixed_stage_attempt,
     repeated_attempt_workspace_id,
@@ -42,7 +43,10 @@ from web_server import (
     validate_mode_command_batch,
     list_workspace_files,
     resolve_workspace_file,
+    should_isolate_llm_history,
     validate_mode_command,
+    validate_mode_command_batch,
+    validate_reported_stage,
     workspace_file_preview,
     zero_fixed_transition_result_if_needed,
 )
@@ -677,7 +681,7 @@ class WebServerModeTest(unittest.TestCase):
         self.assertIsNone(allowed)
 
     def test_extract_commands_accepts_single_shot_fenced_batch(self) -> None:
-        text = '''Мысль: делаю решение
+        text = '''Делаю решение
 ```command
 run_python("""
 print("create submission")
@@ -691,13 +695,13 @@ submit("submission.csv")
         self.assertIn("create submission", commands[0].args["code_or_file"])
 
     def test_extract_commands_ignores_inline_command_mentions(self) -> None:
-        text = 'Мысль: подготовлю решение и потом вызову submit("submission.csv").'
+        text = 'Подготовлю решение и потом вызову submit("submission.csv").'
 
         with self.assertRaisesRegex(ValueError, "No executable command"):
             extract_commands(text)
 
     def test_extract_commands_accepts_command_on_own_line(self) -> None:
-        text = '''Мысль: отправляю готовый файл
+        text = '''Отправляю готовый файл
 submit("submission.csv")'''
 
         commands = extract_commands(text)
@@ -851,7 +855,7 @@ submit("submission.csv")'''
 
         prompt = apply_mode_instruction(state, "base")
 
-        self.assertIn("Ответ только с `Мысль: ...` будет отклонён", prompt)
+        self.assertIn("Ответ только с коротким комментарием будет отклонён", prompt)
         self.assertIn("Обязательный формат ответа", prompt)
         self.assertIn("run_python", prompt)
         self.assertIn("не обещай улучшить модель позже", prompt)
@@ -891,6 +895,9 @@ submit("submission.csv")'''
                 repeated_attempt_workspace_id("run", 1),
             )
             (first_workspace / "solution.py").write_text("old attempt", encoding="utf-8")
+            executor, docker_container, created_container = manager._make_executor(
+                config, first_workspace, repeated_attempt_workspace_id("run", 1)
+            )
             state = RunState(
                 run_id="run",
                 config=config,
