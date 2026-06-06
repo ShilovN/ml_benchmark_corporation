@@ -76,8 +76,9 @@ load_dataset("train.csv")
 
         self.assertEqual(extract_command_text(text), 'read_file("checker/README.md")')
 
-    def test_extract_command_after_short_comment(self) -> None:
-        text = """Посмотрю, какие файлы есть в проекте.
+    def test_extract_command_after_stage_and_short_comment(self) -> None:
+        text = """EDA
+Посмотрю, какие файлы есть в проекте.
 list_files(".")"""
 
         command = parse_model_response(text)
@@ -520,9 +521,9 @@ class WebServerModeTest(unittest.TestCase):
         flexible_prompt = apply_mode_instruction(flexible_state, "base")
 
         self.assertIn("текущий обязательный этап EDA", fixed_prompt)
-        self.assertIn("stage: EDA", fixed_prompt)
+        self.assertIn("Первая строка ответа должна быть `EDA`", fixed_prompt)
         self.assertIn("Режим flexible", flexible_prompt)
-        self.assertIn("укажи текущий stage", flexible_prompt)
+        self.assertIn("Самостоятельно выбери актуальный этап", flexible_prompt)
         self.assertIn(f"попытка 1/{REPEATED_MAX_ATTEMPTS}", apply_mode_instruction(repeated_state, "base"))
 
 
