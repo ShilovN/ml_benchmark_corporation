@@ -1,0 +1,13 @@
+{
+  "id": "mushrooms",
+  "name": "mushrooms",
+  "metric": "accuracy",
+  "answer_file": "answers.csv",
+  "id_column": "id",
+  "column": "is_poisonous",
+  "public_files": [
+    "train.csv",
+    "test.csv",
+    "statement.md"
+  ]
+}
