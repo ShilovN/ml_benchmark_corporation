@@ -20,7 +20,7 @@ import pandas as pd
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
 
-from agent.executor import AgentContext, CommandExecutor
+from agent.executor import AgentContext, CommandExecutor, DEFAULT_TIME_LIMIT_SECONDS
 from agent.llm_client import (
     DEFAULT_MAX_TOKENS,
     DEFAULT_TEMPERATURE,
@@ -376,7 +376,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
     parser.add_argument("--token-limit", type=int, default=120000)
-    parser.add_argument("--time-limit-seconds", type=int, default=3600)
+    parser.add_argument(
+        "--time-limit-seconds",
+        type=int,
+        default=DEFAULT_TIME_LIMIT_SECONDS,
+        help="Per-command timeout in seconds for run_python(code) and run_python(file).",
+    )
     parser.add_argument("--max-steps", type=int, default=100)
     parser.add_argument("--request-timeout", type=int, default=DEFAULT_TIMEOUT)
     parser.add_argument("--context-chars-per-file", type=int, default=DEFAULT_CONTEXT_CHARS_PER_FILE)
@@ -493,9 +498,6 @@ def main() -> int:
                 return 1
 
         while True:
-            if time_exhausted(stats, args.time_limit_seconds):
-                stats.stop_reason = "time_limit"
-                break
             if args.token_limit and stats.total_tokens >= args.token_limit:
                 stats.stop_reason = "token_limit"
                 break
@@ -881,7 +883,7 @@ def build_followup_prompt(
 ) -> str:
     prefix = (
         f"{format_budget_line(stats, args)} "
-        "Продолжай решение.\n\n"
+        "Дальше верни короткую строку `Мысль: ...`, затем команды.\n\n"
     )
     body = format_followup_body(command_results, stats, args, feedback)
     return prefix + truncate_middle(body, MAX_FOLLOWUP_PROMPT_CHARS - len(prefix))
@@ -894,14 +896,12 @@ def format_followup_body(
     feedback: dict[str, Any] | None,
 ) -> str:
     budget = build_budget_status(stats, args)
-    remaining_seconds = max(0.0, args.time_limit_seconds - stats.elapsed_seconds)
     lines = [
         "Статус benchmark:",
         (
             f"requests={stats.requests}; tokens={stats.total_tokens}/{args.token_limit or 'без лимита'}; "
             f"steps={stats.executed_commands}/{args.max_steps}; "
-            f"remaining_steps={budget['remaining_iterations']}; "
-            f"remaining_seconds={remaining_seconds:.1f}"
+            f"remaining_steps={budget['remaining_iterations']}"
         ),
         "",
         "Результаты команд:",
@@ -911,7 +911,7 @@ def format_followup_body(
             lines.extend(format_command_result_for_prompt(index, result))
     else:
         lines.append("- команд не было")
-    if feedback:
+    if feedback and stats.requests > 1:
         lines.extend(["", "Подсказки:"])
         lines.extend(format_feedback_for_prompt(feedback))
     return "\n".join(lines)
@@ -931,6 +931,16 @@ def format_command_result_for_prompt(index: int, result: dict[str, Any]) -> list
 
 
 def format_result_payload(command: str, payload: Any) -> list[str]:
+    if command == "submit" and isinstance(payload, dict):
+        lines = [
+            f"metric={payload.get('metric', '?')}; value={payload.get('value', '?')}; "
+            f"rows_checked={payload.get('rows_checked', '?')}"
+        ]
+        source = payload.get("submission_source")
+        if isinstance(source, dict):
+            path = source.get("path") or source.get("kind") or "inline"
+            lines.append(f"submission_source={path}; truncated={source.get('truncated', False)}")
+        return lines
     if command == "read_file" and isinstance(payload, dict):
         lines = [f"path={payload.get('path', '?')}; truncated={payload.get('truncated', False)}"]
         content = str(payload.get("content", ""))
@@ -1218,10 +1228,6 @@ def update_token_stats(stats: BenchmarkStats, usage: Any) -> None:
     stats.prompt_tokens += prompt_tokens
     stats.completion_tokens += completion_tokens
     stats.total_tokens += total_tokens
-
-
-def time_exhausted(stats: BenchmarkStats, time_limit_seconds: int) -> bool:
-    return stats.elapsed_seconds >= time_limit_seconds
 
 
 def build_report(stats: BenchmarkStats, executor: CommandExecutor) -> dict[str, Any]:
