@@ -9,6 +9,7 @@ import csv
 import html
 import json
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -26,7 +27,7 @@ from urllib.parse import parse_qs, urlparse
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agent.executor import AgentContext, CommandExecutor
+from agent.executor import AgentContext, CommandExecutor, DEFAULT_TIME_LIMIT_SECONDS
 from agent.llm_client import (
     AVAILABLE_MODELS,
     DEFAULT_MAX_TOKENS,
@@ -45,6 +46,7 @@ from agent.parser import COMMAND_NAMES, FENCED_BLOCK_RE, ParsedCommand, parse_co
 
 DEFAULT_TASKS_DIR = Path("checker/tasks")
 DEFAULT_RUN_ROOT = Path("benchmark_runs")
+DEFAULT_DOCKER_IMAGE = "ml-benchmark-runner:latest"
 TEXT_EXTENSIONS = {".csv", ".json", ".md", ".py", ".txt", ".tsv", ".yaml", ".yml"}
 MAX_CONTEXT_CHARS = 28000
 MAX_FILE_PREVIEW_CHARS = 2500
@@ -122,6 +124,7 @@ class RunConfig:
     mode: str = DEFAULT_MODE
     max_steps: int = 40
     token_limit: int = 120000
+    time_limit_seconds: int = DEFAULT_TIME_LIMIT_SECONDS
     temperature: float = DEFAULT_TEMPERATURE
     max_tokens: int = DEFAULT_MAX_TOKENS
     request_timeout: int = DEFAULT_TIMEOUT
@@ -148,6 +151,8 @@ class RunState:
     final_submit_requested: bool = False
     fixed_stage_index: int = 0
     fixed_stage_attempts: dict[str, int] = field(default_factory=dict)
+    docker_container: str | None = None
+    created_container: bool = False
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -161,18 +166,33 @@ class RunState:
             "total_tokens": self.total_tokens,
             "used_steps": self.executor.context.used_steps,
             "max_steps": self.config.max_steps,
+            "code_time_limit_seconds": self.config.time_limit_seconds,
+            "elapsed_seconds": round(time.monotonic() - self.executor.context.start_time, 1),
             "submitted": self.submitted,
             "submission_result": self.submission_result,
             "error": self.error,
+            "docker_container": self.docker_container,
             "events": self.events[-200:],
         }
 
 
 class AgentRunManager:
-    def __init__(self, project_root: Path, tasks_dir: Path, run_root: Path) -> None:
+    def __init__(
+        self,
+        project_root: Path,
+        tasks_dir: Path,
+        run_root: Path,
+        *,
+        use_docker: bool = True,
+        docker_image: str = DEFAULT_DOCKER_IMAGE,
+        keep_containers: bool = False,
+    ) -> None:
         self.project_root = project_root.resolve()
         self.tasks_dir = resolve_path(project_root, tasks_dir)
         self.run_root = resolve_path(project_root, run_root)
+        self.use_docker = use_docker
+        self.docker_image = docker_image
+        self.keep_containers = keep_containers
         self.runs: dict[str, RunState] = {}
         self.lock = threading.Lock()
 
@@ -196,8 +216,15 @@ class AgentRunManager:
         run_id = uuid.uuid4().hex[:12]
         workspace_id = repeated_attempt_workspace_id(run_id, 1) if config.mode == "repeated" else run_id
         workspace = prepare_run_workspace(self.project_root, self.tasks_dir, self.run_root, config.task_id, workspace_id)
-        executor = self._make_executor(config, workspace)
-        state = RunState(run_id=run_id, config=config, workspace=workspace, executor=executor)
+        executor, docker_container, created_container = self._make_executor(config, workspace, workspace_id)
+        state = RunState(
+            run_id=run_id,
+            config=config,
+            workspace=workspace,
+            executor=executor,
+            docker_container=docker_container,
+            created_container=created_container,
+        )
         thread = threading.Thread(target=self._run_loop, args=(state,), daemon=True)
         state.thread = thread
         with self.lock:
@@ -205,17 +232,26 @@ class AgentRunManager:
         thread.start()
         return state
 
-    def _make_executor(self, config: RunConfig, workspace: Path) -> CommandExecutor:
-        return CommandExecutor(
+    def _make_executor(self, config: RunConfig, workspace: Path, container_id: str) -> tuple[CommandExecutor, str | None, bool]:
+        docker_container = None
+        created_container = False
+        if self.use_docker:
+            docker_container = default_container_name(config.task_id, container_id)
+            create_container(name=docker_container, image=self.docker_image, workspace=workspace)
+            created_container = True
+        executor = CommandExecutor(
             AgentContext(
                 workspace=workspace,
                 project_root=self.project_root,
                 task_id=config.task_id,
                 tasks_dir=self.tasks_dir,
                 max_steps=config.max_steps,
+                time_limit_seconds=config.time_limit_seconds,
                 history_file=Path("agent_history.txt"),
+                docker_container=docker_container,
             )
         )
+        return executor, docker_container, created_container
 
     def get_run(self, run_id: str) -> RunState | None:
         with self.lock:
@@ -238,9 +274,27 @@ class AgentRunManager:
     def _run_loop(self, state: RunState) -> None:
         user_message = apply_mode_instruction(state, build_initial_prompt(state.workspace, state.config.task_id))
         history: list[dict[str, str]] = []
-        add_event(state, "system", "Run started", {"task_id": state.config.task_id, "mode": state.config.mode})
+        add_event(
+            state,
+            "system",
+            "Run started",
+            {
+                "task_id": state.config.task_id,
+                "mode": state.config.mode,
+                "docker_container": state.docker_container,
+            },
+        )
         if state.config.mode == "repeated":
-            add_event(state, "system", "Repeated isolated attempt started", {"attempt": 1, "max_attempts": REPEATED_MAX_ATTEMPTS})
+            add_event(
+                state,
+                "system",
+                "Repeated isolated attempt started",
+                {
+                    "attempt": 1,
+                    "max_attempts": REPEATED_MAX_ATTEMPTS,
+                    "docker_container": state.docker_container,
+                },
+            )
 
         try:
             while not state.stop_requested:
@@ -406,23 +460,36 @@ class AgentRunManager:
             state.stop_reason = "error"
             state.error = str(exc)
             add_event(state, "error", "Run failed", {"error": str(exc)})
+        finally:
+            if state.created_container and state.docker_container and not self.keep_containers:
+                remove_container(state.docker_container)
 
     def _prepare_next_repeated_attempt(self, state: RunState) -> None:
+        if state.created_container and state.docker_container and not self.keep_containers:
+            remove_container(state.docker_container)
         next_attempt = state.requests + 1
+        workspace_id = repeated_attempt_workspace_id(state.run_id, next_attempt)
         workspace = prepare_run_workspace(
             self.project_root,
             self.tasks_dir,
             self.run_root,
             state.config.task_id,
-            repeated_attempt_workspace_id(state.run_id, next_attempt),
+            workspace_id,
         )
+        executor, docker_container, created_container = self._make_executor(state.config, workspace, workspace_id)
         state.workspace = workspace
-        state.executor = self._make_executor(state.config, workspace)
+        state.executor = executor
+        state.docker_container = docker_container
+        state.created_container = created_container
         add_event(
             state,
             "system",
             "Repeated isolated attempt started",
-            {"attempt": next_attempt, "max_attempts": REPEATED_MAX_ATTEMPTS},
+            {
+                "attempt": next_attempt,
+                "max_attempts": REPEATED_MAX_ATTEMPTS,
+                "docker_container": state.docker_container,
+            },
         )
 
     def _force_final_submit(self, state: RunState) -> None:
@@ -513,10 +580,35 @@ def make_handler(manager: AgentRunManager) -> type[BaseHTTPRequestHandler]:
                 self._send_json({"status": "ok", "run": run.public_dict() if run else None})
                 return
             if parsed.path.startswith("/api/runs/"):
-                run_id = parsed.path.rsplit("/", 1)[-1]
+                parts = parsed.path.strip("/").split("/")
+                run_id = parts[2] if len(parts) >= 3 else ""
                 run = manager.get_run(run_id)
                 if not run:
                     self._send_json({"status": "error", "error": "Run not found"}, HTTPStatus.NOT_FOUND)
+                    return
+                if len(parts) == 4 and parts[3] == "files":
+                    self._send_json({"status": "ok", "files": list_workspace_files(run.workspace)})
+                    return
+                if len(parts) == 5 and parts[3] == "files" and parts[4] == "view":
+                    file_path = _first_query_value(parsed.query, "path") or ""
+                    try:
+                        payload = workspace_file_preview(run.workspace, file_path)
+                    except ValueError as exc:
+                        self._send_json({"status": "error", "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                        return
+                    self._send_json({"status": "ok", "file": payload})
+                    return
+                if len(parts) == 5 and parts[3] == "files" and parts[4] == "download":
+                    file_path = _first_query_value(parsed.query, "path") or ""
+                    try:
+                        path = resolve_workspace_file(run.workspace, file_path)
+                    except ValueError as exc:
+                        self._send_json({"status": "error", "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                        return
+                    self._send_file_download(path)
+                    return
+                if len(parts) != 3:
+                    self._send_json({"status": "error", "error": "Not found"}, HTTPStatus.NOT_FOUND)
                     return
                 self._send_json({"status": "ok", "run": run.public_dict()})
                 return
@@ -547,11 +639,27 @@ def make_handler(manager: AgentRunManager) -> type[BaseHTTPRequestHandler]:
                     mode=mode,
                     max_steps=int(payload["max_steps"]) if "max_steps" in payload else 40,
                     token_limit=int(payload["token_limit"]) if "token_limit" in payload else 120000,
+                    time_limit_seconds=(
+                        int(payload["time_limit_seconds"])
+                        if "time_limit_seconds" in payload
+                        else DEFAULT_TIME_LIMIT_SECONDS
+                    ),
                     temperature=float(payload["temperature"]) if "temperature" in payload else DEFAULT_TEMPERATURE,
                     max_tokens=int(payload["max_tokens"]) if "max_tokens" in payload else DEFAULT_MAX_TOKENS,
                     request_timeout=int(payload["request_timeout"]) if "request_timeout" in payload else DEFAULT_TIMEOUT,
                 )
-                run = manager.start_run(config)
+                try:
+                    run = manager.start_run(config)
+                except subprocess.CalledProcessError as exc:
+                    self._send_json(
+                        {
+                            "status": "error",
+                            "error": "Could not start benchmark Docker container",
+                            "details": (exc.stderr or exc.stdout or str(exc)).strip(),
+                        },
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                    return
                 self._send_json({"status": "ok", "run": run.public_dict()})
                 return
             if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/stop"):
@@ -581,6 +689,16 @@ def make_handler(manager: AgentRunManager) -> type[BaseHTTPRequestHandler]:
             body = html.encode("utf-8")
             self.send_response(HTTPStatus.OK.value)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _send_file_download(self, path: Path) -> None:
+            body = path.read_bytes()
+            filename = path.name.replace('"', "")
+            self.send_response(HTTPStatus.OK.value)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -616,6 +734,37 @@ def prepare_run_workspace(
 
 def repeated_attempt_workspace_id(run_id: str, attempt: int) -> str:
     return f"{run_id}-attempt-{attempt}"
+
+
+def create_container(*, name: str, image: str, workspace: Path) -> None:
+    subprocess.run(
+        [
+            "docker",
+            "run",
+            "-d",
+            "--name",
+            name,
+            "-v",
+            f"{workspace.resolve()}:/workspace",
+            "-w",
+            "/workspace",
+            image,
+            "sleep",
+            "infinity",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def remove_container(container: str) -> None:
+    subprocess.run(["docker", "rm", "-f", container], check=False, capture_output=True, text=True)
+
+
+def default_container_name(task_id: str, run_id: str) -> str:
+    safe_task_id = "".join(char if char.isalnum() or char in "-_" else "-" for char in task_id)
+    return f"ml-benchmark-web-{safe_task_id}-{run_id}"
 
 
 def create_baseline_submission(workspace: Path) -> Path:
@@ -1185,6 +1334,16 @@ def format_web_command_result(index: int, result: dict[str, Any]) -> list[str]:
 
 
 def format_web_result_payload(command: str, payload: Any) -> list[str]:
+    if command == "submit" and isinstance(payload, dict):
+        lines = [
+            f"metric={payload.get('metric', '?')}; value={payload.get('value', '?')}; "
+            f"rows_checked={payload.get('rows_checked', '?')}"
+        ]
+        source = payload.get("submission_source")
+        if isinstance(source, dict):
+            path = source.get("path") or source.get("kind") or "inline"
+            lines.append(f"submission_source={path}; truncated={source.get('truncated', False)}")
+        return lines
     if command == "read_file" and isinstance(payload, dict):
         lines = [f"path={payload.get('path', '?')}; truncated={payload.get('truncated', False)}"]
         content = str(payload.get("content", ""))
@@ -1386,6 +1545,54 @@ def collect_file_previews(workspace: Path) -> str:
     return "\n".join(chunks) if chunks else "(no readable files)"
 
 
+def list_workspace_files(workspace: Path) -> list[dict[str, Any]]:
+    files: list[dict[str, Any]] = []
+    workspace = workspace.resolve()
+    for path in sorted(workspace.rglob("*")):
+        if not path.is_file():
+            continue
+        relative = path.resolve().relative_to(workspace)
+        stat = path.stat()
+        files.append(
+            {
+                "path": str(relative),
+                "name": path.name,
+                "size": stat.st_size,
+                "modified": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+                "previewable": path.suffix.lower() in TEXT_EXTENSIONS,
+            }
+        )
+    return files
+
+
+def workspace_file_preview(workspace: Path, file_path: str) -> dict[str, Any]:
+    path = resolve_workspace_file(workspace, file_path)
+    if path.suffix.lower() not in TEXT_EXTENSIONS:
+        raise ValueError("Preview is available only for text-like files")
+    content = path.read_text(encoding="utf-8", errors="ignore")
+    return {
+        "path": str(path.resolve().relative_to(workspace.resolve())),
+        "content": content[:MAX_FILE_PREVIEW_CHARS],
+        "truncated": len(content) > MAX_FILE_PREVIEW_CHARS,
+        "size": path.stat().st_size,
+    }
+
+
+def resolve_workspace_file(workspace: Path, file_path: str) -> Path:
+    if not file_path:
+        raise ValueError("File path is required")
+    raw_path = Path(file_path)
+    if raw_path.is_absolute():
+        raise ValueError("Absolute paths are not allowed")
+    workspace = workspace.resolve()
+    path = (workspace / raw_path).resolve()
+    if path != workspace and workspace not in path.parents:
+        raise ValueError("File path is outside workspace")
+    if not path.exists() or not path.is_file():
+        raise ValueError("File not found")
+    return path
+
+
 def extract_assistant_text(response: dict[str, Any]) -> str:
     return str(response["choices"][0]["message"]["content"])
 
@@ -1538,10 +1745,13 @@ def render_agent_page() -> str:
     input, select { border:1px solid var(--border); border-radius:6px; padding:8px; background:white; }
     .field { margin-bottom:14px; }
     .row { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+    .limit-row { grid-template-columns:repeat(3,minmax(0,1fr)); }
     button { border:0; border-radius:6px; background:var(--accent); color:white; font-weight:800; cursor:pointer; padding:0 14px; }
     button.secondary { background:#eef3f8; color:var(--text); border:1px solid var(--border); }
     button:disabled { opacity:.55; cursor:not-allowed; }
     .status { display:inline-flex; min-height:32px; align-items:center; padding:0 12px; border-radius:999px; border:1px solid var(--border); background:white; color:var(--muted); }
+    .status.is-thinking { color:var(--accent); border-color:#b9cdfd; background:#eff4ff; }
+    .status.is-thinking::before { content:""; width:8px; height:8px; margin-right:8px; border-radius:50%; background:var(--accent); animation:thinking-pulse 1s ease-in-out infinite; }
     .cards { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; }
     .card { border:1px solid var(--border); border-radius:8px; padding:12px; background:#f8fafc; }
     .card strong { display:block; font-size:22px; margin-top:4px; }
@@ -1565,6 +1775,14 @@ def render_agent_page() -> str:
     .chat-body .block { margin:10px 0; }
     .chat-body pre { max-height:none; white-space:pre-wrap; word-break:break-word; }
     .chat-tail { box-sizing:border-box; display:flex; justify-content:space-between; gap:10px; min-width:0; max-width:100%; color:var(--muted); font-size:12px; padding:0 44px; }
+    .thinking-bubble { border-color:#b9cdfd; background:#f6f9ff; }
+    .thinking-line { display:flex; align-items:center; gap:10px; color:var(--muted); font-weight:700; }
+    .thinking-dots { display:inline-flex; align-items:center; gap:4px; }
+    .thinking-dots span { width:6px; height:6px; border-radius:50%; background:var(--accent); opacity:.35; animation:thinking-dot 1.2s ease-in-out infinite; }
+    .thinking-dots span:nth-child(2) { animation-delay:.16s; }
+    .thinking-dots span:nth-child(3) { animation-delay:.32s; }
+    @keyframes thinking-dot { 0%, 80%, 100% { transform:translateY(0); opacity:.35; } 40% { transform:translateY(-4px); opacity:1; } }
+    @keyframes thinking-pulse { 0%, 100% { transform:scale(.8); opacity:.45; } 50% { transform:scale(1.15); opacity:1; } }
     .event.command, .event.result, .event.feedback, .event.system, .event.error, .event.parse_error, .event.validation { border:1px solid var(--border); border-radius:10px; padding:10px 12px; background:white; }
     .event.command { border-left:4px solid #c2410c; }
     .event.result { border-left:4px solid #067647; }
@@ -1591,6 +1809,7 @@ def render_agent_page() -> str:
     .code-block.is-expanded .code-toggle::before { transform:rotate(180deg); }
     .code-toggle:hover { border-color:rgba(148,163,184,0.9); }
     .code-toggle:focus-visible { outline:2px solid #93c5fd; outline-offset:2px; }
+    .submit-card { display:grid; gap:12px; min-width:0; max-width:100%; }
     .csv-table-wrap { box-sizing:border-box; width:100%; max-width:100%; max-height:360px; overflow:auto; border:1px solid var(--border); border-radius:8px; background:white; margin:8px 0; }
     .csv-table-inner { width:max-content; min-width:100%; }
     .csv-table { width:max-content; min-width:100%; border-collapse:collapse; font-size:13px; }
@@ -1599,7 +1818,6 @@ def render_agent_page() -> str:
     .csv-table td { color:#344054; }
     .csv-table tr:last-child td { border-bottom:0; }
     .csv-caption { display:flex; justify-content:space-between; gap:12px; padding:8px 10px; color:var(--muted); font-size:12px; font-weight:700; background:#f8fafc; border-top:1px solid var(--border); }
-    .submit-card { display:grid; gap:12px; }
     .submit-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; flex-wrap:wrap; }
     .submit-title { font-weight:900; color:var(--text); }
     .submit-subtitle { margin-top:3px; color:var(--muted); font-size:13px; }
@@ -1611,7 +1829,24 @@ def render_agent_page() -> str:
     .submit-metric span { display:block; color:var(--muted); font-size:12px; font-weight:800; margin-bottom:4px; }
     .submit-metric strong { display:block; color:var(--text); font-size:18px; overflow-wrap:anywhere; }
     .submit-error { border:1px solid #fecdca; border-radius:8px; background:#fef3f2; color:#b42318; padding:10px; line-height:1.45; overflow-wrap:anywhere; }
+    .submission-source { box-sizing:border-box; min-width:0; max-width:100%; overflow:hidden; border:1px solid var(--border); border-radius:8px; background:#fff; padding:10px 12px; }
+    .submission-source summary { cursor:pointer; font-weight:800; color:var(--text); overflow-wrap:anywhere; }
+    .submission-source pre { box-sizing:border-box; width:100%; max-width:100%; min-width:0; margin:10px 0 0; background:#111827; color:#f9fafb; border-radius:6px; padding:12px; max-height:360px; overflow:auto; font-size:13px; line-height:1.45; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; }
     .message { border-radius:8px; padding:12px; background:#eef3f8; color:var(--muted); margin-top:12px; }
+    .file-panel { display:grid; gap:10px; }
+    .file-list { display:grid; gap:6px; max-height:240px; overflow:auto; padding-right:2px; }
+    .file-row { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px; align-items:center; border:1px solid var(--border); border-radius:6px; background:#f8fafc; padding:8px; }
+    .file-main { min-width:0; }
+    .file-name { color:var(--text); font-weight:800; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .file-meta { margin-top:2px; color:var(--muted); font-size:12px; }
+    .file-actions { display:flex; gap:6px; }
+    .file-actions button, .file-actions a { display:inline-flex; align-items:center; justify-content:center; min-height:28px; width:auto; padding:0 8px; border-radius:6px; font-size:12px; font-weight:800; text-decoration:none; border:1px solid var(--border); }
+    .file-actions button { color:var(--accent); background:#fff; }
+    .file-actions button:disabled { color:var(--muted); cursor:not-allowed; background:#eef3f8; }
+    .file-actions a { color:white; background:var(--accent); border-color:var(--accent); }
+    .file-preview { min-width:0; border:1px solid var(--border); border-radius:6px; background:#fff; overflow:hidden; }
+    .file-preview-head { display:flex; justify-content:space-between; gap:8px; padding:8px 10px; color:var(--muted); font-size:12px; font-weight:800; border-bottom:1px solid var(--border); }
+    .file-preview pre { box-sizing:border-box; width:100%; max-height:260px; margin:0; padding:10px; overflow:auto; background:#111827; color:#f9fafb; font-size:12px; line-height:1.45; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; }
     .error { color:var(--bad); background:#fef3f2; border:1px solid #fecdca; }
     @media (max-width:900px){ header,.layout{display:block}.row,.cards,.submit-metrics{grid-template-columns:1fr} }
   </style>
@@ -1649,11 +1884,22 @@ __MODEL_OPTIONS__
           <div class="field"><label for="steps">Max steps</label><input id="steps" type="number" value="40" min="1"></div>
           <div class="field"><label for="tokens">Token limit</label><input id="tokens" type="number" value="120000" min="1"></div>
         </div>
+        <div class="field"><label for="timeLimit">Code timeout, sec</label><input id="timeLimit" type="number" value="__DEFAULT_TIME_LIMIT_SECONDS__" min="1"></div>
         <div class="row">
           <button id="start">Start LLM Run</button>
           <button class="secondary" id="stop" disabled>Stop</button>
         </div>
         <div class="message" id="message">Готово к запуску. Нужен доступ к OpenAI-compatible LLM endpoint.</div>
+      </section>
+      <section>
+        <h2>Workspace Files</h2>
+        <div class="file-panel">
+          <div class="file-list" id="file-list"><div class="message">Start a run to browse files.</div></div>
+          <div class="file-preview" id="file-preview">
+            <div class="file-preview-head"><span>Preview</span><span>-</span></div>
+            <pre>Select a text file to preview it.</pre>
+          </div>
+        </div>
       </section>
     </aside>
     <div>
@@ -1690,6 +1936,8 @@ const stop = document.getElementById('stop');
 const message = document.getElementById('message');
 const statusEl = document.getElementById('status');
 const eventsEl = document.getElementById('events');
+const fileListEl = document.getElementById('file-list');
+const filePreviewEl = document.getElementById('file-preview');
 function truncateText(value, limit=180){
   const text = cleanText(value).replace(/\\s+/g, ' ');
   return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
@@ -1697,6 +1945,12 @@ function truncateText(value, limit=180){
 function esc(v){return String(v).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');}
 function escAttr(v){return esc(v).replaceAll('"','&quot;').replaceAll("'","&#39;");}
 function cleanText(value){return String(value ?? '').trim();}
+function isProbablyCode(value){
+  const text = cleanText(value);
+  if(!text) return false;
+  if(text.includes('\n')) return true;
+  return /\b(?:import|from|def|class|for|while|if|try|except|with|return|print)\b|[=;{}]/.test(text);
+}
 function isPlainObject(value){return value !== null && typeof value === 'object' && !Array.isArray(value);}
 function safeTextBlock(value){
   return `<div class="chat-body structured"><pre>${esc(cleanText(value) || 'Empty message.')}</pre></div>`;
@@ -2082,6 +2336,9 @@ function renderSubmissionHtml(submission){
   const value = payload.value ?? '-';
   const rows = payload.rows_checked ?? '-';
   const elapsed = submission.elapsed_ms ?? '-';
+  const source = payload.submission_source || null;
+  const sourcePath = source && (source.path || source.kind || 'inline');
+  const sourceCode = source && source.content ? cleanText(source.content) : '';
   return `
     <div class="submit-card">
       <div class="submit-head">
@@ -2097,6 +2354,12 @@ function renderSubmissionHtml(submission){
         <div class="submit-metric"><span>Value</span><strong>${esc(value)}</strong></div>
         <div class="submit-metric"><span>Rows checked</span><strong>${esc(rows)}</strong></div>
       </div>
+      ${sourceCode ? `
+        <details class="submission-source">
+          <summary>Код, который сформировал submission.csv</summary>
+          <div class="note-meta">Источник: <span class="inline-code">${esc(sourcePath)}</span>${source.truncated ? ' · truncated' : ''}</div>
+          <pre>${esc(sourceCode)}</pre>
+        </details>` : ''}
     </div>`;
 }
 function renderPromptHtml(text, allowCsv=false){
@@ -2117,18 +2380,36 @@ function renderCommandNote(event){
   const code = cleanText(args.code_or_file || '');
   const path = cleanText(args.path || args.file || '');
   const content = cleanText(args.content || args.diff || '');
-  const isCode = name === 'run_python';
-  const fileOps = new Set(['read_file', 'write_file', 'edit_file', 'load_dataset', 'list_files', 'show_dataset_info', 'show_sample_rows']);
-  if(!isCode && !fileOps.has(name)) return '';
-  const summary = isCode ? 'Выполняю код' : 'Открываю файл';
+  const labels = {
+    list_files: 'Показываю список файлов',
+    read_file: 'Открываю файл',
+    write_file: 'Создаю файл',
+    edit_file: 'Редактирую файл',
+    load_dataset: 'Загружаю датасет',
+    show_dataset_info: 'Показываю информацию о датасете',
+    show_sample_rows: 'Показываю sample строки',
+    run_python: 'Выполняю код',
+    get_budget_status: 'Проверяю бюджет шагов',
+    get_remaining_time: 'Проверяю timeout кода',
+    get_trajectory: 'Показываю trajectory',
+    get_hints: 'Запрашиваю подсказки',
+    submit: 'Отправляю submission'
+  };
+  const summary = labels[name] || `Выполняю команду ${name || 'unknown'}`;
   const details = [];
-  if(isCode) {
+  details.push(`<div class="note-meta">Команда: <span class="inline-code">${esc(renderCommandCall(name, args))}</span></div>`);
+  if(name === 'run_python') {
     if(code) details.push(`<div class="note-meta">Код</div><pre>${esc(code)}</pre>`);
     else details.push('<div class="note-meta">Код не передан.</div>');
   } else {
     if(path) details.push(`<div class="note-meta">Путь: <span class="inline-code">${esc(path)}</span></div>`);
+    if(args.n !== undefined) details.push(`<div class="note-meta">Строк: <span class="inline-code">${esc(args.n)}</span></div>`);
     if(content) details.push(`<div class="note-meta">Содержимое</div>${renderTextPreview(content)}`);
-    if(!path && !content) details.push('<div class="note-meta">Без дополнительных данных.</div>');
+    if(!path && !content && args.n === undefined) {
+      const argEntries = Object.keys(args || {});
+      if(argEntries.length) details.push(renderJsonSummary(args));
+      else details.push('<div class="note-meta">Без аргументов.</div>');
+    }
   }
   return `
     <div class="command-note">
@@ -2218,7 +2499,24 @@ function renderTurn(turn, index){
           <span>${esc(new Date(turn.llm.time).toLocaleTimeString())}</span>
         </div>
       </div>` : '';
-    return `<div class="turn" data-turn-index="${index}">${prompt}${llm}</div>`;
+    const thinking = turn.thinking ? `
+      <div class="event chat-event llm assistant">
+        <div class="chat-row assistant">
+          <div class="chat-avatar">LLM</div>
+          <div class="bubble thinking-bubble">
+            <div class="chat-title">LLM</div>
+            <div class="thinking-line">
+              <span>Модель размышляет</span>
+              <span class="thinking-dots" aria-hidden="true"><span></span><span></span><span></span></span>
+            </div>
+          </div>
+        </div>
+        <div class="chat-tail">
+          <span>Generating response</span>
+          <span>${esc(new Date().toLocaleTimeString())}</span>
+        </div>
+      </div>` : '';
+    return `<div class="turn" data-turn-index="${index}">${prompt}${llm}${thinking}</div>`;
   } catch (error) {
     const promptText = turn.prompt?.data?.content || '';
     const llmText = turn.llm?.data?.content || '';
@@ -2265,6 +2563,12 @@ function applyTrajectoryUiState(){
     });
   });
 }
+function isScrolledToBottom(element, threshold=24){
+  return element.scrollHeight - element.scrollTop - element.clientHeight <= threshold;
+}
+function scrollToBottom(element){
+  element.scrollTop = element.scrollHeight;
+}
 function eventPreviewHtml(event){
   const text = truncateText(eventMainText(event));
   return text ? `<div class="event-preview">${esc(text)}</div>` : '';
@@ -2290,12 +2594,15 @@ async function loadTasks(){
 }
 async function startRun(){
   start.disabled = true; stop.disabled = false; message.textContent = 'Starting run...';
+  renderFileList([]);
+  renderFilePreview(null);
   const res = await fetch('/api/runs', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({
     task_id: task.value,
     model: model.value,
     mode: mode.value,
     max_steps: Number(steps.value),
-    token_limit: Number(tokens.value)
+    token_limit: Number(tokens.value),
+    time_limit_seconds: Number(timeLimit.value)
   })});
   const data = await res.json();
   if(data.status !== 'ok'){ message.textContent = data.error || 'Failed to start'; start.disabled=false; stop.disabled=true; return; }
@@ -2314,13 +2621,83 @@ async function poll(){
   const data = await res.json();
   if(data.status !== 'ok') return;
   render(data.run);
+  loadRunFiles();
   if(['completed','stopped','error'].includes(data.run.status)){
     clearInterval(timer); start.disabled=false; stop.disabled=true;
   }
 }
+async function loadRunFiles(){
+  if(!currentRun) {
+    renderFileList([]);
+    return;
+  }
+  const res = await fetch(`/api/runs/${currentRun}/files`);
+  const data = await res.json();
+  if(data.status !== 'ok') {
+    fileListEl.innerHTML = `<div class="message error">${esc(data.error || 'Failed to load files')}</div>`;
+    return;
+  }
+  renderFileList(data.files || []);
+}
+function renderFileList(files){
+  if(!currentRun) {
+    fileListEl.innerHTML = '<div class="message">Start a run to browse files.</div>';
+    return;
+  }
+  if(!files.length) {
+    fileListEl.innerHTML = '<div class="message">No files in workspace yet.</div>';
+    return;
+  }
+  fileListEl.innerHTML = files.map(file => {
+    const path = cleanText(file.path);
+    const viewDisabled = file.previewable ? '' : 'disabled';
+    const downloadHref = `/api/runs/${encodeURIComponent(currentRun)}/files/download?path=${encodeURIComponent(path)}`;
+    return `
+      <div class="file-row">
+        <div class="file-main">
+          <div class="file-name" title="${escAttr(path)}">${esc(path)}</div>
+          <div class="file-meta">${esc(formatBytes(file.size || 0))}</div>
+        </div>
+        <div class="file-actions">
+          <button type="button" data-file-view="${escAttr(path)}" ${viewDisabled}>View</button>
+          <a href="${escAttr(downloadHref)}">Download</a>
+        </div>
+      </div>`;
+  }).join('');
+}
+function renderFilePreview(file){
+  if(!file) {
+    filePreviewEl.innerHTML = '<div class="file-preview-head"><span>Preview</span><span>-</span></div><pre>Select a text file to preview it.</pre>';
+    return;
+  }
+  filePreviewEl.innerHTML = `
+    <div class="file-preview-head">
+      <span>${esc(file.path)}</span>
+      <span>${file.truncated ? 'truncated' : formatBytes(file.size || 0)}</span>
+    </div>
+    <pre>${esc(file.content || '')}</pre>`;
+}
+async function viewRunFile(path){
+  if(!currentRun || !path) return;
+  const res = await fetch(`/api/runs/${encodeURIComponent(currentRun)}/files/view?path=${encodeURIComponent(path)}`);
+  const data = await res.json();
+  if(data.status !== 'ok') {
+    filePreviewEl.innerHTML = `<div class="file-preview-head"><span>Preview error</span><span>-</span></div><pre>${esc(data.error || 'Failed to preview file')}</pre>`;
+    return;
+  }
+  renderFilePreview(data.file);
+}
+function formatBytes(size){
+  const value = Number(size) || 0;
+  if(value < 1024) return `${value} B`;
+  if(value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / 1024 / 1024).toFixed(1)} MB`;
+}
 function render(run){
+  const shouldStickToBottom = isScrolledToBottom(eventsEl);
   saveCsvScrollPositions();
   statusEl.textContent = run.status + ' / ' + run.stop_reason;
+  statusEl.classList.remove('is-thinking');
   document.getElementById('s-status').textContent = run.status;
   document.getElementById('s-requests').textContent = run.requests;
   document.getElementById('s-steps').textContent = `${run.used_steps}/${run.max_steps}`;
@@ -2379,17 +2756,33 @@ function render(run){
       if(currentTurn) currentTurn.notes.push(renderTechEvent(event, turns.length));
     }
   }
+  const lastTurn = turns[turns.length - 1];
+  const isThinking = run.status === 'running' && Boolean(lastTurn?.prompt) && !lastTurn.llm;
+  if(isThinking) {
+    lastTurn.thinking = true;
+    statusEl.classList.add('is-thinking');
+    message.textContent = `Mode: ${run.mode}. Task: ${run.task_id}. Модель размышляет...`;
+  }
   eventsEl.innerHTML = turns.length ? turns.map(renderTurn).join('') : '<div class="message">No events yet.</div>';
-applyTrajectoryUiState();
+  applyTrajectoryUiState();
+  if(shouldStickToBottom) scrollToBottom(eventsEl);
 }
 start.addEventListener('click', startRun);
 stop.addEventListener('click', stopRun);
+fileListEl.addEventListener('click', (event) => {
+  const button = event.target.closest('[data-file-view]');
+  if(!button) return;
+  viewRunFile(button.dataset.fileView || '');
+});
 setupCodeToggles();
 loadTasks();
 </script>
 </body>
 </html>"""
-    return page.replace("__MODEL_OPTIONS__", model_options)
+    return page.replace("__MODEL_OPTIONS__", model_options).replace(
+        "__DEFAULT_TIME_LIMIT_SECONDS__",
+        str(DEFAULT_TIME_LIMIT_SECONDS),
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -2399,14 +2792,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--project-root", type=Path, default=Path.cwd())
     parser.add_argument("--tasks-dir", type=Path, default=DEFAULT_TASKS_DIR)
     parser.add_argument("--run-root", type=Path, default=DEFAULT_RUN_ROOT)
+    parser.add_argument(
+        "--docker-image",
+        default=DEFAULT_DOCKER_IMAGE,
+        help="Prebuilt Docker image used for agent run_python commands.",
+    )
+    parser.add_argument(
+        "--no-docker",
+        action="store_true",
+        help="Run agent Python commands on the host instead of a benchmark Docker container.",
+    )
+    parser.add_argument(
+        "--keep-containers",
+        action="store_true",
+        help="Do not remove per-run benchmark containers after runs finish.",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    manager = AgentRunManager(args.project_root, args.tasks_dir, args.run_root)
+    manager = AgentRunManager(
+        args.project_root,
+        args.tasks_dir,
+        args.run_root,
+        use_docker=not args.no_docker,
+        docker_image=args.docker_image,
+        keep_containers=args.keep_containers,
+    )
     server = ThreadingHTTPServer((args.host, args.port), make_handler(manager))
     print(f"Agent web UI is running on http://{args.host}:{args.port}")
+    if args.no_docker:
+        print("Agent Python execution: host python3")
+    else:
+        print(f"Agent Python execution: Docker image {args.docker_image}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

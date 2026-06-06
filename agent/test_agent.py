@@ -37,7 +37,10 @@ from web_server import (
     repeated_attempt_workspace_id,
     should_isolate_llm_history,
     validate_mode_command_batch,
+    list_workspace_files,
+    resolve_workspace_file,
     validate_mode_command,
+    workspace_file_preview,
 )
 
 
@@ -518,6 +521,80 @@ class ExecutorTest(unittest.TestCase):
         self.assertEqual(result["result"]["metric"], "mae")
         self.assertEqual(result["result"]["value"], 0.0)
 
+    def test_submit_includes_submission_source_code(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            tasks_dir = workspace / "checker" / "tasks" / "toy"
+            tasks_dir.mkdir(parents=True)
+            (tasks_dir / "task.json").write_text(
+                json.dumps(
+                    {
+                        "id": "toy",
+                        "metric": "mae",
+                        "answer_file": "answers.csv",
+                        "id_column": "id",
+                        "column": "target",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (tasks_dir / "answers.csv").write_text("id,target\n1,10\n2,20\n", encoding="utf-8")
+            executor = CommandExecutor(
+                AgentContext(workspace=workspace, task_id="toy", tasks_dir=workspace / "checker" / "tasks")
+            )
+            code = (
+                "import csv\n"
+                "with open('submission.csv', 'w', newline='') as file:\n"
+                "    writer = csv.writer(file)\n"
+                "    writer.writerow(['id', 'target'])\n"
+                "    writer.writerow([1, 10])\n"
+                "    writer.writerow([2, 20])\n"
+            )
+
+            write_result = executor.execute_text(f'write_file("solution.py", {code!r})')
+            run_result = executor.execute_text('run_python("solution.py")')
+            submit_result = executor.execute_text('submit("submission.csv")')
+
+        source = submit_result["result"]["submission_source"]
+        self.assertEqual(write_result["status"], "ok")
+        self.assertEqual(run_result["status"], "ok")
+        self.assertEqual(submit_result["status"], "ok")
+        self.assertEqual(source["path"], "solution.py")
+        self.assertEqual(source["kind"], "python_file")
+        self.assertIn("csv.writer", source["content"])
+        self.assertIn("submission.csv", source["content"])
+
+    def test_submit_source_requires_submission_file_and_csv_writer_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            tasks_dir = workspace / "checker" / "tasks" / "toy"
+            tasks_dir.mkdir(parents=True)
+            (tasks_dir / "task.json").write_text(
+                json.dumps(
+                    {
+                        "id": "toy",
+                        "metric": "mae",
+                        "answer_file": "answers.csv",
+                        "id_column": "id",
+                        "column": "target",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (tasks_dir / "answers.csv").write_text("id,target\n1,10\n2,20\n", encoding="utf-8")
+            executor = CommandExecutor(
+                AgentContext(workspace=workspace, task_id="toy", tasks_dir=workspace / "checker" / "tasks")
+            )
+            unrelated_code = "print('submission.csv exists elsewhere')\n"
+
+            executor.execute_text(f'write_file("notes.py", {unrelated_code!r})')
+            executor.execute_text('run_python("notes.py")')
+            (workspace / "submission.csv").write_text("id,target\n1,10\n2,20\n", encoding="utf-8")
+            submit_result = executor.execute_text('submit("submission.csv")')
+
+        self.assertEqual(submit_result["status"], "ok")
+        self.assertNotIn("submission_source", submit_result["result"])
+
     def test_edit_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             workspace = Path(tmp_dir)
@@ -546,20 +623,19 @@ class ExecutorTest(unittest.TestCase):
         self.assertEqual(file_result["result"]["returncode"], 0)
         self.assertIn("from file", file_result["result"]["stdout"])
 
-    def test_run_python_blocks_project_files_outside_workspace(self) -> None:
+    @patch("agent.executor.subprocess.run")
+    def test_run_python_uses_configured_code_timeout(self, run_mock: Mock) -> None:
+        run_mock.return_value = Mock(returncode=0, stdout="ok", stderr="")
         with tempfile.TemporaryDirectory() as tmp_dir:
-            project_root = Path(tmp_dir)
-            workspace = project_root / "current_run"
-            other_run = project_root / "other_run"
-            workspace.mkdir()
-            other_run.mkdir()
-            (other_run / "submission.csv").write_text("secret", encoding="utf-8")
-            executor = CommandExecutor(AgentContext(workspace=workspace, project_root=project_root))
+            executor = CommandExecutor(
+                AgentContext(workspace=Path(tmp_dir), time_limit_seconds=123)
+            )
 
-            result = executor.execute_text('run_python("print(open(\'../other_run/submission.csv\').read())")')
+            result = executor.execute_text('run_python("print(1)")')
 
-        self.assertEqual(result["result"]["returncode"], 1)
-        self.assertIn("outside isolated workspace", result["result"]["stderr"])
+        self.assertEqual(result["status"], "ok")
+        timeout = run_mock.call_args.kwargs["timeout"]
+        self.assertEqual(timeout, 123)
 
     def test_step_budget_exceeded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -780,6 +856,35 @@ submit("submission.csv")'''
             self.assertTrue(state.workspace.name.endswith("attempt-2"))
             self.assertTrue((state.workspace / "train.csv").exists())
             self.assertFalse((state.workspace / "solution.py").exists())
+
+
+class WebServerFileBrowserTest(unittest.TestCase):
+    def test_workspace_file_listing_and_preview(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            (workspace / "solution.py").write_text("print('ok')\n", encoding="utf-8")
+            (workspace / "model.bin").write_bytes(b"\x00\x01")
+
+            files = list_workspace_files(workspace)
+            preview = workspace_file_preview(workspace, "solution.py")
+
+        by_path = {item["path"]: item for item in files}
+        self.assertTrue(by_path["solution.py"]["previewable"])
+        self.assertFalse(by_path["model.bin"]["previewable"])
+        self.assertEqual(preview["path"], "solution.py")
+        self.assertEqual(preview["content"], "print('ok')\n")
+
+    def test_workspace_file_resolution_rejects_paths_outside_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            (workspace / "inside.txt").write_text("ok", encoding="utf-8")
+
+            resolved = resolve_workspace_file(workspace, "inside.txt")
+
+            with self.assertRaisesRegex(ValueError, "outside workspace"):
+                resolve_workspace_file(workspace, "../outside.txt")
+
+        self.assertEqual(resolved.name, "inside.txt")
 
 
 class HintEngineTest(unittest.TestCase):

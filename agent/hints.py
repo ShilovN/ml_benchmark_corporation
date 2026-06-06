@@ -451,6 +451,8 @@ def _has_categorical_processing_signal(python_sources: list[str]) -> bool:
         "labelencoder",
         "targetencoder",
         "catboost",
+        "xgboost",
+        "lightgbm",
         "category_encoders",
         "columntransformer",
         "dictvectorizer",
