@@ -30,6 +30,7 @@ from web_server import (
     apply_mode_instruction,
     best_repeated_submission,
     current_fixed_stage,
+    detect_fixed_stage_violation,
     extract_commands,
     extract_reported_stage,
     handle_successful_submit,
@@ -37,12 +38,17 @@ from web_server import (
     prepare_run_workspace,
     record_fixed_stage_attempt,
     repeated_attempt_workspace_id,
+    should_isolate_llm_history,
+    validate_reported_stage,
+    validate_mode_command_batch,
+    list_workspace_files,
     resolve_workspace_file,
     should_isolate_llm_history,
     validate_mode_command,
     validate_mode_command_batch,
     validate_reported_stage,
     workspace_file_preview,
+    zero_fixed_transition_result_if_needed,
 )
 
 
@@ -801,7 +807,7 @@ submit("submission.csv")'''
         fixed_prompt = apply_mode_instruction(fixed_state, "base")
         flexible_prompt = apply_mode_instruction(flexible_state, "base")
 
-        self.assertIn("самостоятельно определи текущий этап", fixed_prompt)
+        self.assertIn("Самостоятельно определи текущий этап", fixed_prompt)
         self.assertNotIn("текущий обязательный этап EDA", fixed_prompt)
         self.assertNotIn("должна быть `EDA`", fixed_prompt)
         self.assertIn("Режим flexible", flexible_prompt)
@@ -814,17 +820,6 @@ submit("submission.csv")'''
         self.assertEqual(extract_reported_stage('EDA\nИзучу данные.\nlist_files(".")'), "EDA")
         self.assertIsNone(validate_reported_stage(state, 'EDA\nИзучу данные.\nlist_files(".")'))
 
-    def test_fixed_transitions_rejects_wrong_reported_stage(self) -> None:
-        state = self._state("fixed-transitions")
-
-        error = validate_reported_stage(state, 'TRAIN\nОбучу модель.\nrun_python("solution.py")')
-
-        self.assertIsNotNone(error)
-        self.assertEqual(error["command"], "stage_check")
-        self.assertIn("модель указала TRAIN", error["error"])
-        self.assertIn("не совпадает с этапом среды", error["error"])
-        self.assertNotIn("ожидает EDA", error["error"])
-
     def test_stage_check_rejects_missing_stage(self) -> None:
         state = self._state("flexible")
 
@@ -832,6 +827,28 @@ submit("submission.csv")'''
 
         self.assertIsNotNone(error)
         self.assertIn("Первая непустая строка", error["error"])
+
+    def test_fixed_transition_early_stage_zeroes_submit_result(self) -> None:
+        state = self._state("fixed-transitions")
+        violation = detect_fixed_stage_violation(state, 'FEATURES\nrun_python("print(1)")')
+
+        self.assertIsNotNone(violation)
+        state.fixed_stage_violations.append(violation)
+        result = {"status": "ok", "command": "submit", "result": {"metric": "f1_score", "value": 0.71}}
+        zeroed = zero_fixed_transition_result_if_needed(state, result)
+
+        self.assertEqual(zeroed["result"]["raw_value"], 0.71)
+        self.assertEqual(zeroed["result"]["value"], 0.0)
+        self.assertTrue(zeroed["result"]["score_zeroed"])
+        self.assertEqual(zeroed["result"]["stage_violations"][0]["declared_stage"], "FEATURES")
+        self.assertEqual(zeroed["result"]["stage_violations"][0]["expected_stage"], "EDA")
+
+    def test_fixed_transition_current_stage_does_not_zero_result(self) -> None:
+        state = self._state("fixed-transitions")
+
+        self.assertIsNone(detect_fixed_stage_violation(state, 'EDA\nread_file("train.csv")'))
+        self.assertIsNone(detect_fixed_stage_violation(state, 'read_file("train.csv")'))
+
     def test_repeated_prompt_requires_current_attempt_submit(self) -> None:
         state = self._state("repeated")
         state.requests = 1
@@ -885,9 +902,7 @@ submit("submission.csv")'''
                 run_id="run",
                 config=config,
                 workspace=first_workspace,
-                executor=executor,
-                docker_container=docker_container,
-                created_container=created_container,
+                executor=manager._make_executor(config, first_workspace, repeated_attempt_workspace_id("run", 1))[0],
             )
             state.requests = 1
 

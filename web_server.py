@@ -151,6 +151,7 @@ class RunState:
     final_submit_requested: bool = False
     fixed_stage_index: int = 0
     fixed_stage_attempts: dict[str, int] = field(default_factory=dict)
+    fixed_stage_violations: list[dict[str, Any]] = field(default_factory=list)
     docker_container: str | None = None
     created_container: bool = False
 
@@ -371,6 +372,11 @@ class AgentRunManager:
                     history.append({"role": "user", "content": user_message})
                     history.append({"role": "assistant", "content": assistant_text})
 
+                stage_violation = detect_fixed_stage_violation(state, assistant_text)
+                if stage_violation:
+                    state.fixed_stage_violations.append(stage_violation)
+                    add_event(state, "validation", "Fixed-transition stage violation", stage_violation)
+
                 try:
                     commands = extract_commands(assistant_text)
                 except ValueError as exc:
@@ -410,23 +416,20 @@ class AgentRunManager:
                     break
 
                 results: list[dict[str, Any]] = []
-                stage_error = validate_reported_stage(state, assistant_text)
-                if stage_error:
-                    results.append(stage_error)
-                    add_event(state, "stage_error", "Stage check failed", stage_error)
-                else:
-                    for command in commands:
-                        add_event(state, "command", command.name, {"args": command.args})
-                        validation_error = validate_mode_command(state, command)
-                        if validation_error:
-                            result = validation_error
-                        else:
-                            result = state.executor.execute(command)
-                        results.append(result)
-                        add_event(state, "result", f"{command.name}: {result['status']}", result)
-                        if command.name == "submit" and result["status"] == "ok":
-                            handle_successful_submit(state, result)
-                            break
+                for command in commands:
+                    add_event(state, "command", command.name, {"args": command.args})
+                    validation_error = validate_mode_command(state, command)
+                    if validation_error:
+                        result = validation_error
+                    else:
+                        result = state.executor.execute(command)
+                    if command.name == "submit" and result["status"] == "ok":
+                        result = zero_fixed_transition_result_if_needed(state, result)
+                    results.append(result)
+                    add_event(state, "result", f"{command.name}: {result['status']}", result)
+                    if command.name == "submit" and result["status"] == "ok":
+                        handle_successful_submit(state, result)
+                        break
 
                 if state.submitted and state.config.mode != "repeated":
                     break
@@ -919,12 +922,10 @@ def mode_instruction(state: RunState) -> str:
             f"{stage_note}"
         )
     if mode == "fixed-transitions":
-        attempt = current_fixed_stage_attempt(state) + 1
-        minimum = FIXED_STAGE_MIN_ATTEMPTS.get(current_fixed_stage(state), 1)
         return (
-            "Режим fixed-transitions: самостоятельно определи текущий этап по траектории. "
-            "Укажи его первой строкой ответа; среда проверит этап перед выполнением команд. "
-            f"Текущая попытка внутри скрытого этапа: {attempt}; минимум попыток до перехода: {minimum}."
+            "Режим fixed-transitions: первая непустая строка ответа должна быть одним из EDA, FEATURES или TRAIN. "
+            "Самостоятельно определи текущий этап по состоянию решения и работай только над ним. "
+            "Этапы идут строго по порядку: EDA -> FEATURES -> TRAIN; преждевременный переход обнулит итоговый score."
         )
     if mode == "flexible":
         return (
@@ -976,6 +977,54 @@ def record_fixed_stage_attempt(state: RunState) -> None:
     state.fixed_stage_attempts[stage] = current_fixed_stage_attempt(state) + 1
 
 
+def detect_fixed_stage_violation(state: RunState, response_text: str) -> dict[str, Any] | None:
+    if state.config.mode != "fixed-transitions":
+        return None
+    declared_stage = extract_reported_stage(response_text)
+    expected_stage = current_fixed_stage(state)
+    if declared_stage is None or declared_stage == expected_stage:
+        return None
+    return {
+        "reason": "fixed_stage_early_transition",
+        "error": (
+            f"Model declared stage {declared_stage}, but fixed-transitions currently requires {expected_stage}. "
+            "Final score will be reset to 0.0."
+        ),
+        "declared_stage": declared_stage,
+        "expected_stage": expected_stage,
+        "request": state.requests,
+    }
+
+
+def zero_fixed_transition_result_if_needed(state: RunState, result: dict[str, Any]) -> dict[str, Any]:
+    if state.config.mode != "fixed-transitions" or not state.fixed_stage_violations:
+        return result
+    details = result.get("result")
+    if not isinstance(details, dict):
+        return result
+
+    zeroed = dict(result)
+    zeroed_details = dict(details)
+    raw_value = zeroed_details.get("value")
+    zeroed_details["raw_value"] = raw_value
+    zeroed_details["value"] = 0.0
+    zeroed_details["score_zeroed"] = True
+    zeroed_details["zero_reason"] = "fixed_transition_early_stage"
+    zeroed_details["stage_violations"] = state.fixed_stage_violations
+    zeroed["result"] = zeroed_details
+    add_event(
+        state,
+        "validation",
+        "Fixed-transition score zeroed",
+        {
+            "raw_value": raw_value,
+            "value": 0.0,
+            "violations": state.fixed_stage_violations,
+        },
+    )
+    return zeroed
+
+
 def extract_reported_stage(response_text: str) -> str | None:
     for line in response_text.splitlines():
         stage = line.strip().strip("`").upper()
@@ -1005,7 +1054,7 @@ def validate_reported_stage(state: RunState, response_text: str) -> dict[str, An
                 "command": "stage_check",
                 "error": (
                     f"Неверно определен этап: модель указала {reported_stage}, "
-                    "но он не совпадает с этапом среды. Команды не выполнены."
+                    "но он не совпадает с этапом среды. Итоговый score будет обнулен."
                 ),
             }
     return None
