@@ -2574,7 +2574,7 @@ function eventMainText(event){
 function eventBodyHtml(event){
   const data = event.data || {};
   if(event.kind === 'prompt') return renderPromptHtml(data.content || '', false);
-  if(event.kind === 'llm') return `<div class="chat-body structured">${renderMarkdownish(data.content || '', {strip:false})}</div>`;
+  if(event.kind === 'llm') return `<div class="chat-body structured">${renderMarkdownish(data.content || '')}</div>`;
   if(event.kind === 'result') {
     if(data.command === 'submit') return renderSubmissionHtml(data);
     return '';
@@ -2625,7 +2625,7 @@ function renderTurn(turn, index){
           <div class="chat-avatar">LLM</div>
           <div class="bubble">
             <div class="chat-title">LLM</div>
-            <div class="chat-body structured">${renderMarkdownish(llmText, {strip:false})}</div>
+            <div class="chat-body structured">${renderMarkdownish(llmText)}</div>
             ${turn.notes.length ? `<div class="command-notes">${turn.notes.join('')}</div>` : ''}
           </div>
         </div>
