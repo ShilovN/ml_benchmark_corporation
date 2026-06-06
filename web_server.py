@@ -907,24 +907,10 @@ def mode_instruction(state: RunState) -> str:
             f"{stage_note}"
         )
     if mode == "fixed-transitions":
-        stage = current_fixed_stage(state)
-        attempt = current_fixed_stage_attempt(state) + 1
-        minimum = FIXED_STAGE_MIN_ATTEMPTS.get(stage, 1)
-        if stage == "EDA":
-            detail = (
-                "это этап 1/3. Изучи файлы, целевую колонку, размер данных, пропуски, распределения и первые идеи признаков. "
-                "На этом этапе submit запрещен."
-            )
-        elif stage == "FEATURES":
-            detail = (
-                "это этап 2/3. Подготовь и сравни признаки, предобработку и скрипты для обучения/инференса. "
-                "На этом этапе submit еще запрещен."
-            )
-        else:
-            detail = "обучи модель, создай submission.csv, проверь формат и вызови submit"
         return (
-            f"Режим fixed-transitions: текущий обязательный этап {stage}. Задача этапа: {detail}. "
-            f"Первая строка ответа должна быть `{stage}`."
+            "Режим fixed-transitions: первая непустая строка ответа должна быть одним из EDA, FEATURES или TRAIN. "
+            "Самостоятельно определи текущий этап по состоянию решения и работай только над ним. "
+            "Этапы идут строго по порядку: EDA -> FEATURES -> TRAIN; преждевременный переход обнулит итоговый score."
         )
     if mode == "flexible":
         return (
@@ -979,7 +965,7 @@ def record_fixed_stage_attempt(state: RunState) -> None:
 def detect_fixed_stage_violation(state: RunState, response_text: str) -> dict[str, Any] | None:
     if state.config.mode != "fixed-transitions":
         return None
-    declared_stage = declared_fixed_stage(response_text)
+    declared_stage = extract_reported_stage(response_text)
     expected_stage = current_fixed_stage(state)
     if declared_stage is None or declared_stage == expected_stage:
         return None
@@ -1024,32 +1010,38 @@ def zero_fixed_transition_result_if_needed(state: RunState, result: dict[str, An
     return zeroed
 
 
-def declared_fixed_stage(response_text: str) -> str | None:
-    stage_area = response_text.split("```", 1)[0].lower()
-    lines = [line.strip() for line in stage_area.splitlines()[:8] if line.strip()]
-    for line in lines:
-        stage = fixed_stage_from_text(line)
-        if stage:
-            return stage
+def extract_reported_stage(response_text: str) -> str | None:
+    for line in response_text.splitlines():
+        stage = line.strip().strip("`").upper()
+        if not stage:
+            continue
+        return stage if stage in FIXED_TRANSITION_STAGES else None
     return None
 
 
-def fixed_stage_from_text(text: str) -> str | None:
-    normalized = text.strip().lower().rstrip(":.,;")
-    if normalized in {"eda", "эда"}:
-        return "EDA"
-    if normalized in {"features", "feature", "feature engineering", "фичи", "признаки"}:
-        return "FEATURES"
-    if normalized in {"train", "training", "обучение", "submit", "submission"}:
-        return "TRAIN"
-    if "этап" not in normalized and "stage" not in normalized and "сейчас" not in normalized:
+def validate_reported_stage(state: RunState, response_text: str) -> dict[str, Any] | None:
+    if state.config.mode not in {"fixed-transitions", "flexible"}:
         return None
-    if "eda" in normalized or "анализ данных" in normalized or "развед" in normalized:
-        return "EDA"
-    if "features" in normalized or "feature engineering" in normalized or "признак" in normalized or "фич" in normalized:
-        return "FEATURES"
-    if "train" in normalized or "обуч" in normalized or "submission" in normalized or "submit" in normalized:
-        return "TRAIN"
+
+    reported_stage = extract_reported_stage(response_text)
+    if reported_stage is None:
+        return {
+            "status": "error",
+            "command": "stage_check",
+            "error": "Первая непустая строка ответа должна быть EDA, FEATURES или TRAIN.",
+        }
+
+    if state.config.mode == "fixed-transitions":
+        expected_stage = current_fixed_stage(state)
+        if reported_stage != expected_stage:
+            return {
+                "status": "error",
+                "command": "stage_check",
+                "error": (
+                    f"Неверно определен этап: модель указала {reported_stage}, "
+                    "но он не совпадает с этапом среды. Итоговый score будет обнулен."
+                ),
+            }
     return None
 
 
