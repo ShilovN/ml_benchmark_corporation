@@ -28,7 +28,9 @@ from web_server import (
     apply_mode_after_results,
     apply_mode_instruction,
     current_fixed_stage,
+    extract_reported_stage,
     validate_mode_command,
+    validate_reported_stage,
 )
 
 
@@ -512,7 +514,7 @@ class WebServerModeTest(unittest.TestCase):
             "repeated_attempt_limit",
         )
 
-    def test_mode_instruction_mentions_current_mode(self) -> None:
+    def test_mode_instruction_does_not_reveal_fixed_stage(self) -> None:
         fixed_state = self._state("fixed-transitions")
         flexible_state = self._state("flexible")
         repeated_state = self._state("repeated")
@@ -520,11 +522,37 @@ class WebServerModeTest(unittest.TestCase):
         fixed_prompt = apply_mode_instruction(fixed_state, "base")
         flexible_prompt = apply_mode_instruction(flexible_state, "base")
 
-        self.assertIn("текущий обязательный этап EDA", fixed_prompt)
-        self.assertIn("Первая строка ответа должна быть `EDA`", fixed_prompt)
+        self.assertIn("самостоятельно определи текущий этап", fixed_prompt)
+        self.assertNotIn("текущий обязательный этап EDA", fixed_prompt)
+        self.assertNotIn("должна быть `EDA`", fixed_prompt)
         self.assertIn("Режим flexible", flexible_prompt)
         self.assertIn("Самостоятельно выбери актуальный этап", flexible_prompt)
         self.assertIn(f"попытка 1/{REPEATED_MAX_ATTEMPTS}", apply_mode_instruction(repeated_state, "base"))
+
+    def test_fixed_transitions_accepts_correct_reported_stage(self) -> None:
+        state = self._state("fixed-transitions")
+
+        self.assertEqual(extract_reported_stage('EDA\nИзучу данные.\nlist_files(".")'), "EDA")
+        self.assertIsNone(validate_reported_stage(state, 'EDA\nИзучу данные.\nlist_files(".")'))
+
+    def test_fixed_transitions_rejects_wrong_reported_stage(self) -> None:
+        state = self._state("fixed-transitions")
+
+        error = validate_reported_stage(state, 'TRAIN\nОбучу модель.\nrun_python("solution.py")')
+
+        self.assertIsNotNone(error)
+        self.assertEqual(error["command"], "stage_check")
+        self.assertIn("модель указала TRAIN", error["error"])
+        self.assertIn("не совпадает с этапом среды", error["error"])
+        self.assertNotIn("ожидает EDA", error["error"])
+
+    def test_stage_check_rejects_missing_stage(self) -> None:
+        state = self._state("flexible")
+
+        error = validate_reported_stage(state, 'Посмотрю данные.\nlist_files(".")')
+
+        self.assertIsNotNone(error)
+        self.assertIn("Первая непустая строка", error["error"])
 
 
 class HintEngineTest(unittest.TestCase):

@@ -283,20 +283,25 @@ class AgentRunManager:
                     continue
 
                 results: list[dict[str, Any]] = []
-                for command in commands:
-                    add_event(state, "command", command.name, {"args": command.args})
-                    validation_error = validate_mode_command(state, command)
-                    if validation_error:
-                        result = validation_error
-                    else:
-                        result = state.executor.execute(command)
-                    results.append(result)
-                    add_event(state, "result", f"{command.name}: {result['status']}", result)
-                    if command.name == "submit" and result["status"] == "ok":
-                        state.submitted = True
-                        state.submission_result = result
-                        state.stop_reason = "submitted"
-                        break
+                stage_error = validate_reported_stage(state, assistant_text)
+                if stage_error:
+                    results.append(stage_error)
+                    add_event(state, "stage_error", "Stage check failed", stage_error)
+                else:
+                    for command in commands:
+                        add_event(state, "command", command.name, {"args": command.args})
+                        validation_error = validate_mode_command(state, command)
+                        if validation_error:
+                            result = validation_error
+                        else:
+                            result = state.executor.execute(command)
+                        results.append(result)
+                        add_event(state, "result", f"{command.name}: {result['status']}", result)
+                        if command.name == "submit" and result["status"] == "ok":
+                            state.submitted = True
+                            state.submission_result = result
+                            state.stop_reason = "submitted"
+                            break
 
                 if state.submitted:
                     break
@@ -593,16 +598,9 @@ def mode_instruction(state: RunState) -> str:
             "Каждая попытка должна улучшать или проверять решение; при готовности вызывай submit."
         )
     if mode == "fixed-transitions":
-        stage = current_fixed_stage(state)
-        if stage == "EDA":
-            detail = "изучи файлы и данные; не вызывай submit на этом этапе"
-        elif stage == "FEATURES":
-            detail = "подготовь признаки, скрипты или промежуточные файлы; submit пока запрещен"
-        else:
-            detail = "обучи модель, создай submission.csv, проверь формат и вызови submit"
         return (
-            f"Режим fixed-transitions: текущий обязательный этап {stage}. Задача этапа: {detail}. "
-            f"Первая строка ответа должна быть `{stage}`."
+            "Режим fixed-transitions: самостоятельно определи текущий этап по траектории. "
+            "Укажи его первой строкой ответа; среда проверит этап перед выполнением команд."
         )
     if mode == "flexible":
         return (
@@ -615,6 +613,41 @@ def mode_instruction(state: RunState) -> str:
 def current_fixed_stage(state: RunState) -> str:
     index = min(state.fixed_stage_index, len(FIXED_TRANSITION_STAGES) - 1)
     return FIXED_TRANSITION_STAGES[index]
+
+
+def extract_reported_stage(response_text: str) -> str | None:
+    for line in response_text.splitlines():
+        stage = line.strip().strip("`").upper()
+        if not stage:
+            continue
+        return stage if stage in FIXED_TRANSITION_STAGES else None
+    return None
+
+
+def validate_reported_stage(state: RunState, response_text: str) -> dict[str, Any] | None:
+    if state.config.mode not in {"fixed-transitions", "flexible"}:
+        return None
+
+    reported_stage = extract_reported_stage(response_text)
+    if reported_stage is None:
+        return {
+            "status": "error",
+            "command": "stage_check",
+            "error": "Первая непустая строка ответа должна быть EDA, FEATURES или TRAIN.",
+        }
+
+    if state.config.mode == "fixed-transitions":
+        expected_stage = current_fixed_stage(state)
+        if reported_stage != expected_stage:
+            return {
+                "status": "error",
+                "command": "stage_check",
+                "error": (
+                    f"Неверно определен этап: модель указала {reported_stage}, "
+                    "но он не совпадает с этапом среды. Команды не выполнены."
+                ),
+            }
+    return None
 
 
 def validate_mode_command(state: RunState, command: ParsedCommand) -> dict[str, Any] | None:
