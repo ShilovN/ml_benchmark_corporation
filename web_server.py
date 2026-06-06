@@ -41,7 +41,7 @@ from agent.llm_client import (
     open_url,
     resolve_model_url,
 )
-from agent.parser import COMMAND_NAMES, FENCED_BLOCK_RE, ParsedCommand, parse_command, parse_model_response
+from agent.parser import COMMAND_NAMES, FENCED_BLOCK_RE, ParsedCommand, parse_command
 
 
 DEFAULT_TASKS_DIR = Path("checker/tasks")
@@ -65,6 +65,26 @@ SINGLE_SHOT_ALLOWED_COMMANDS = {"write_file", "run_python", "submit"}
 PRODUCTIVE_SOLUTION_COMMANDS = {"write_file", "edit_file", "run_python"}
 FIXED_TRANSITION_STAGES = ["EDA", "FEATURES", "TRAIN"]
 FIXED_STAGE_MIN_ATTEMPTS = {"EDA": 3, "FEATURES": 5, "TRAIN": 1}
+LOWER_IS_BETTER_METRICS = {
+    "mae",
+    "mean_absolute_error",
+    "mse",
+    "mean_squared_error",
+    "rmse",
+    "root_mean_squared_error",
+    "log_loss",
+}
+HIGHER_IS_BETTER_METRICS = {
+    "accuracy",
+    "precision",
+    "recall",
+    "f1",
+    "f1_score",
+    "roc_auc",
+    "roc_auc_score",
+    "r2",
+    "r2_score",
+}
 FIXED_STAGE_ALLOWED_COMMANDS = {
     "EDA": {
         "list_files",
@@ -124,6 +144,7 @@ class RunState:
     total_tokens: int = 0
     submitted: bool = False
     submission_result: dict[str, Any] | None = None
+    repeated_submissions: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None
     thread: threading.Thread | None = None
     stop_requested: bool = False
@@ -193,24 +214,9 @@ class AgentRunManager:
 
     def start_run(self, config: RunConfig) -> RunState:
         run_id = uuid.uuid4().hex[:12]
-        workspace = prepare_run_workspace(self.project_root, self.tasks_dir, self.run_root, config.task_id, run_id)
-        docker_container = None
-        created_container = False
-        if self.use_docker:
-            docker_container = default_container_name(config.task_id, run_id)
-            create_container(name=docker_container, image=self.docker_image, workspace=workspace)
-            created_container = True
-        executor = CommandExecutor(
-            AgentContext(
-                workspace=workspace,
-                task_id=config.task_id,
-                tasks_dir=self.tasks_dir,
-                max_steps=config.max_steps,
-                time_limit_seconds=config.time_limit_seconds,
-                history_file=Path("agent_history.txt"),
-                docker_container=docker_container,
-            )
-        )
+        workspace_id = repeated_attempt_workspace_id(run_id, 1) if config.mode == "repeated" else run_id
+        workspace = prepare_run_workspace(self.project_root, self.tasks_dir, self.run_root, config.task_id, workspace_id)
+        executor, docker_container, created_container = self._make_executor(config, workspace, workspace_id)
         state = RunState(
             run_id=run_id,
             config=config,
@@ -225,6 +231,27 @@ class AgentRunManager:
             self.runs[run_id] = state
         thread.start()
         return state
+
+    def _make_executor(self, config: RunConfig, workspace: Path, container_id: str) -> tuple[CommandExecutor, str | None, bool]:
+        docker_container = None
+        created_container = False
+        if self.use_docker:
+            docker_container = default_container_name(config.task_id, container_id)
+            create_container(name=docker_container, image=self.docker_image, workspace=workspace)
+            created_container = True
+        executor = CommandExecutor(
+            AgentContext(
+                workspace=workspace,
+                project_root=self.project_root,
+                task_id=config.task_id,
+                tasks_dir=self.tasks_dir,
+                max_steps=config.max_steps,
+                time_limit_seconds=config.time_limit_seconds,
+                history_file=Path("agent_history.txt"),
+                docker_container=docker_container,
+            )
+        )
+        return executor, docker_container, created_container
 
     def get_run(self, run_id: str) -> RunState | None:
         with self.lock:
@@ -257,6 +284,17 @@ class AgentRunManager:
                 "docker_container": state.docker_container,
             },
         )
+        if state.config.mode == "repeated":
+            add_event(
+                state,
+                "system",
+                "Repeated isolated attempt started",
+                {
+                    "attempt": 1,
+                    "max_attempts": REPEATED_MAX_ATTEMPTS,
+                    "docker_container": state.docker_container,
+                },
+            )
 
         try:
             while not state.stop_requested:
@@ -293,10 +331,11 @@ class AgentRunManager:
                     )
 
                 add_event(state, "prompt", "Prompt sent to LLM", {"content": user_message})
+                request_history = [] if should_isolate_llm_history(state) else history
                 response = chat_completion(
                     user_message,
                     system_message=SYSTEM_MESSAGE,
-                    history=history,
+                    history=request_history,
                     url=build_chat_completions_url(
                         state.config.llm_url or resolve_model_url(state.config.model)
                     ),
@@ -314,8 +353,11 @@ class AgentRunManager:
 
                 assistant_text = extract_assistant_text(response)
                 add_event(state, "llm", "LLM response", {"content": assistant_text, "usage": usage})
-                history.append({"role": "user", "content": user_message})
-                history.append({"role": "assistant", "content": assistant_text})
+                if should_isolate_llm_history(state):
+                    history = []
+                else:
+                    history.append({"role": "user", "content": user_message})
+                    history.append({"role": "assistant", "content": assistant_text})
 
                 try:
                     commands = extract_commands(assistant_text)
@@ -327,6 +369,11 @@ class AgentRunManager:
                     if state.config.mode == "repeated" and state.requests >= REPEATED_MAX_ATTEMPTS:
                         state.stop_reason = "repeated_attempt_limit"
                         break
+                    if state.config.mode == "repeated":
+                        self._prepare_next_repeated_attempt(state)
+                        user_message = apply_mode_instruction(state, build_initial_prompt(state.workspace, state.config.task_id))
+                        history = []
+                        continue
                     user_message = apply_mode_instruction(
                         state,
                         "Твой ответ не удалось распарсить как команду.\n"
@@ -337,7 +384,12 @@ class AgentRunManager:
 
                 batch_error = validate_mode_command_batch(state, commands)
                 if batch_error:
-                    add_event(state, "parse_error", "Invalid command batch", batch_error)
+                    add_event(state, "validation", "Invalid command batch", batch_error)
+                    if state.config.mode == "repeated" and state.requests < REPEATED_MAX_ATTEMPTS:
+                        self._prepare_next_repeated_attempt(state)
+                        user_message = apply_mode_instruction(state, build_initial_prompt(state.workspace, state.config.task_id))
+                        history = []
+                        continue
                     if should_retry_after_batch_error(state):
                         user_message = apply_mode_instruction(state, build_batch_error_prompt(batch_error))
                         continue
@@ -355,12 +407,10 @@ class AgentRunManager:
                     results.append(result)
                     add_event(state, "result", f"{command.name}: {result['status']}", result)
                     if command.name == "submit" and result["status"] == "ok":
-                        state.submitted = True
-                        state.submission_result = result
-                        state.stop_reason = "submitted"
+                        handle_successful_submit(state, result)
                         break
 
-                if state.submitted:
+                if state.submitted and state.config.mode != "repeated":
                     break
 
                 if state.config.mode == "single-shot":
@@ -372,6 +422,12 @@ class AgentRunManager:
                     state.stop_reason = mode_stop_reason
                     break
 
+                if state.config.mode == "repeated":
+                    self._prepare_next_repeated_attempt(state)
+                    user_message = apply_mode_instruction(state, build_initial_prompt(state.workspace, state.config.task_id))
+                    history = []
+                    continue
+
                 feedback = state.executor.build_feedback()
                 if state.requests > 1:
                     add_event(state, "feedback", "Feedback hints", feedback)
@@ -379,6 +435,11 @@ class AgentRunManager:
 
             if state.stop_requested:
                 state.status = "stopped"
+            elif state.config.mode == "repeated" and state.submission_result is not None:
+                state.submitted = True
+                state.status = "completed"
+                if state.stop_reason == "not_finished":
+                    state.stop_reason = "submitted"
             elif state.submitted:
                 state.status = "completed"
             elif state.config.mode == "single-shot":
@@ -402,6 +463,34 @@ class AgentRunManager:
         finally:
             if state.created_container and state.docker_container and not self.keep_containers:
                 remove_container(state.docker_container)
+
+    def _prepare_next_repeated_attempt(self, state: RunState) -> None:
+        if state.created_container and state.docker_container and not self.keep_containers:
+            remove_container(state.docker_container)
+        next_attempt = state.requests + 1
+        workspace_id = repeated_attempt_workspace_id(state.run_id, next_attempt)
+        workspace = prepare_run_workspace(
+            self.project_root,
+            self.tasks_dir,
+            self.run_root,
+            state.config.task_id,
+            workspace_id,
+        )
+        executor, docker_container, created_container = self._make_executor(state.config, workspace, workspace_id)
+        state.workspace = workspace
+        state.executor = executor
+        state.docker_container = docker_container
+        state.created_container = created_container
+        add_event(
+            state,
+            "system",
+            "Repeated isolated attempt started",
+            {
+                "attempt": next_attempt,
+                "max_attempts": REPEATED_MAX_ATTEMPTS,
+                "docker_container": state.docker_container,
+            },
+        )
 
     def _force_final_submit(self, state: RunState) -> None:
         if state.submitted:
@@ -643,6 +732,10 @@ def prepare_run_workspace(
     return workspace
 
 
+def repeated_attempt_workspace_id(run_id: str, attempt: int) -> str:
+    return f"{run_id}-attempt-{attempt}"
+
+
 def create_container(*, name: str, image: str, workspace: Path) -> None:
     subprocess.run(
         [
@@ -753,6 +846,10 @@ def apply_mode_instruction(state: RunState, prompt: str) -> str:
     return f"{prompt}\n\n{instruction}"
 
 
+def should_isolate_llm_history(state: RunState) -> bool:
+    return state.config.mode == "repeated"
+
+
 def mode_instruction(state: RunState) -> str:
     mode = state.config.mode
     if mode == "single-shot":
@@ -776,26 +873,26 @@ def mode_instruction(state: RunState) -> str:
         )
     if mode == "repeated":
         attempt = min(state.requests + 1, REPEATED_MAX_ATTEMPTS)
-        if attempt == 1:
-            stage_note = (
-                "Это единственная попытка, где можно в основном читать и изучать файлы. "
-                "К концу ответа сформулируй следующий продуктивный шаг."
-            )
-        elif attempt < REPEATED_MAX_ATTEMPTS:
-            stage_note = (
-                "На этой попытке одних read_file/list_files уже недостаточно. "
-                "Обязательно создай или измени решение продуктивной командой: write_file, edit_file или run_python. "
-                "Сделай baseline, признаки, обучение, валидацию или генерацию submission.csv."
-            )
-        else:
-            stage_note = (
-                "Это последняя попытка. Используй лучшее уже подготовленное решение, "
-                "создай/проверь submission.csv и обязательно вызови submit(\"submission.csv\")."
-            )
+        stage_note = (
+            "Каждая repeated-попытка является полноценным single-shot решением: "
+            "в текущем ответе создай или запусти решение, сформируй submission.csv и обязательно вызови submit(\"submission.csv\"). "
+            "Ответ только с `Мысль: ...` будет отклонён. Submit-only будет отклонён: система не создаёт baseline вместо тебя. "
+            "Это отдельный чистый чат и отдельный чистый workspace; у тебя нет доступа к прошлым попыткам, их файлам, ответам и результатам. "
+            "Не пиши планы на будущие попытки и не обещай улучшить модель позже.\n"
+            "Обязательный формат ответа:\n"
+            "Мысль: делаю полный пайплайн и отправляю решение\n"
+            "```command\n"
+            "run_python(\"\"\"\n"
+            "<python-код: читает train.csv/test.csv, обучает или строит baseline, создает submission.csv>\n"
+            "\"\"\")\n"
+            "submit(\"submission.csv\")\n"
+            "```"
+        )
+        if attempt > 1:
+            stage_note += " Решай задачу с нуля по данным из текущего prompt и отправь полный submit в этом же ответе."
         return (
             f"Режим repeated: попытка {attempt}/{REPEATED_MAX_ATTEMPTS}. "
-            "После каждой попытки ты получаешь результаты команд и можешь улучшить решение в следующей попытке. "
-            "Не трать несколько попыток подряд только на открытие файлов. "
+            "Это не flexible-режим и не пошаговая разработка без отправки. "
             f"{stage_note}"
         )
     if mode == "fixed-transitions":
@@ -956,21 +1053,20 @@ def validate_fixed_transition_command_batch(state: RunState, command_names: list
 
 
 def validate_repeated_command_batch(state: RunState, command_names: list[str]) -> dict[str, Any] | None:
-    attempt = state.requests
     has_productive = any(name in PRODUCTIVE_SOLUTION_COMMANDS for name in command_names)
     has_submit = "submit" in command_names
-    if attempt >= REPEATED_MAX_ATTEMPTS and not has_submit:
+    if not has_submit:
         return {
-            "reason": "repeated_final_missing_submit",
-            "error": "Final repeated attempt must include submit(\"submission.csv\").",
+            "reason": "repeated_missing_submit",
+            "error": "Every repeated attempt is a full single-shot attempt and must include submit(\"submission.csv\").",
             "commands": command_names,
         }
-    if attempt >= 2 and not has_productive and not has_submit:
+    if not has_productive:
         return {
-            "reason": "repeated_no_productive_progress",
+            "reason": "repeated_submit_without_solution",
             "error": (
-                "Repeated mode allows exploration at the beginning, but this attempt must make productive progress. "
-                "Use write_file, edit_file, or run_python to build, validate, or improve the solution."
+                "Repeated submit-only is not accepted. Each isolated attempt must create or run a solution "
+                "with write_file, edit_file, or run_python before submit(\"submission.csv\")."
             ),
             "commands": command_names,
             "productive_commands": sorted(PRODUCTIVE_SOLUTION_COMMANDS),
@@ -983,6 +1079,8 @@ def apply_mode_after_results(state: RunState, results: list[dict[str, Any]]) -> 
         return "single_shot_finished"
 
     if state.config.mode == "repeated" and state.requests >= REPEATED_MAX_ATTEMPTS:
+        if state.submission_result is not None:
+            state.submitted = True
         return "repeated_attempt_limit"
 
     if state.config.mode != "fixed-transitions":
@@ -1016,13 +1114,91 @@ def apply_mode_after_results(state: RunState, results: list[dict[str, Any]]) -> 
     return None
 
 
+def handle_successful_submit(state: RunState, result: dict[str, Any]) -> None:
+    if state.config.mode == "repeated":
+        state.repeated_submissions.append(result)
+        state.submission_result = best_repeated_submission(state.repeated_submissions)
+        add_event(
+            state,
+            "system",
+            "Repeated attempt submitted",
+            {
+                "attempt": len(state.repeated_submissions),
+                "max_attempts": REPEATED_MAX_ATTEMPTS,
+                "best": state.submission_result,
+            },
+        )
+        if state.requests >= REPEATED_MAX_ATTEMPTS:
+            state.submitted = True
+            state.stop_reason = "submitted"
+        return
+
+    state.submitted = True
+    state.submission_result = result
+    state.stop_reason = "submitted"
+
+
+def best_repeated_submission(submissions: list[dict[str, Any]]) -> dict[str, Any] | None:
+    ok_submissions = [item for item in submissions if item.get("status") == "ok"]
+    if not ok_submissions:
+        return submissions[-1] if submissions else None
+
+    metric_name = next(
+        (name for name in (submission_metric_name(item) for item in ok_submissions) if name),
+        "",
+    )
+    lower_is_better = is_lower_better_metric(metric_name)
+    invalid_score = float("inf") if lower_is_better else float("-inf")
+
+    def sortable_value(item: dict[str, Any]) -> float:
+        value = submission_metric_value(item)
+        return invalid_score if value is None else value
+
+    if lower_is_better:
+        return min(ok_submissions, key=sortable_value)
+    return max(ok_submissions, key=sortable_value)
+
+
+def submission_metric_name(item: dict[str, Any]) -> str:
+    details = item.get("result")
+    if isinstance(details, dict):
+        metric = details.get("metric")
+    else:
+        metric = item.get("metric")
+    return str(metric or "").strip().lower().replace("-", "_")
+
+
+def submission_metric_value(item: dict[str, Any]) -> float | None:
+    details = item.get("result")
+    if isinstance(details, dict):
+        value = details.get("value")
+    else:
+        value = item.get("value")
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number:
+        return None
+    return number
+
+
+def is_lower_better_metric(metric_name: str) -> bool:
+    metric = metric_name.strip().lower().replace("-", "_")
+    if metric in HIGHER_IS_BETTER_METRICS:
+        return False
+    if metric in LOWER_IS_BETTER_METRICS:
+        return True
+    return True
+
+
 def should_force_final_submit(state: RunState) -> bool:
     if state.config.mode == "single-shot":
         return False
     if state.config.mode == "fixed-transitions":
         return False
-    if state.config.mode == "repeated" and not (state.workspace / "submission.csv").exists():
-        return has_productive_history(state)
+    if state.config.mode == "repeated":
+        return False
     return True
 
 
@@ -1037,7 +1213,11 @@ def mode_failure_message(state: RunState) -> str:
     if state.config.mode == "single-shot":
         return "Single-shot response did not produce executable commands or submission.csv."
     if state.config.mode == "repeated":
-        return "Repeated mode ended without productive solution commands or submission.csv."
+        return (
+            "Repeated mode ended because none of the isolated attempts produced a valid full solution. "
+            "Each attempt must include a productive command such as run_python(...) or write_file(...), "
+            "create submission.csv, and then submit(\"submission.csv\")."
+        )
     if state.config.mode == "fixed-transitions":
         return "Fixed-transitions mode ended before the model produced its own submit(\"submission.csv\")."
     return "Run ended before a valid submission was produced."
@@ -1098,18 +1278,15 @@ def build_followup_prompt(results: list[dict[str, Any]], feedback: dict[str, Any
 
 def repeated_followup_opener(state: RunState) -> str:
     next_attempt = min(state.requests + 1, REPEATED_MAX_ATTEMPTS)
-    if next_attempt >= REPEATED_MAX_ATTEMPTS:
-        return (
-            "Это последняя repeated-попытка. Верни короткую строку `Мысль: ...`, затем команды: "
-            "создай или проверь submission.csv и обязательно вызови submit(\"submission.csv\")."
-        )
-    if next_attempt >= 2:
-        return (
-            "Продолжай repeated-решение. Верни короткую строку `Мысль: ...`, затем команды с продуктивным шагом: "
-            "write_file, edit_file или run_python для baseline, признаков, обучения, валидации или submission.csv. "
-            "Не трать попытку только на открытие файлов."
-        )
-    return "Продолжай решение. Верни короткую строку `Мысль: ...`, затем следующую команду или команды."
+    final = " Это последняя попытка." if next_attempt >= REPEATED_MAX_ATTEMPTS else ""
+    return (
+        f"Продолжай repeated: попытка {next_attempt}/{REPEATED_MAX_ATTEMPTS}.{final} "
+        "Это независимый чистый single-shot запуск без доступа к предыдущим попыткам. "
+        "Не описывай, что улучшишь модель потом. В этом же ответе сделай конкретную попытку решения. "
+        "Submit-only не засчитывается, сначала создай submission.csv сам. "
+        "Верни короткую строку `Мысль: ...`, затем полный single-shot набор команд: "
+        "создай/запусти решение, создай submission.csv и обязательно заверши ответ командой submit(\"submission.csv\")."
+    )
 
 
 def fixed_transition_followup_opener(state: RunState) -> str:
@@ -1421,18 +1598,15 @@ def extract_assistant_text(response: dict[str, Any]) -> str:
 
 
 def extract_commands(text: str) -> list[ParsedCommand]:
-    try:
-        return [parse_model_response(text)]
-    except ValueError as first_error:
-        commands: list[ParsedCommand] = []
-        for candidate in command_candidates(text):
-            try:
-                commands.append(parse_command(candidate))
-            except ValueError:
-                continue
-        if commands:
-            return commands
-        raise first_error
+    commands: list[ParsedCommand] = []
+    for candidate in command_candidates(text):
+        try:
+            commands.append(parse_command(candidate))
+        except ValueError:
+            continue
+    if commands:
+        return commands
+    raise ValueError("No executable command found in response. Put each command on its own line or inside a ```command``` block.")
 
 
 def command_candidates(text: str) -> list[str]:
@@ -1609,11 +1783,12 @@ def render_agent_page() -> str:
     .thinking-dots span:nth-child(3) { animation-delay:.32s; }
     @keyframes thinking-dot { 0%, 80%, 100% { transform:translateY(0); opacity:.35; } 40% { transform:translateY(-4px); opacity:1; } }
     @keyframes thinking-pulse { 0%, 100% { transform:scale(.8); opacity:.45; } 50% { transform:scale(1.15); opacity:1; } }
-    .event.command, .event.result, .event.feedback, .event.system, .event.error, .event.parse_error { border:1px solid var(--border); border-radius:10px; padding:10px 12px; background:white; }
+    .event.command, .event.result, .event.feedback, .event.system, .event.error, .event.parse_error, .event.validation { border:1px solid var(--border); border-radius:10px; padding:10px 12px; background:white; }
     .event.command { border-left:4px solid #c2410c; }
     .event.result { border-left:4px solid #067647; }
     .event.feedback { border-left:4px solid #7c3aed; }
     .event.system { border-left:4px solid #64748b; }
+    .event.validation { border-left:4px solid #d97706; }
     .event.error, .event.parse_error { border-left:4px solid var(--bad); }
     .event-head { display:flex; justify-content:space-between; gap:10px; color:var(--muted); font-size:13px; margin-bottom:6px; }
     .kind { font-weight:800; color:var(--accent); text-transform:uppercase; }
@@ -2258,7 +2433,7 @@ function eventMainText(event){
     const hints = (data.hints || []).map(h => `- ${h.stage}: ${h.message}`).join(String.fromCharCode(10));
     return hints || JSON.stringify(data, null, 2);
   }
-  if(event.kind === 'error' || event.kind === 'parse_error') return data.error || JSON.stringify(data, null, 2);
+  if(event.kind === 'error' || event.kind === 'parse_error' || event.kind === 'validation') return data.error || JSON.stringify(data, null, 2);
   return JSON.stringify(data, null, 2);
 }
 function eventBodyHtml(event){
@@ -2407,6 +2582,7 @@ function eventLabel(kind){
     feedback: 'Hints',
     system: 'System',
     error: 'Error',
+    validation: 'Validation',
     parse_error: 'Parse error'
   };
   return labels[kind] || kind;
@@ -2576,7 +2752,7 @@ function render(run){
     if(event.kind === 'result' && event.data?.command === 'submit') {
       continue;
     }
-    if(event.kind === 'error' || event.kind === 'parse_error' || event.kind === 'system') {
+    if(event.kind === 'error' || event.kind === 'parse_error' || event.kind === 'validation' || event.kind === 'system') {
       if(currentTurn) currentTurn.notes.push(renderTechEvent(event, turns.length));
     }
   }

@@ -6,6 +6,7 @@ import csv
 import json
 import os
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -24,6 +25,118 @@ MAX_SUBMISSION_SOURCE_CHARS = 20000
 DEFAULT_MAX_STEPS = 100
 DEFAULT_TIME_LIMIT_SECONDS = 300
 DEFAULT_HISTORY_FILENAME = "agent_history.txt"
+PYTHON_GUARD_DIR = Path(tempfile.gettempdir()) / "ml_benchmark_python_guard"
+PYTHON_GUARD_CODE = r'''
+"""Runtime guard for agent run_python commands."""
+
+from __future__ import annotations
+
+import builtins
+import os
+from pathlib import Path
+
+
+WORKSPACE = Path(os.environ["AGENT_WORKSPACE"]).resolve()
+PROJECT_ROOT = Path(os.environ.get("AGENT_PROJECT_ROOT") or WORKSPACE.parent).resolve()
+
+
+def _resolve_candidate(value):
+    if isinstance(value, int):
+        return None
+    try:
+        path = Path(value)
+    except TypeError:
+        return None
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    try:
+        return path.resolve()
+    except Exception:
+        return path.absolute()
+
+
+def _is_inside(path, root):
+    return path == root or root in path.parents
+
+
+def _check_path(value):
+    path = _resolve_candidate(value)
+    if path is None:
+        return
+    if _is_inside(path, PROJECT_ROOT) and not _is_inside(path, WORKSPACE):
+        raise PermissionError(
+            f"Access outside isolated workspace is blocked: {path}"
+        )
+
+
+_original_open = builtins.open
+
+
+def guarded_open(file, *args, **kwargs):
+    _check_path(file)
+    return _original_open(file, *args, **kwargs)
+
+
+builtins.open = guarded_open
+
+
+def _wrap_os_path_function(name):
+    original = getattr(os, name, None)
+    if original is None:
+        return
+
+    def wrapper(path, *args, **kwargs):
+        _check_path(path)
+        return original(path, *args, **kwargs)
+
+    setattr(os, name, wrapper)
+
+
+for _name in (
+    "access",
+    "chmod",
+    "chown",
+    "lchown",
+    "listdir",
+    "lstat",
+    "mkdir",
+    "makedirs",
+    "remove",
+    "rmdir",
+    "scandir",
+    "stat",
+    "unlink",
+):
+    _wrap_os_path_function(_name)
+
+
+_original_os_open = os.open
+
+
+def guarded_os_open(path, *args, **kwargs):
+    _check_path(path)
+    return _original_os_open(path, *args, **kwargs)
+
+
+os.open = guarded_os_open
+
+
+def _wrap_os_two_path_function(name):
+    original = getattr(os, name, None)
+    if original is None:
+        return
+
+    def wrapper(src, dst, *args, **kwargs):
+        _check_path(src)
+        _check_path(dst)
+        return original(src, dst, *args, **kwargs)
+
+    setattr(os, name, wrapper)
+
+
+for _name in ("link", "rename", "replace", "symlink"):
+    _wrap_os_two_path_function(_name)
+'''
 
 
 @dataclass
@@ -36,6 +149,7 @@ class DatasetState:
 @dataclass
 class AgentContext:
     workspace: Path
+    project_root: Path | None = None
     task_id: str = "salary_prediction"
     tasks_dir: Path = Path("checker/tasks")
     max_steps: int = DEFAULT_MAX_STEPS
@@ -230,6 +344,21 @@ class CommandExecutor:
             ]
         return ["python3", "-c", code]
 
+    def _python_env(self) -> dict[str, str]:
+        guard_dir = ensure_python_guard_dir()
+        existing_pythonpath = os.environ.get("PYTHONPATH")
+        pythonpath = str(guard_dir)
+        if existing_pythonpath:
+            pythonpath = pythonpath + os.pathsep + existing_pythonpath
+        project_root = self.context.project_root or self.context.workspace.parent
+        return {
+            **os.environ,
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPATH": pythonpath,
+            "AGENT_WORKSPACE": str(self.context.workspace.resolve()),
+            "AGENT_PROJECT_ROOT": str(project_root.resolve()),
+        }
+
     def _get_budget_status(self, args: dict[str, Any]) -> dict[str, int]:
         _ensure_no_args(args)
         return {
@@ -420,6 +549,14 @@ class CommandExecutor:
 
     def _elapsed_ms(self, started_at: float) -> float:
         return round((time.perf_counter() - started_at) * 1000, 3)
+
+
+def ensure_python_guard_dir() -> Path:
+    PYTHON_GUARD_DIR.mkdir(parents=True, exist_ok=True)
+    guard_path = PYTHON_GUARD_DIR / "sitecustomize.py"
+    if not guard_path.exists() or guard_path.read_text(encoding="utf-8") != PYTHON_GUARD_CODE:
+        guard_path.write_text(PYTHON_GUARD_CODE, encoding="utf-8")
+    return PYTHON_GUARD_DIR
 
 
 def _required_str(args: dict[str, Any], name: str) -> str:
