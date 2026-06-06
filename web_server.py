@@ -359,6 +359,14 @@ class AgentRunManager:
                     history.append({"role": "user", "content": user_message})
                     history.append({"role": "assistant", "content": assistant_text})
 
+                stage_error = validate_fixed_transition_declared_stage(state, assistant_text)
+                if stage_error:
+                    add_event(state, "validation", "Fixed-transition stage mismatch", stage_error)
+                    reset_fixed_transition_result(state)
+                    rollback_fixed_stage_attempt(state)
+                    user_message = apply_mode_instruction(state, build_fixed_stage_mismatch_prompt(stage_error))
+                    continue
+
                 try:
                     commands = extract_commands(assistant_text)
                 except ValueError as exc:
@@ -378,8 +386,7 @@ class AgentRunManager:
                         state,
                         "Твой ответ не удалось распарсить как команду.\n"
                         f"Ошибка: {exc}\n"
-                        "Первая строка: EDA, FEATURES или TRAIN. Вторая строка: короткий комментарий без вводного слова. "
-                        "Затем верни валидную команду или несколько команд, по одной на строку.",
+                        "Верни короткую строку `Мысль: ...`, затем валидную команду или несколько команд, по одной на строку.",
                     )
                     continue
 
@@ -830,9 +837,7 @@ def baseline_prediction(rows: list[dict[str, str]], target_column: str, metric: 
 def build_initial_prompt(workspace: Path, task_id: str) -> str:
     return (
         "Ты решаешь ML benchmark task через агентские команды.\n"
-        "Каждый ответ начинай с отдельной строки EDA, FEATURES или TRAIN. "
-        "На второй строке кратко напиши, что собираешься сделать, без вводного слова; "
-        "затем укажи одну или несколько команд, по одной на строку.\n"
+        "В одном ответе сначала напиши короткую строку `Мысль: ...`, затем одну или несколько команд, по одной на строку.\n"
         "Работай как в обычной ML-задаче: осмотри данные, сделай признаки, обучи и проверь модель. "
         "Перед submit проверь, что submission.csv существует, имеет нужные колонки, правильное число строк "
         "и не содержит пустых предсказаний. Когда всё готово, вызови submit(\"submission.csv\").\n\n"
@@ -913,16 +918,19 @@ def mode_instruction(state: RunState) -> str:
                 "На этом этапе submit еще запрещен."
             )
         else:
-            detail = "обучи модель, создай submission.csv, проверь формат и вызови submit"
+            detail = (
+                "это этап 3/3. Обучи или запусти лучшую модель, создай и проверь submission.csv, "
+                "затем обязательно вызови submit(\"submission.csv\")."
+            )
         return (
-            f"Режим fixed-transitions: текущий обязательный этап {stage}. Задача этапа: {detail}. "
-            f"Первая строка ответа должна быть `{stage}`."
+            f"Режим fixed-transitions: текущий обязательный этап {stage}. "
+            f"Итерация этапа {attempt}/{minimum}. "
+            "Этапы идут строго по порядку: EDA -> FEATURES -> TRAIN; команды вне текущего этапа блокируются. "
+            "Не пытайся завершить этап за один короткий ответ: используй несколько итераций на глубину, как в flexible. "
+            f"Задача этапа: {detail}"
         )
     if mode == "flexible":
-        return (
-            "Режим flexible: продолжай решение до submit или лимитов. "
-            "Самостоятельно выбери актуальный этап для первой строки ответа."
-        )
+        return flexible_mode_instruction(state)
     return ""
 
 
@@ -966,6 +974,88 @@ def current_fixed_stage_attempt(state: RunState) -> int:
 def record_fixed_stage_attempt(state: RunState) -> None:
     stage = current_fixed_stage(state)
     state.fixed_stage_attempts[stage] = current_fixed_stage_attempt(state) + 1
+
+
+def rollback_fixed_stage_attempt(state: RunState) -> None:
+    stage = current_fixed_stage(state)
+    current_attempt = current_fixed_stage_attempt(state)
+    if current_attempt > 0:
+        state.fixed_stage_attempts[stage] = current_attempt - 1
+
+
+def reset_fixed_transition_result(state: RunState) -> None:
+    state.submitted = False
+    state.submission_result = None
+    state.stop_reason = "not_finished"
+
+
+def validate_fixed_transition_declared_stage(state: RunState, response_text: str) -> dict[str, Any] | None:
+    if state.config.mode != "fixed-transitions":
+        return None
+    declared_stage = declared_fixed_stage(response_text)
+    if declared_stage is None:
+        return None
+    expected_stage = current_fixed_stage(state)
+    if declared_stage == expected_stage:
+        return None
+    return {
+        "reason": "fixed_stage_mismatch",
+        "error": (
+            f"Model declared stage {declared_stage}, but fixed-transitions currently requires {expected_stage}. "
+            "This response is ignored and its result is reset."
+        ),
+        "declared_stage": declared_stage,
+        "expected_stage": expected_stage,
+    }
+
+
+def declared_fixed_stage(response_text: str) -> str | None:
+    stage_area = response_text.split("```", 1)[0].lower()
+    lines = [line.strip() for line in stage_area.splitlines()[:8] if line.strip()]
+    for line in lines:
+        if not fixed_stage_line_looks_explicit(line):
+            continue
+        stage = fixed_stage_from_text(line)
+        if stage:
+            return stage
+    return None
+
+
+def fixed_stage_line_looks_explicit(line: str) -> bool:
+    explicit_markers = (
+        "stage",
+        "этап",
+        "стад",
+        "сейчас",
+        "перехожу",
+        "начинаю",
+        "работаю",
+        "делаю",
+    )
+    return any(marker in line for marker in explicit_markers)
+
+
+def fixed_stage_from_text(text: str) -> str | None:
+    if "eda" in text or "exploratory" in text or "анализ данных" in text or "развед" in text:
+        return "EDA"
+    if (
+        "features" in text
+        or "feature engineering" in text
+        or "признак" in text
+        or "фич" in text
+        or "предобработ" in text
+    ):
+        return "FEATURES"
+    if (
+        "train" in text
+        or "training" in text
+        or "обуч" in text
+        or "инференс" in text
+        or "submission" in text
+        or "submit" in text
+    ):
+        return "TRAIN"
+    return None
 
 
 def validate_mode_command(state: RunState, command: ParsedCommand) -> dict[str, Any] | None:
@@ -1238,6 +1328,17 @@ def build_batch_error_prompt(batch_error: dict[str, Any]) -> str:
     )
 
 
+def build_fixed_stage_mismatch_prompt(stage_error: dict[str, Any]) -> str:
+    expected_stage = stage_error.get("expected_stage", "current")
+    declared_stage = stage_error.get("declared_stage", "unknown")
+    return (
+        "Предыдущий ответ не засчитан: ты заявил неверный этап fixed-transitions.\n"
+        f"Текущий обязательный этап: {expected_stage}. Ты заявил: {declared_stage}.\n"
+        "Не переходи к следующему этапу раньше времени. Верни короткую строку `Мысль: ...`, "
+        f"затем команды только для этапа {expected_stage}."
+    )
+
+
 def build_followup_prompt(results: list[dict[str, Any]], feedback: dict[str, Any], state: RunState) -> str:
     used_steps = state.executor.context.used_steps
     max_steps = state.config.max_steps
@@ -1429,7 +1530,7 @@ def build_emergency_submit_prompt(state: RunState) -> str:
         instruction = (
             "FINAL SUBMIT NOW.\n"
             "В workspace уже есть submission.csv. Не улучшай решение и не запускай EDA.\n"
-            "Начни ответ со строки TRAIN, на второй строке кратко укажи действие, затем верни одну команду:\n"
+            "Верни короткую строку `Мысль: отправляю готовый файл`, затем одну команду:\n"
             "submit(\"submission.csv\")\n\n"
         )
     else:
@@ -1437,7 +1538,7 @@ def build_emergency_submit_prompt(state: RunState) -> str:
             "FINAL SUBMIT NOW.\n"
             "Нужно дать последнее лучшее решение. Не делай EDA и долгие улучшения.\n"
             "Создай submission.csv самым надежным быстрым способом и в этом же ответе вызови submit(\"submission.csv\").\n"
-            "Начни ответ со строки TRAIN, на второй строке кратко укажи действие, затем верни команды.\n\n"
+            "Верни короткую строку `Мысль: завершаю решение`, затем команды.\n\n"
         )
     payload = {
         "task": task_config,
@@ -1926,6 +2027,8 @@ let timer = null;
 const csvScrollPositions = new Map();
 const expandedCodeBlocks = new Set();
 const openDetails = new Set();
+let submissionSourceOpen = false;
+let renderedSubmissionSignature = '';
 const task = document.getElementById('task');
 const model = document.getElementById('model');
 const mode = document.getElementById('mode');
@@ -2186,9 +2289,28 @@ function setupCodeToggles(){
     }
     button.setAttribute('aria-label', block.classList.contains('is-expanded') ? 'Collapse code' : 'Expand code');
   });
+  document.addEventListener('click', (event) => {
+    const summary = event.target.closest('#submission details[data-ui-key="submission-source-code"] summary');
+    if(!summary) return;
+    const details = summary.closest('details');
+    setTimeout(() => {
+      if(details && details.isConnected) {
+        submissionSourceOpen = details.open;
+      }
+    }, 0);
+  });
   document.addEventListener('toggle', (event) => {
     const details = event.target.closest('details');
     if(!details || !details.dataset.uiKey) return;
+    if(details.dataset.uiKey === 'submission-source-code') {
+      if(details.closest('#submission')) {
+        submissionSourceOpen = details.open;
+      }
+      return;
+    }
+    if(!details.isConnected) {
+      return;
+    }
     if(details.open) openDetails.add(details.dataset.uiKey);
     else openDetails.delete(details.dataset.uiKey);
   }, true);
@@ -2355,7 +2477,7 @@ function renderSubmissionHtml(submission){
         <div class="submit-metric"><span>Rows checked</span><strong>${esc(rows)}</strong></div>
       </div>
       ${sourceCode ? `
-        <details class="submission-source">
+        <details class="submission-source" data-ui-key="submission-source-code" open>
           <summary>Код, который сформировал submission.csv</summary>
           <div class="note-meta">Источник: <span class="inline-code">${esc(sourcePath)}</span>${source.truncated ? ' · truncated' : ''}</div>
           <pre>${esc(sourceCode)}</pre>
@@ -2696,6 +2818,8 @@ function formatBytes(size){
 function render(run){
   const shouldStickToBottom = isScrolledToBottom(eventsEl);
   saveCsvScrollPositions();
+  const submissionDetails = document.querySelector('#submission details[data-ui-key="submission-source-code"]');
+  if(submissionDetails) submissionSourceOpen = submissionDetails.open;
   statusEl.textContent = run.status + ' / ' + run.stop_reason;
   statusEl.classList.remove('is-thinking');
   document.getElementById('s-status').textContent = run.status;
@@ -2704,12 +2828,21 @@ function render(run){
   document.getElementById('s-tokens').textContent = run.total_tokens;
   message.textContent = `Mode: ${run.mode}. Task: ${run.task_id}.`;
   if(run.submission_result){
-    document.getElementById('submission').className = 'message';
-    document.getElementById('submission').innerHTML = renderSubmissionHtml(run.submission_result);
+    const submissionEl = document.getElementById('submission');
+    const signature = JSON.stringify(run.submission_result);
+    submissionEl.className = 'message';
+    if(signature !== renderedSubmissionSignature) {
+      submissionEl.innerHTML = renderSubmissionHtml(run.submission_result);
+      renderedSubmissionSignature = signature;
+      const nextSubmissionDetails = submissionEl.querySelector('details[data-ui-key="submission-source-code"]');
+      if(nextSubmissionDetails) nextSubmissionDetails.open = true;
+    }
   } else if(run.error){
+    renderedSubmissionSignature = '';
     document.getElementById('submission').className = 'message error';
     document.getElementById('submission').textContent = run.error;
   } else if(['completed','stopped','error'].includes(run.status)){
+    renderedSubmissionSignature = '';
     document.getElementById('submission').className = 'message error';
     const reason = run.stop_reason === 'token_limit'
       ? 'Token limit ended before a final submission could be attempted.'
@@ -2718,6 +2851,7 @@ function render(run){
         : `Run finished without submit(file). Stop reason: ${run.stop_reason}.`;
     document.getElementById('submission').textContent = reason;
   } else {
+    renderedSubmissionSignature = '';
     document.getElementById('submission').className = 'message';
     document.getElementById('submission').textContent = 'No submission yet.';
   }
