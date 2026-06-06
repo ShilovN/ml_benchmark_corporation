@@ -883,7 +883,7 @@ def build_followup_prompt(
 ) -> str:
     prefix = (
         f"{format_budget_line(stats, args)} "
-        "Дальше верни короткую строку `Мысль: ...`, затем команды.\n\n"
+        "Дальше верни короткую строку комментария без вводного слова, затем команды.\n\n"
     )
     body = format_followup_body(command_results, stats, args, feedback)
     return prefix + truncate_middle(body, MAX_FOLLOWUP_PROMPT_CHARS - len(prefix))
