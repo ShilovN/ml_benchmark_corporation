@@ -736,13 +736,17 @@ submit("submission.csv")'''
         self.assertIsNone(apply_mode_after_results(state, [{"status": "ok", "command": "write_file"}]))
         self.assertEqual(current_fixed_stage(state), "TRAIN")
         record_fixed_stage_attempt(state)
-        self.assertIsNone(apply_mode_after_results(state, [{"status": "ok", "command": "run_python"}]))
+        self.assertEqual(
+            apply_mode_after_results(state, [{"status": "ok", "command": "run_python"}]),
+            "fixed_transitions_ready_to_submit",
+        )
         state.submitted = True
         self.assertEqual(apply_mode_after_results(state, []), "fixed_transitions_finished")
 
     def test_fixed_transitions_train_accepts_submit_after_existing_solution(self) -> None:
         state = self._state("fixed-transitions")
         state.fixed_stage_index = 2
+        record_fixed_stage_attempt(state)
         state.executor.context.trajectory.append(
             {"command": "run_python", "status": "ok", "result_preview": ""}
         )
@@ -754,11 +758,25 @@ submit("submission.csv")'''
     def test_fixed_transitions_train_accepts_submit_after_existing_submission_file(self) -> None:
         state = self._state("fixed-transitions")
         state.fixed_stage_index = 2
+        record_fixed_stage_attempt(state)
         (state.workspace / "submission.csv").write_text("id,target\n1,0\n", encoding="utf-8")
 
         error = validate_mode_command_batch(state, [parse_command('submit("submission.csv")')])
 
         self.assertIsNone(error)
+
+    def test_fixed_transitions_train_rejects_submit_before_final_train_iteration(self) -> None:
+        state = self._state("fixed-transitions")
+        state.fixed_stage_index = 2
+        state.fixed_stage_attempts["TRAIN"] = 0
+        state.executor.context.trajectory.append(
+            {"command": "run_python", "status": "ok", "result_preview": ""}
+        )
+
+        error = validate_mode_command_batch(state, [parse_command('submit("submission.csv")')])
+
+        self.assertIsNotNone(error)
+        self.assertEqual(error["reason"], "fixed_train_early_submit")
 
     def test_repeated_mode_stops_after_attempt_limit(self) -> None:
         state = self._state("repeated")
