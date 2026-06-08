@@ -1123,12 +1123,14 @@ def validate_fixed_transition_command_batch(state: RunState, command_names: list
             "productive_commands": sorted(PRODUCTIVE_SOLUTION_COMMANDS),
         }
     if stage == "TRAIN":
-        if not has_productive and not (state.workspace / "submission.csv").exists():
+        has_existing_solution = has_productive_history(state) or (state.workspace / "submission.csv").exists()
+        if not has_productive and not has_existing_solution:
             return {
                 "reason": "fixed_train_no_solution",
                 "error": (
                     "TRAIN stage must train/run a solution or create submission.csv before submit. "
-                    "Use run_python or write_file, then submit(\"submission.csv\")."
+                    "Use run_python or write_file, then submit(\"submission.csv\"). "
+                    "If submission.csv already exists, submit it directly."
                 ),
                 "stage": stage,
                 "commands": command_names,
@@ -1199,7 +1201,7 @@ def apply_mode_after_results(state: RunState, results: list[dict[str, Any]]) -> 
 
     add_event(state, "stage", f"{stage} completed", {"stage": stage})
     if stage == "TRAIN":
-        return "fixed_transitions_finished"
+        return "fixed_transitions_finished" if state.submitted else None
     state.fixed_stage_index += 1
     next_stage = current_fixed_stage(state)
     add_event(state, "stage", f"Next stage: {next_stage}", {"stage": next_stage})
