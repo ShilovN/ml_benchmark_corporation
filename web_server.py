@@ -1860,8 +1860,11 @@ def render_agent_page() -> str:
     button { border:0; border-radius:6px; background:var(--accent); color:white; font-weight:800; cursor:pointer; padding:0 14px; }
     button.secondary { background:#eef3f8; color:var(--text); border:1px solid var(--border); }
     button:disabled { opacity:.55; cursor:not-allowed; }
-    a.button-link { box-sizing:border-box; display:inline-flex; width:100%; min-height:40px; align-items:center; justify-content:center; border-radius:6px; background:#eef3f8; color:var(--text); border:1px solid var(--border); font-weight:800; text-decoration:none; padding:0 14px; }
+    a.button-link { box-sizing:border-box; display:inline-flex; width:100%; min-height:40px; align-items:center; justify-content:center; border-radius:6px; background:#eef3f8; color:var(--text); border:1px solid var(--border); font-weight:600; text-decoration:none; padding:0 14px; }
     .top-action { margin-bottom:12px; }
+    .section-head { display:flex; justify-content:space-between; gap:12px; align-items:center; margin-bottom:14px; }
+    .section-head h2 { margin:0; }
+    .section-head .button-link { width:auto; }
     .hidden { display:none !important; }
     .status { display:inline-flex; min-height:32px; align-items:center; padding:0 12px; border-radius:999px; border:1px solid var(--border); background:white; color:var(--muted); }
     .status.is-thinking { color:var(--accent); border-color:#b9cdfd; background:#eff4ff; }
@@ -1984,7 +1987,10 @@ def render_agent_page() -> str:
   </header>
   <div id="runs-page" class="hidden">
     <section>
-      <h2>Список запусков</h2>
+      <div class="section-head">
+        <h2>Список запусков</h2>
+        <a class="button-link" href="/">Новый запуск</a>
+      </div>
       <div class="run-list" id="run-list"><div class="message">Загрузка запусков...</div></div>
     </section>
   </div>
