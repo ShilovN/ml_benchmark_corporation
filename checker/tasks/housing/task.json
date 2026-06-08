@@ -1,0 +1,13 @@
+{
+  "id": "housing",
+  "name": "Housing prices",
+  "metric": "mae",
+  "answer_file": "answers.csv",
+  "id_column": "id",
+  "column": "price",
+  "public_files": [
+    "train.csv",
+    "test.csv",
+    "statement.md"
+  ]
+}
