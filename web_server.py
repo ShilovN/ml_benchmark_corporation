@@ -64,7 +64,7 @@ REPEATED_MAX_ATTEMPTS = 5
 SINGLE_SHOT_ALLOWED_COMMANDS = {"write_file", "run_python", "submit"}
 PRODUCTIVE_SOLUTION_COMMANDS = {"write_file", "edit_file", "run_python"}
 FIXED_TRANSITION_STAGES = ["EDA", "FEATURES", "TRAIN"]
-FIXED_STAGE_MIN_ATTEMPTS = {"EDA": 3, "FEATURES": 5, "TRAIN": 1}
+FIXED_STAGE_MIN_ATTEMPTS = {"EDA": 3, "FEATURES": 5, "TRAIN": 5}
 LOWER_IS_BETTER_METRICS = {
     "mae",
     "mean_absolute_error",
