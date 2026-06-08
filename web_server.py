@@ -473,7 +473,7 @@ class AgentRunManager:
                 add_event(state, "error", "Run failed before valid submit", {"error": state.error})
             else:
                 self._force_final_submit(state)
-                state.status = "stopped"
+                state.status = "completed" if state.submitted else "stopped"
             if state.stop_reason == "not_finished":
                 state.stop_reason = "finished"
         except Exception as exc:
@@ -548,6 +548,8 @@ class AgentRunManager:
                 state.executor.context.used_steps + 1,
             )
             result = state.executor.execute(command)
+            if state.config.mode == "fixed-transitions" and result["status"] == "ok":
+                result = zero_fixed_transition_result_if_needed(state, result)
             state.submitted = True
             state.submission_result = result
             if state.config.mode == "single-shot":
@@ -1123,6 +1125,18 @@ def validate_fixed_transition_command_batch(state: RunState, command_names: list
             "productive_commands": sorted(PRODUCTIVE_SOLUTION_COMMANDS),
         }
     if stage == "TRAIN":
+        stage_attempts = current_fixed_stage_attempt(state)
+        required_attempts = FIXED_STAGE_MIN_ATTEMPTS.get(stage, 1)
+        if has_submit and stage_attempts < required_attempts:
+            return {
+                "reason": "fixed_train_early_submit",
+                "error": (
+                    "TRAIN submit is only allowed on the final fixed TRAIN iteration. "
+                    f"Current TRAIN iteration: {stage_attempts}/{required_attempts}."
+                ),
+                "stage": stage,
+                "commands": command_names,
+            }
         has_existing_solution = has_productive_history(state) or (state.workspace / "submission.csv").exists()
         if not has_productive and not has_existing_solution:
             return {
@@ -1135,13 +1149,6 @@ def validate_fixed_transition_command_batch(state: RunState, command_names: list
                 "stage": stage,
                 "commands": command_names,
                 "productive_commands": sorted(PRODUCTIVE_SOLUTION_COMMANDS),
-            }
-        if not has_submit:
-            return {
-                "reason": "fixed_train_missing_submit",
-                "error": "TRAIN stage must include the model's own submit(\"submission.csv\") command.",
-                "stage": stage,
-                "commands": command_names,
             }
     return None
 
@@ -1201,7 +1208,7 @@ def apply_mode_after_results(state: RunState, results: list[dict[str, Any]]) -> 
 
     add_event(state, "stage", f"{stage} completed", {"stage": stage})
     if stage == "TRAIN":
-        return "fixed_transitions_finished" if state.submitted else None
+        return "fixed_transitions_finished" if state.submitted else "fixed_transitions_ready_to_submit"
     state.fixed_stage_index += 1
     next_stage = current_fixed_stage(state)
     add_event(state, "stage", f"Next stage: {next_stage}", {"stage": next_stage})
@@ -1309,7 +1316,7 @@ def should_force_final_submit(state: RunState) -> bool:
     if state.config.mode == "single-shot":
         return False
     if state.config.mode == "fixed-transitions":
-        return False
+        return state.stop_reason == "fixed_transitions_ready_to_submit"
     if state.config.mode == "repeated":
         return False
     return True
@@ -1332,7 +1339,7 @@ def mode_failure_message(state: RunState) -> str:
             "create submission.csv, and then submit(\"submission.csv\")."
         )
     if state.config.mode == "fixed-transitions":
-        return "Fixed-transitions mode ended before the model produced its own submit(\"submission.csv\")."
+        return "Fixed-transitions mode ended before the fixed schedule reached its final submit point."
     return "Run ended before a valid submission was produced."
 
 
@@ -1347,7 +1354,7 @@ def build_batch_error_prompt(batch_error: dict[str, Any]) -> str:
         "Предыдущий ответ не подходит для текущего режима.\n"
         f"Ошибка: {batch_error.get('error', 'invalid command batch')}\n"
         "Верни короткую строку комментария без вводного слова, затем команды, которые реально продвигают решение. "
-        "Если это последняя попытка, создай/проверь submission.csv и вызови submit(\"submission.csv\")."
+        "В fixed-transitions не вызывай submit до финальной TRAIN-итерации."
     )
 
 
@@ -1421,7 +1428,7 @@ def fixed_transition_followup_opener(state: RunState) -> str:
         )
     return (
         "Продолжай fixed-transitions этап TRAIN. Верни короткую строку комментария без вводного слова, затем команды, которые создают/проверяют "
-        "submission.csv, и обязательно вызови submit(\"submission.csv\"). Без собственного submit этап TRAIN не завершится."
+        "submission.csv. Submit будет выполнен автоматически строго после завершения fixed-transitions расписания."
     )
 
 
