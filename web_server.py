@@ -385,9 +385,11 @@ class AgentRunManager:
                         state.stop_reason = "single_shot_parse_error"
                         break
                     if state.config.mode == "repeated" and state.requests >= REPEATED_MAX_ATTEMPTS:
+                        self._force_repeated_attempt_submit(state, "parse_error")
                         state.stop_reason = "repeated_attempt_limit"
                         break
                     if state.config.mode == "repeated":
+                        self._force_repeated_attempt_submit(state, "parse_error")
                         self._prepare_next_repeated_attempt(state)
                         user_message = apply_mode_instruction(state, build_initial_prompt(state.workspace, state.config.task_id))
                         history = []
@@ -405,6 +407,7 @@ class AgentRunManager:
                 if batch_error:
                     add_event(state, "validation", "Invalid command batch", batch_error)
                     if state.config.mode == "repeated" and state.requests < REPEATED_MAX_ATTEMPTS:
+                        self._force_repeated_attempt_submit(state, batch_error["reason"])
                         self._prepare_next_repeated_attempt(state)
                         user_message = apply_mode_instruction(state, build_initial_prompt(state.workspace, state.config.task_id))
                         history = []
@@ -416,6 +419,7 @@ class AgentRunManager:
                     break
 
                 results: list[dict[str, Any]] = []
+                submitted_submission_csv = False
                 for command in commands:
                     add_event(state, "command", command.name, {"args": command.args})
                     validation_error = validate_mode_command(state, command)
@@ -428,6 +432,7 @@ class AgentRunManager:
                     results.append(result)
                     add_event(state, "result", f"{command.name}: {result['status']}", result)
                     if command.name == "submit" and result["status"] == "ok":
+                        submitted_submission_csv = is_submission_csv_submit(command)
                         handle_successful_submit(state, result)
                         break
 
@@ -440,10 +445,14 @@ class AgentRunManager:
 
                 mode_stop_reason = apply_mode_after_results(state, results)
                 if mode_stop_reason:
+                    if state.config.mode == "repeated" and not submitted_submission_csv:
+                        self._force_repeated_attempt_submit(state, "missing_submission_csv_submit")
                     state.stop_reason = mode_stop_reason
                     break
 
                 if state.config.mode == "repeated":
+                    if not submitted_submission_csv:
+                        self._force_repeated_attempt_submit(state, "missing_submission_csv_submit")
                     self._prepare_next_repeated_attempt(state)
                     user_message = apply_mode_instruction(state, build_initial_prompt(state.workspace, state.config.task_id))
                     history = []
@@ -512,6 +521,40 @@ class AgentRunManager:
                 "docker_container": state.docker_container,
             },
         )
+
+    def _force_repeated_attempt_submit(self, state: RunState, reason: str) -> None:
+        if state.config.mode != "repeated":
+            return
+
+        submission_path = latest_csv_submission_candidate(state.workspace)
+        if submission_path is None:
+            add_event(
+                state,
+                "system",
+                "Repeated force submit skipped",
+                {"reason": reason, "error": "No generated CSV file found in workspace"},
+            )
+            return
+
+        relative_path = str(submission_path.resolve().relative_to(state.workspace.resolve()))
+        command = ParsedCommand("submit", {"file": relative_path})
+        add_event(
+            state,
+            "command",
+            "Repeated force submit",
+            {"reason": reason, "source": relative_path, "args": command.args},
+        )
+        state.executor.context.max_steps = max(
+            state.executor.context.max_steps,
+            state.executor.context.used_steps + 1,
+        )
+        result = state.executor.execute(command)
+        add_event(state, "result", f"repeated force submit: {result['status']}", result)
+        if result["status"] == "ok":
+            handle_successful_submit(state, result)
+        else:
+            state.repeated_submissions.append(result)
+            state.submission_result = best_repeated_submission(state.repeated_submissions)
 
     def _force_final_submit(self, state: RunState) -> None:
         if state.submitted:
@@ -831,6 +874,33 @@ def create_baseline_submission(workspace: Path) -> Path:
     return submission_path
 
 
+def latest_csv_submission_candidate(workspace: Path) -> Path | None:
+    ignored_names = {
+        "train.csv",
+        "test.csv",
+        "answers.csv",
+        "answer.csv",
+        "sample_submission.csv",
+    }
+    candidates = [
+        path
+        for path in workspace.rglob("*.csv")
+        if path.is_file() and path.name.lower() not in ignored_names
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: (path.stat().st_mtime_ns, str(path.relative_to(workspace))))
+
+
+def is_submission_csv_submit(command: ParsedCommand) -> bool:
+    if command.name != "submit":
+        return False
+    file_arg = command.args.get("file")
+    if not isinstance(file_arg, str):
+        return False
+    return Path(file_arg).name.lower() == "submission.csv"
+
+
 def baseline_prediction(rows: list[dict[str, str]], target_column: str, metric: str) -> str:
     values = [row.get(target_column, "") for row in rows if row.get(target_column, "") != ""]
     if not values:
@@ -881,47 +951,18 @@ def should_isolate_llm_history(state: RunState) -> bool:
 def mode_instruction(state: RunState) -> str:
     mode = state.config.mode
     if mode == "single-shot":
-        return (
-            "Режим single-shot: у тебя ровно один ответ модели на всю задачу. "
-            "В этом ответе можно вернуть несколько команд подряд, но после их выполнения новых попыток не будет. "
-            "Файлы train.csv, test.csv и task.json уже показаны выше, поэтому НЕ трать единственный ответ на list_files/read_file/load_dataset/show_sample_rows. "
-            "В single-shot разрешены только продуктивные команды: write_file, run_python, submit. "
-            "Ответ без submit(\"submission.csv\") будет отклонен.\n"
-            "Лучший формат для длинного кода:\n"
-            "Делаю полный быстрый пайплайн и отправляю решение\n"
-            "```command\n"
-            "run_python(\"\"\"\n"
-            "<полный python-код: читает train.csv/test.csv, обучает или строит baseline, создает submission.csv и печатает проверку формата>\n"
-            "\"\"\")\n"
-            "```\n"
-            "```command\n"
-            "submit(\"submission.csv\")\n"
-            "```\n"
-            "Если сложная модель рискованна, сделай простой валидный baseline, но обязательно создай submission.csv и вызови submit."
-        )
+        return single_shot_mode_instruction()
     if mode == "repeated":
         attempt = min(state.requests + 1, REPEATED_MAX_ATTEMPTS)
-        stage_note = (
-            "Каждая repeated-попытка является полноценным single-shot решением: "
-            "в текущем ответе создай или запусти решение, сформируй submission.csv и обязательно вызови submit(\"submission.csv\"). "
-            "Ответ только с коротким комментарием будет отклонён. Submit-only будет отклонён: система не создаёт baseline вместо тебя. "
-            "Это отдельный чистый чат и отдельный чистый workspace; у тебя нет доступа к прошлым попыткам, их файлам, ответам и результатам. "
-            "Не пиши планы на будущие попытки и не обещай улучшить модель позже.\n"
-            "Обязательный формат ответа:\n"
-            "Делаю полный пайплайн и отправляю решение\n"
-            "```command\n"
-            "run_python(\"\"\"\n"
-            "<python-код: читает train.csv/test.csv, обучает или строит baseline, создает submission.csv>\n"
-            "\"\"\")\n"
-            "submit(\"submission.csv\")\n"
-            "```"
-        )
-        if attempt > 1:
-            stage_note += " Решай задачу с нуля по данным из текущего prompt и отправь полный submit в этом же ответе."
         return (
             f"Режим repeated: попытка {attempt}/{REPEATED_MAX_ATTEMPTS}. "
-            "Это не flexible-режим и не пошаговая разработка без отправки. "
-            f"{stage_note}"
+            "Эта попытка должна выглядеть для модели как отдельный single-shot запуск: один ответ, полный pipeline, созданный CSV-файл и submit. "
+            "Это отдельный чистый чат и отдельный чистый workspace; у тебя нет доступа к прошлым попыткам, их файлам, ответам и результатам. "
+            "Не пиши планы на будущие попытки, не обещай улучшить модель позже и не отвечай только комментарием. "
+            "Submit-only будет отклонён: сначала сам создай файл через write_file или run_python. "
+            "Если забудешь submit(\"submission.csv\"), runner принудительно отправит последний созданный CSV этой попытки, "
+            "поэтому в каждой попытке обязательно создай свежий CSV-файл.\n\n"
+            f"{single_shot_mode_instruction()}"
         )
     if mode == "fixed-transitions":
         return (
@@ -935,6 +976,29 @@ def mode_instruction(state: RunState) -> str:
             "Самостоятельно выбери актуальный этап для первой строки ответа."
         )
     return ""
+
+
+def single_shot_mode_instruction() -> str:
+    return (
+        "Режим single-shot: у тебя ровно один ответ модели на всю задачу. "
+        "В этом ответе можно вернуть несколько команд подряд, но после их выполнения новых попыток не будет. "
+        "Файлы train.csv, test.csv и task.json уже показаны выше, поэтому НЕ трать единственный ответ на list_files/read_file/load_dataset/show_sample_rows. "
+        "В single-shot разрешены только продуктивные команды: write_file, run_python, submit. "
+        "Ответ без созданного CSV-файла будет провальным; обязательно создай submission.csv или другой свежий CSV с предсказаниями. "
+        "Ответ без submit(\"submission.csv\") будет исправлен runner'ом только если ты создал CSV-файл, но правильный формат ответа всё равно должен включать submit.\n"
+        "Лучший формат для длинного кода:\n"
+        "TRAIN\n"
+        "Делаю полный быстрый пайплайн и отправляю решение\n"
+        "```command\n"
+        "run_python(\"\"\"\n"
+        "<полный python-код: читает train.csv/test.csv, обучает или строит baseline, создает submission.csv и печатает проверку формата>\n"
+        "\"\"\")\n"
+        "```\n"
+        "```command\n"
+        "submit(\"submission.csv\")\n"
+        "```\n"
+        "Если сложная модель рискованна, сделай простой валидный baseline, но обязательно создай CSV-файл и вызови submit."
+    )
 
 
 def flexible_mode_instruction(state: RunState) -> str:
@@ -1155,19 +1219,13 @@ def validate_fixed_transition_command_batch(state: RunState, command_names: list
 
 def validate_repeated_command_batch(state: RunState, command_names: list[str]) -> dict[str, Any] | None:
     has_productive = any(name in PRODUCTIVE_SOLUTION_COMMANDS for name in command_names)
-    has_submit = "submit" in command_names
-    if not has_submit:
-        return {
-            "reason": "repeated_missing_submit",
-            "error": "Every repeated attempt is a full single-shot attempt and must include submit(\"submission.csv\").",
-            "commands": command_names,
-        }
     if not has_productive:
         return {
-            "reason": "repeated_submit_without_solution",
+            "reason": "repeated_missing_solution",
             "error": (
-                "Repeated submit-only is not accepted. Each isolated attempt must create or run a solution "
-                "with write_file, edit_file, or run_python before submit(\"submission.csv\")."
+                "Each isolated repeated attempt must create or run a solution "
+                "with write_file, edit_file, or run_python. If submit(\"submission.csv\") is missing, "
+                "the runner will force-submit the latest generated CSV."
             ),
             "commands": command_names,
             "productive_commands": sorted(PRODUCTIVE_SOLUTION_COMMANDS),
@@ -1734,7 +1792,10 @@ def command_candidates(text: str) -> list[str]:
     for block in FENCED_BLOCK_RE.findall(text):
         if block.strip():
             block_commands = command_block_candidates(block)
-            candidates.extend(block_commands if block_commands else [block.strip()])
+            if block_commands:
+                candidates.extend(block_commands)
+            else:
+                candidates.extend(loose_command_block_candidates(block))
     for line in text.splitlines():
         stripped = line.strip()
         if stripped.startswith("{") or any(
@@ -1746,6 +1807,62 @@ def command_candidates(text: str) -> list[str]:
         if candidate not in unique:
             unique.append(candidate)
     return unique
+
+
+def loose_command_block_candidates(block: str) -> list[str]:
+    candidates: list[tuple[int, str]] = []
+    for name in sorted(COMMAND_NAMES):
+        start = 0
+        needle = f"{name}("
+        while True:
+            index = block.find(needle, start)
+            if index == -1:
+                break
+            if index > 0 and (block[index - 1].isalnum() or block[index - 1] in "_."):
+                start = index + len(needle)
+                continue
+            candidate = extract_balanced_python_call(block, index)
+            if candidate:
+                candidates.append((index, candidate))
+                start = index + len(candidate)
+            else:
+                start = index + len(needle)
+    return [candidate for _, candidate in sorted(candidates, key=lambda item: item[0])]
+
+
+def extract_balanced_python_call(text: str, start: int) -> str | None:
+    depth = 0
+    quote: str | None = None
+    triple_quote = False
+    escaped = False
+    index = start
+    while index < len(text):
+        char = text[index]
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif triple_quote and text.startswith(quote * 3, index):
+                quote = None
+                triple_quote = False
+                index += 2
+            elif not triple_quote and char == quote:
+                quote = None
+        else:
+            if char in {"'", '"'}:
+                quote = char
+                triple_quote = text.startswith(char * 3, index)
+                if triple_quote:
+                    index += 2
+            elif char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    return text[start : index + 1].strip()
+        index += 1
+    return None
 
 
 def command_block_candidates(block: str) -> list[str]:

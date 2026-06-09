@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -34,6 +35,7 @@ from web_server import (
     extract_commands,
     extract_reported_stage,
     handle_successful_submit,
+    latest_csv_submission_candidate,
     list_workspace_files,
     prepare_run_workspace,
     record_fixed_stage_attempt,
@@ -694,6 +696,22 @@ submit("submission.csv")
         self.assertEqual([command.name for command in commands], ["run_python", "submit"])
         self.assertIn("create submission", commands[0].args["code_or_file"])
 
+    def test_extract_commands_accepts_dirty_fenced_batch_with_stage_header(self) -> None:
+        text = '''```command
+TRAIN
+Делаю полный пайплайн и отправляю решение
+run_python("""
+import pandas as pd
+pd.DataFrame({"id": [1], "target": [0]}).to_csv("submission.csv", index=False)
+""")
+submit("submission.csv")
+```'''
+
+        commands = extract_commands(text)
+
+        self.assertEqual([command.name for command in commands], ["run_python", "submit"])
+        self.assertIn("to_csv", commands[0].args["code_or_file"])
+
     def test_extract_commands_ignores_inline_command_mentions(self) -> None:
         text = 'Подготовлю решение и потом вызову submit("submission.csv").'
 
@@ -791,14 +809,13 @@ submit("submission.csv")'''
             "repeated_attempt_limit",
         )
 
-    def test_repeated_requires_submit_on_every_attempt(self) -> None:
+    def test_repeated_allows_missing_submit_for_forced_attempt_submit(self) -> None:
         state = self._state("repeated")
         state.requests = 1
 
         error = validate_mode_command_batch(state, [parse_command('run_python("print(1)")')])
 
-        self.assertIsNotNone(error)
-        self.assertEqual(error["reason"], "repeated_missing_submit")
+        self.assertIsNone(error)
 
     def test_repeated_rejects_submit_only(self) -> None:
         state = self._state("repeated")
@@ -806,7 +823,7 @@ submit("submission.csv")'''
         error = validate_mode_command_batch(state, [parse_command('submit("submission.csv")')])
 
         self.assertIsNotNone(error)
-        self.assertEqual(error["reason"], "repeated_submit_without_solution")
+        self.assertEqual(error["reason"], "repeated_missing_solution")
 
     def test_repeated_accepts_solution_command_before_submit(self) -> None:
         state = self._state("repeated")
@@ -839,6 +856,21 @@ submit("submission.csv")'''
         second = {"status": "ok", "command": "submit", "result": {"metric": "f1_score", "value": 0.81}}
 
         self.assertEqual(best_repeated_submission([first, second]), second)
+
+    def test_latest_csv_submission_candidate_ignores_input_csv_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            (workspace / "train.csv").write_text("id,target\n1,0\n", encoding="utf-8")
+            (workspace / "test.csv").write_text("id\n2\n", encoding="utf-8")
+            first = workspace / "predictions.csv"
+            second = workspace / "nested" / "final.csv"
+            first.write_text("id,target\n2,0\n", encoding="utf-8")
+            second.parent.mkdir()
+            second.write_text("id,target\n2,1\n", encoding="utf-8")
+            os.utime(first, (1, 1))
+            os.utime(second, (2, 2))
+
+            self.assertEqual(latest_csv_submission_candidate(workspace), second)
 
     def test_mode_instruction_does_not_reveal_fixed_stage(self) -> None:
         fixed_state = self._state("fixed-transitions")
@@ -896,11 +928,13 @@ submit("submission.csv")'''
 
         prompt = apply_mode_instruction(state, "base")
 
-        self.assertIn("Ответ только с коротким комментарием будет отклонён", prompt)
-        self.assertIn("Обязательный формат ответа", prompt)
+        self.assertIn("должна выглядеть для модели как отдельный single-shot запуск", prompt)
+        self.assertIn("Режим single-shot", prompt)
+        self.assertIn("один ответ модели на всю задачу", prompt)
         self.assertIn("run_python", prompt)
         self.assertIn("не обещай улучшить модель позже", prompt)
         self.assertIn("Submit-only будет отклонён", prompt)
+        self.assertIn("обязательно создай свежий CSV-файл", prompt)
         self.assertIn("submit(\"submission.csv\")", prompt)
         self.assertNotIn("сможешь в следующей попытке", prompt)
 
