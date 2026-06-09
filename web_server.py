@@ -953,17 +953,7 @@ def mode_instruction(state: RunState) -> str:
     if mode == "single-shot":
         return single_shot_mode_instruction()
     if mode == "repeated":
-        attempt = min(state.requests + 1, REPEATED_MAX_ATTEMPTS)
-        return (
-            f"Режим repeated: попытка {attempt}/{REPEATED_MAX_ATTEMPTS}. "
-            "Эта попытка должна выглядеть для модели как отдельный single-shot запуск: один ответ, полный pipeline, созданный CSV-файл и submit. "
-            "Это отдельный чистый чат и отдельный чистый workspace; у тебя нет доступа к прошлым попыткам, их файлам, ответам и результатам. "
-            "Не пиши планы на будущие попытки, не обещай улучшить модель позже и не отвечай только комментарием. "
-            "Submit-only будет отклонён: сначала сам создай файл через write_file или run_python. "
-            "Если забудешь submit(\"submission.csv\"), runner принудительно отправит последний созданный CSV этой попытки, "
-            "поэтому в каждой попытке обязательно создай свежий CSV-файл.\n\n"
-            f"{single_shot_mode_instruction()}"
-        )
+        return single_shot_mode_instruction()
     if mode == "fixed-transitions":
         return (
             "Режим fixed-transitions: первая непустая строка ответа должна быть одним из EDA, FEATURES или TRAIN. "
@@ -985,7 +975,7 @@ def single_shot_mode_instruction() -> str:
         "Файлы train.csv, test.csv и task.json уже показаны выше, поэтому НЕ трать единственный ответ на list_files/read_file/load_dataset/show_sample_rows. "
         "В single-shot разрешены только продуктивные команды: write_file, run_python, submit. "
         "Ответ без созданного CSV-файла будет провальным; обязательно создай submission.csv или другой свежий CSV с предсказаниями. "
-        "Ответ без submit(\"submission.csv\") будет исправлен runner'ом только если ты создал CSV-файл, но правильный формат ответа всё равно должен включать submit.\n"
+        "Ответ без submit(\"submission.csv\") будет отклонен.\n"
         "Лучший формат для длинного кода:\n"
         "TRAIN\n"
         "Делаю полный быстрый пайплайн и отправляю решение\n"
@@ -1455,16 +1445,7 @@ def build_followup_prompt(results: list[dict[str, Any]], feedback: dict[str, Any
 
 
 def repeated_followup_opener(state: RunState) -> str:
-    next_attempt = min(state.requests + 1, REPEATED_MAX_ATTEMPTS)
-    final = " Это последняя попытка." if next_attempt >= REPEATED_MAX_ATTEMPTS else ""
-    return (
-        f"Продолжай repeated: попытка {next_attempt}/{REPEATED_MAX_ATTEMPTS}.{final} "
-        "Это независимый чистый single-shot запуск без доступа к предыдущим попыткам. "
-        "Не описывай, что улучшишь модель потом. В этом же ответе сделай конкретную попытку решения. "
-        "Submit-only не засчитывается, сначала создай submission.csv сам. "
-        "Верни короткую строку комментария без вводного слова, затем полный single-shot набор команд: "
-        "создай/запусти решение, создай submission.csv и обязательно заверши ответ командой submit(\"submission.csv\")."
-    )
+    return single_shot_mode_instruction()
 
 
 def fixed_transition_followup_opener(state: RunState) -> str:

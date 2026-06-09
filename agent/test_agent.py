@@ -875,7 +875,6 @@ submit("submission.csv")'''
     def test_mode_instruction_does_not_reveal_fixed_stage(self) -> None:
         fixed_state = self._state("fixed-transitions")
         flexible_state = self._state("flexible")
-        repeated_state = self._state("repeated")
 
         fixed_prompt = apply_mode_instruction(fixed_state, "base")
         flexible_prompt = apply_mode_instruction(flexible_state, "base")
@@ -885,7 +884,6 @@ submit("submission.csv")'''
         self.assertNotIn("должна быть `EDA`", fixed_prompt)
         self.assertIn("Режим flexible", flexible_prompt)
         self.assertIn("Самостоятельно выбери актуальный этап", flexible_prompt)
-        self.assertIn(f"попытка 1/{REPEATED_MAX_ATTEMPTS}", apply_mode_instruction(repeated_state, "base"))
 
     def test_fixed_transitions_accepts_correct_reported_stage(self) -> None:
         state = self._state("fixed-transitions")
@@ -922,21 +920,21 @@ submit("submission.csv")'''
         self.assertIsNone(detect_fixed_stage_violation(state, 'EDA\nread_file("train.csv")'))
         self.assertIsNone(detect_fixed_stage_violation(state, 'read_file("train.csv")'))
 
-    def test_repeated_prompt_requires_current_attempt_submit(self) -> None:
-        state = self._state("repeated")
-        state.requests = 1
+    def test_repeated_prompt_is_identical_to_single_shot_prompt(self) -> None:
+        repeated_state = self._state("repeated")
+        single_shot_state = self._state("single-shot")
+        repeated_state.requests = 3
 
-        prompt = apply_mode_instruction(state, "base")
+        repeated_prompt = apply_mode_instruction(repeated_state, "base")
+        single_shot_prompt = apply_mode_instruction(single_shot_state, "base")
 
-        self.assertIn("должна выглядеть для модели как отдельный single-shot запуск", prompt)
-        self.assertIn("Режим single-shot", prompt)
-        self.assertIn("один ответ модели на всю задачу", prompt)
-        self.assertIn("run_python", prompt)
-        self.assertIn("не обещай улучшить модель позже", prompt)
-        self.assertIn("Submit-only будет отклонён", prompt)
-        self.assertIn("обязательно создай свежий CSV-файл", prompt)
-        self.assertIn("submit(\"submission.csv\")", prompt)
-        self.assertNotIn("сможешь в следующей попытке", prompt)
+        self.assertEqual(repeated_prompt, single_shot_prompt)
+        self.assertIn("Режим single-shot", repeated_prompt)
+        self.assertIn("submit(\"submission.csv\")", repeated_prompt)
+        self.assertNotIn("repeated", repeated_prompt.lower())
+        self.assertNotIn("runner", repeated_prompt.lower())
+        self.assertNotIn("принуд", repeated_prompt.lower())
+        self.assertNotIn("следующ", repeated_prompt.lower())
 
     def test_repeated_mode_isolates_llm_history_between_attempts(self) -> None:
         self.assertTrue(should_isolate_llm_history(self._state("repeated")))
