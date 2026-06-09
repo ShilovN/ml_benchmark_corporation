@@ -38,7 +38,9 @@ from web_server import (
     prepare_run_workspace,
     record_fixed_stage_attempt,
     repeated_attempt_workspace_id,
+    repair_submission_for_task_contract,
     should_isolate_llm_history,
+    submission_contract_prompt,
     validate_reported_stage,
     validate_mode_command_batch,
     list_workspace_files,
@@ -849,6 +851,79 @@ submit("submission.csv")'''
         self.assertIsNone(detect_fixed_stage_violation(state, 'EDA\nread_file("train.csv")'))
         self.assertIsNone(detect_fixed_stage_violation(state, 'read_file("train.csv")'))
 
+    def test_submission_contract_prompt_names_required_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            (workspace / "task.json").write_text(
+                json.dumps(
+                    {
+                        "id": "wifi",
+                        "metric": "roc_auc",
+                        "id_column": "packet_id",
+                        "column": "delivered",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            prompt = submission_contract_prompt(workspace)
+
+        self.assertIn("`packet_id`", prompt)
+        self.assertIn("`delivered`", prompt)
+        self.assertIn("Не заменяй `packet_id` на общий `id`", prompt)
+        self.assertIn("вероятности", prompt)
+
+    def test_forced_submit_repair_renames_generic_id_column(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            (workspace / "task.json").write_text(
+                json.dumps(
+                    {
+                        "id": "wifi",
+                        "metric": "roc_auc",
+                        "id_column": "packet_id",
+                        "column": "delivered",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            submission_path = workspace / "submission.csv"
+            submission_path.write_text("id,delivered\n1,0.2\n2,0.8\n", encoding="utf-8")
+
+            repair = repair_submission_for_task_contract(workspace, submission_path)
+
+            content = submission_path.read_text(encoding="utf-8")
+
+        self.assertIsNotNone(repair)
+        self.assertEqual(content.splitlines()[0], "packet_id,delivered")
+
+    def test_forced_submit_repair_inserts_missing_id_column_from_test(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            (workspace / "task.json").write_text(
+                json.dumps(
+                    {
+                        "id": "wifi",
+                        "metric": "roc_auc",
+                        "id_column": "packet_id",
+                        "column": "delivered",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (workspace / "test.csv").write_text("packet_id,x\n10,a\n20,b\n", encoding="utf-8")
+            submission_path = workspace / "submission.csv"
+            submission_path.write_text("delivered\n0.2\n0.8\n", encoding="utf-8")
+
+            repair = repair_submission_for_task_contract(workspace, submission_path)
+
+            content = submission_path.read_text(encoding="utf-8").splitlines()
+
+        self.assertIsNotNone(repair)
+        self.assertEqual(content[0], "packet_id,delivered")
+        self.assertEqual(content[1], "10,0.2")
+        self.assertEqual(content[2], "20,0.8")
+
     def test_repeated_prompt_requires_current_attempt_submit(self) -> None:
         state = self._state("repeated")
         state.requests = 1
@@ -860,7 +935,7 @@ submit("submission.csv")'''
         self.assertIn("run_python", prompt)
         self.assertIn("не обещай улучшить модель позже", prompt)
         self.assertIn("Submit-only будет отклонён", prompt)
-        self.assertIn("submit(\"submission.csv\")", prompt)
+        self.assertIn("submit(\"название файла с твоим решением\")", prompt)
         self.assertNotIn("сможешь в следующей попытке", prompt)
 
     def test_repeated_mode_isolates_llm_history_between_attempts(self) -> None:
