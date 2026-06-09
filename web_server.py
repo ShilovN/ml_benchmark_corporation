@@ -568,6 +568,9 @@ class AgentRunManager:
             else:
                 create_baseline_submission(state.workspace)
                 source = "auto-generated baseline submission.csv"
+            repair = repair_submission_for_task_contract(state.workspace, submission_path)
+            if repair:
+                source = f"{source}; {repair['message']}"
 
             command = ParsedCommand("submit", {"file": "submission.csv"})
             if state.config.mode == "single-shot":
@@ -874,6 +877,59 @@ def create_baseline_submission(workspace: Path) -> Path:
     return submission_path
 
 
+def repair_submission_for_task_contract(workspace: Path, submission_path: Path) -> dict[str, Any] | None:
+    if not submission_path.exists() or submission_path.suffix.lower() != ".csv":
+        return None
+
+    task_config = read_workspace_task_config(workspace)
+    id_column = str(task_config.get("id_column") or "id")
+    if id_column == "id":
+        return None
+
+    with submission_path.open("r", encoding="utf-8", newline="") as file:
+        reader = csv.reader(file)
+        rows = list(reader)
+    if not rows:
+        return None
+
+    header = rows[0]
+    if id_column in header:
+        return None
+
+    if "id" in header:
+        fixed_header = [id_column if column == "id" else column for column in header]
+        rows[0] = fixed_header
+        message = f"renamed submission column id to required {id_column}"
+    else:
+        test_ids = read_test_ids_for_submission_repair(workspace, id_column)
+        data_rows = rows[1:]
+        if test_ids is None or len(test_ids) != len(data_rows):
+            return None
+        fixed_header = [id_column, *header]
+        rows[0] = fixed_header
+        for row, test_id in zip(data_rows, test_ids):
+            row.insert(0, test_id)
+        message = f"inserted required submission id column {id_column} from test.csv"
+
+    with submission_path.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerows(rows)
+    return {
+        "message": message,
+        "old_columns": header,
+        "new_columns": rows[0],
+    }
+
+
+def read_test_ids_for_submission_repair(workspace: Path, id_column: str) -> list[str] | None:
+    test_path = workspace / "test.csv"
+    if not test_path.exists():
+        return None
+    with test_path.open("r", encoding="utf-8", newline="") as file:
+        reader = csv.DictReader(file)
+        if reader.fieldnames is None or id_column not in reader.fieldnames:
+            return None
+        return [str(row[id_column]) for row in reader]
 def latest_csv_submission_candidate(workspace: Path) -> Path | None:
     ignored_names = {
         "train.csv",
@@ -929,8 +985,9 @@ def build_initial_prompt(workspace: Path, task_id: str) -> str:
         "На второй строке кратко напиши, что собираешься сделать, без вводного слова; "
         "затем укажи одну или несколько команд, по одной на строку.\n"
         "Работай как в обычной ML-задаче: осмотри данные, сделай признаки, обучи и проверь модель. "
-        "Перед submit проверь, что submission.csv существует, имеет нужные колонки, правильное число строк "
-        "и не содержит пустых предсказаний. Когда всё готово, вызови submit(\"submission.csv\").\n\n"
+        "Перед submit проверь, что файл с твоим решением существует, имеет нужные колонки, правильное число строк "
+        "и не содержит пустых предсказаний. Когда всё готово, вызови submit(\"название файла с твоим решением\").\n\n"
+        f"{submission_contract_prompt(workspace)}\n\n"
         f"task_id: {task_id}\n\n"
         "Файлы workspace:\n"
         f"{collect_file_previews(workspace)}"
@@ -995,23 +1052,30 @@ def flexible_mode_instruction(state: RunState) -> str:
     budget = build_budget_payload(state)
     remaining_steps = int(budget["remaining_steps"])
     remaining_percent = budget["remaining_token_percent"]
+    if remaining_steps <= 10:
+        return (
+            "Режим flexible: стадия финализации. Больше не начинай долгие эксперименты. "
+            "Выбери лучший уже полученный подход, создай или исправь файл решения под точный submission contract, "
+            "проверь колонки/число строк/пустые значения и вызывай submit(\"название файла с твоим решением\")."
+        )
     if remaining_steps <= FINALIZE_REMAINING_STEPS or (
         remaining_percent is not None and remaining_percent <= FINALIZE_REMAINING_TOKEN_RATIO * 100
     ):
         return (
             "Режим flexible: финальная стадия. Используй лучшее уже подготовленное решение, "
-            "проверь submission.csv и вызывай submit(\"submission.csv\")."
+            "проверь лучший файл с решением и вызывай submit(\"название файла с твоим решением\")."
         )
     if state.requests <= 1:
         return (
             "Режим flexible: это ранняя стадия решения, не отправляй submit сразу. "
             "Сначала используй доступные итерации на EDA, проверку формата, baseline, валидацию и хотя бы одно улучшение модели. "
-            "Submit уместен только после созданного submission.csv и понятной проверки качества/формата."
+            "Submit уместен только после созданного файла решения и понятной проверки качества/формата."
         )
     if remaining_percent is not None and remaining_percent >= 55:
         return (
             "Режим flexible: бюджет еще большой, продолжай улучшать решение вместо раннего submit. "
-            "Сравни baseline с более сильной моделью, проверь признаки, валидацию и формат submission.csv."
+            "Сравни baseline с более сильной моделью, проверь признаки, валидацию и формат файла решения. "
+            "Держи рабочий валидный файл решения после каждого серьезного эксперимента."
         )
     return (
         "Режим flexible: можно свободно выбирать следующие агентские команды. "
@@ -1414,10 +1478,17 @@ def build_followup_prompt(results: list[dict[str, Any]], feedback: dict[str, Any
         opener = fixed_transition_followup_opener(state)
     elif state.config.mode == "repeated":
         opener = repeated_followup_opener(state)
+    elif state.config.mode == "flexible" and remaining_steps <= 10:
+        opener = (
+            "FINALIZATION MODE для flexible. Не запускай новые долгие эксперименты. "
+            "Используй лучший уже найденный подход, создай или исправь файл решения под точный submission contract, "
+            "проверь формат и вызови submit(\"название файла с твоим решением\") сейчас."
+        )
     elif state.config.mode == "flexible" and not is_finalization_phase(state):
         opener = (
             "Продолжай улучшать решение. Верни короткую строку комментария без вводного слова, затем следующую команду или команды. "
-            "Не вызывай submit рано: сначала используй итерации на проверку данных, признаки, валидацию и улучшение модели."
+            "Не вызывай submit рано: сначала используй итерации на проверку данных, признаки, валидацию и улучшение модели. "
+            "После каждого сильного эксперимента сохраняй валидный файл решения с точными колонками из submission contract."
         )
     else:
         opener = "Продолжай решение. Верни короткую строку комментария без вводного слова, затем следующую команду или команды."
@@ -1432,6 +1503,9 @@ def build_followup_prompt(results: list[dict[str, Any]], feedback: dict[str, Any
         "",
         "Результаты команд:",
     ]
+    contract = submission_contract_prompt(state.workspace)
+    if state.config.mode == "flexible" or remaining_steps <= 10:
+        lines.extend(["", contract, ""])
     if results:
         for index, result in enumerate(results, start=1):
             lines.extend(format_web_command_result(index, result))
@@ -1467,7 +1541,7 @@ def fixed_transition_followup_opener(state: RunState) -> str:
         )
     return (
         "Продолжай fixed-transitions этап TRAIN. Верни короткую строку комментария без вводного слова, затем команды, которые создают/проверяют "
-        "submission.csv. Submit будет выполнен автоматически строго после завершения fixed-transitions расписания."
+        "файл решения, и обязательно вызови submit(\"название файла с твоим решением\"). Без собственного submit этап TRAIN не завершится."
     )
 
 
@@ -1588,14 +1662,16 @@ def build_emergency_submit_prompt(state: RunState) -> str:
         instruction = (
             "FINAL SUBMIT NOW.\n"
             "В workspace уже есть submission.csv. Не улучшай решение и не запускай EDA.\n"
-            "Начни ответ со строки TRAIN, на второй строке кратко укажи действие, затем верни одну команду:\n"
-            "submit(\"submission.csv\")\n\n"
+            "Если в файле неправильные колонки, сначала быстро исправь их под submission contract. "
+            "Затем вызови submit(\"название файла с твоим решением\").\n"
+            "Начни ответ со строки TRAIN, на второй строке кратко укажи действие, затем верни команды.\n\n"
         )
     else:
         instruction = (
             "FINAL SUBMIT NOW.\n"
             "Нужно дать последнее лучшее решение. Не делай EDA и долгие улучшения.\n"
-            "Создай submission.csv самым надежным быстрым способом и в этом же ответе вызови submit(\"submission.csv\").\n"
+            "Создай файл решения самым надежным быстрым способом под submission contract "
+            "и в этом же ответе вызови submit(\"название файла с твоим решением\").\n"
             "Начни ответ со строки TRAIN, на второй строке кратко укажи действие, затем верни команды.\n\n"
         )
     payload = {
@@ -1603,7 +1679,7 @@ def build_emergency_submit_prompt(state: RunState) -> str:
         "workspace_files": files[-80:],
         "budget": budget,
     }
-    return instruction + json.dumps(payload, ensure_ascii=False, default=str)
+    return instruction + submission_contract_prompt(state.workspace) + "\n\n" + json.dumps(payload, ensure_ascii=False, default=str)
 
 
 def read_workspace_task_config(workspace: Path) -> dict[str, Any]:
@@ -1614,6 +1690,29 @@ def read_workspace_task_config(workspace: Path) -> dict[str, Any]:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
+
+
+def submission_contract_prompt(workspace: Path) -> str:
+    task_config = read_workspace_task_config(workspace)
+    id_column = str(task_config.get("id_column") or "id")
+    target_column = str(task_config.get("column") or task_config.get("pred_column") or "target")
+    metric = str(task_config.get("metric") or "").strip().lower().replace("-", "_")
+    lines = [
+        "Submission contract:",
+        f"- Файл решения обязан содержать колонку id ровно с названием `{id_column}` и колонку предсказаний ровно `{target_column}`.",
+        f"- Не заменяй `{id_column}` на общий `id`; checker проверяет точное имя колонки.",
+        f"- Перед submit выполни быструю проверку: columns == [`{id_column}`, `{target_column}`], число строк как в test.csv, нет NaN.",
+        "- Если ты уже создавал файл решения, его можно и нужно перезаписать/исправить перед submit; checker читает последнюю версию файла.",
+    ]
+    if metric in {"roc_auc", "roc_auc_score"}:
+        lines.append(
+            f"- Метрика {metric}: в `{target_column}` должны быть вероятности или continuous score положительного класса, не жесткие 0/1 labels."
+        )
+    elif metric in {"f1", "f1_score", "accuracy", "precision", "recall"}:
+        lines.append(f"- Метрика {metric}: в `{target_column}` должны быть итоговые классы в формате target.")
+    elif metric in LOWER_IS_BETTER_METRICS or metric in {"r2", "r2_score"}:
+        lines.append(f"- Метрика {metric}: в `{target_column}` должны быть численные предсказания.")
+    return "\n".join(lines)
 
 
 def build_budget_payload(state: RunState) -> dict[str, Any]:
